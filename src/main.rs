@@ -1,3 +1,4 @@
+mod bibtex;
 mod cli;
 mod db;
 mod models;
@@ -156,6 +157,81 @@ fn main() {
                 emit(&serde_json::to_string_pretty(&out).unwrap());
             } else {
                 emit(&format!("Removed '{cite_key}'"));
+            }
+        }
+
+        Command::Import { path, json } => {
+            let entries = match bibtex::import(&path) {
+                Ok(e) => e,
+                Err(e) => die(&format!("failed to import '{}': {e}", path.display())),
+            };
+
+            let mut imported = Vec::new();
+            let mut skipped = Vec::new();
+            let mut rejected: Vec<(String, String)> = Vec::new();
+
+            for entry in &entries {
+                match db::insert_entry(&conn, entry) {
+                    Ok(_) => imported.push(entry.cite_key.clone()),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        // SQLite's UNIQUE constraint on cite_key is the only
+                        // expected failure mode; anything else is bad data.
+                        if msg.contains("UNIQUE constraint") {
+                            skipped.push(entry.cite_key.clone());
+                        } else {
+                            rejected.push((entry.cite_key.clone(), msg));
+                        }
+                    }
+                }
+            }
+
+            // Skips are non-fatal by design, so re-importing a file you
+            // already hold is a successful no-op. Only genuine bad data is a
+            // failure -- keying the exit code off `imported` instead would
+            // make 2 duplicates exit 1 while 1 duplicate + 1 new exits 0.
+            let failed = !rejected.is_empty();
+
+            if json {
+                let out = serde_json::json!({
+                    "imported": imported.len(),
+                    "skipped": skipped.len(),
+                    "rejected": rejected.len(),
+                    "skipped_keys": skipped,
+                    "rejected_keys": rejected
+                        .iter()
+                        .map(|(k, r)| serde_json::json!({ "cite_key": k, "reason": r }))
+                        .collect::<Vec<_>>(),
+                });
+                emit(&serde_json::to_string_pretty(&out).unwrap());
+            } else {
+                emit(&format!(
+                    "imported {}, skipped {} (duplicate cite_key), rejected {} (bad data)",
+                    imported.len(),
+                    skipped.len(),
+                    rejected.len()
+                ));
+            }
+
+            if failed {
+                std::process::exit(1);
+            }
+        }
+
+        Command::Export { out } => {
+            let entries = match db::list_entries(&conn) {
+                Ok(e) => e,
+                Err(e) => die(&format!("failed to list entries: {e}")),
+            };
+            let bibtex_str = bibtex::export(&entries);
+
+            match out {
+                Some(path) => {
+                    if let Err(e) = std::fs::write(&path, &bibtex_str) {
+                        die(&format!("failed to write '{}': {e}", path.display()));
+                    }
+                }
+                None => emit(bibtex_str.trim_end()),
             }
         }
     }

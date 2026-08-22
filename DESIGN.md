@@ -56,6 +56,20 @@ Phases 1 and 2 are complete. Phase 3 (BibTeX) is next.
 - The DB is always `./ferref.db`, relative to the current directory. Phase 8 adds
   a config file and is the natural point to fix this.
 
+BibTeX round trips (Phase 3) lose two things, both inherent to the target format
+rather than fixable in our mapping:
+
+- **Non-legacy `entry_type`s collapse to `misc` on export.** We serialize with
+  `to_bibtex_string()`, and legacy BibTeX has no `@online`/`@dataset`/`@software`,
+  nor any custom type like `@preprint`. Switching to `to_biblatex_string()` would
+  preserve them but emit `journaltitle`/`date` instead of `journal`/`year`, which
+  plain BibTeX and LaTeX can't read — a worse loss for the main use case. If both
+  audiences ever need serving, the fix is an `export --format bibtex|biblatex`
+  flag, not a change of default.
+- **Newlines inside a field collapse to single spaces** on re-import. This is
+  standard BibTeX field-content normalization, not specific to our parser. A
+  multi-paragraph abstract survives as one paragraph.
+
 ## Target v1
 
 - CLI subcommands (`clap`), every data-printing command with `--json`

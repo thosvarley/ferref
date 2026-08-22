@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 use crate::models::Author;
@@ -80,6 +82,20 @@ pub enum Command {
         cite_key: String,
         #[arg(long)]
         json: bool,
+    },
+    /// Import entries from a BibTeX (.bib) file. Duplicate cite_keys are
+    /// skipped, not fatal -- re-importing an overlapping file is normal.
+    Import {
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export all entries as BibTeX. Prints to stdout unless --out is given.
+    /// No --json here: the output format is BibTeX by definition, not a
+    /// choice of representation, so the usual --json rule doesn't apply.
+    Export {
+        #[arg(long = "out")]
+        out: Option<PathBuf>,
     },
 }
 
