@@ -1,0 +1,322 @@
+# ferref
+
+A command-line reference manager that keeps your library in a plain SQLite file
+and gets out of the way.
+
+The premise: the main consumer of a reference library increasingly isn't a
+person reading it — it's a script, a model, an embedding pipeline. So ferref
+stores everything in a file anyone can open with `sqlite3`, prints `--json` from
+every command that emits data, and pulls full text out of PDFs into a queryable
+column. It does not do the AI work itself. It hands over clean structured data
+and stops.
+
+See `DESIGN.md` for the reasoning, the phase plan, and a frank list of known
+limitations.
+
+## Requirements
+
+- Rust (2024 edition) — `cargo build --release`
+- `pdftotext` from **poppler-utils**, for full-text extraction
+  (`apt install poppler-utils`)
+- `xdg-open` (Linux) or `open` (macOS), for `ferref open`
+
+SQLite is bundled via `rusqlite`; you don't need to install it.
+
+```sh
+cargo build --release
+./target/release/ferref --help
+```
+
+The database is `./ferref.db` in whatever directory you run from. That's
+deliberate — a library is a folder you `cd` into, like a git repo. It also means
+running ferref somewhere else gives you a different, empty library.
+
+## Tutorial
+
+Everything below is a real session. Make a directory and work in it.
+
+```sh
+mkdir ~/papers && cd ~/papers
+```
+
+### 1. Add a paper by DOI
+
+The fastest way in. Crossref fills in the metadata, and the cite key is derived
+from the first author and year.
+
+```console
+$ ferref add --doi 10.1103/PhysRev.106.620
+Information Theory and Statistical Mechanics [jaynes1957]
+  Type: article
+  Authors: Jaynes, E. T.
+  Year: 1957
+  Journal: Physical Review
+  Volume: 106
+  Pages: 620-630
+  DOI: 10.1103/PhysRev.106.620
+```
+
+Or add one by hand when there's no DOI. `--author` repeats, each as
+`"Last, First"`:
+
+```sh
+ferref add --type article --key shannon1948 \
+  --title "A Mathematical Theory of Communication" \
+  --author "Shannon, Claude E." \
+  --year 1948 --journal "Bell System Technical Journal"
+```
+
+### 2. Look at your library
+
+```console
+$ ferref list
+jaynes1957      1957   Information Theory and Statistical Mechanics       Jaynes, E. T.
+shannon1948     1948   A Mathematical Theory of Communication             Shannon, Claude E.
+```
+
+`show` gives one entry in full, and every data command takes `--json`:
+
+```sh
+ferref show jaynes1957
+ferref show jaynes1957 --json
+```
+
+### 3. Tag things
+
+Tags are lowercased and trimmed, so `ML`, `ml`, and `  Ml  ` are one tag.
+Tagging twice is a no-op, not an error.
+
+```console
+$ ferref tag jaynes1957 "  Entropy  "
+Tagged 'jaynes1957' with 'entropy'
+$ ferref tag jaynes1957 entropy
+'jaynes1957' already tagged 'entropy'
+```
+
+### 4. Search
+
+Filters combine with AND. `--author` and `--title` are case-insensitive
+substring matches; `--tag` is an exact match, because tags are identifiers.
+
+```sh
+ferref search --author jaynes
+ferref search --title "information theory" --from 1950 --to 1960
+ferref search --tag ENTROPY --year 1957
+```
+
+No matches prints nothing and exits 0 — it's a query, not a test.
+
+### 5. Attach a PDF you already have
+
+ferref records the **path**, and never copies or moves your file. The path is
+resolved to an absolute one, so it survives you `cd`-ing elsewhere.
+
+```console
+$ ferref attach shannon1948 ~/Downloads/shannon1948.pdf --extract
+Attached '/home/you/Downloads/shannon1948.pdf' to 'shannon1948'
+Extracted 148204 characters from '/home/you/Downloads/shannon1948.pdf'
+```
+
+(The character count is whatever's in your PDF.)
+
+`--extract` runs `pdftotext` and stores the result. Without it, use
+`ferref extract shannon1948` later. `ferref open shannon1948` opens the
+attachments in your default viewer.
+
+### 6. Fetch an open-access PDF automatically
+
+`fetch` asks Unpaywall whether a legal open-access copy exists, and if one does,
+downloads it to `./pdfs/`, attaches it, and extracts the text.
+
+This needs a contact email — Unpaywall's polite-pool policy. Set it once:
+
+```sh
+mkdir -p ~/.config/ferref
+echo 'email = you@example.com' > ~/.config/ferref/config.toml
+```
+
+(Or pass `--email`, or set `FERREF_EMAIL`. The email is sent to Unpaywall and
+nowhere else — Crossref never sees it.)
+
+Add an open-access paper, then fetch it:
+
+```console
+$ ferref add --doi 10.1038/s41586-020-2649-2
+Array programming with NumPy [harris2020]
+  ...
+
+$ ferref fetch harris2020
+Downloaded open-access PDF for 'harris2020' to '/home/you/papers/pdfs/harris2020.pdf'
+Extracted 41013 characters from '/home/you/papers/pdfs/harris2020.pdf'
+```
+
+Plenty of genuinely open papers are only linked as landing pages, so you'll also
+see this — it's an answer, not a failure, and exits 0:
+
+```console
+$ ferref add --doi 10.7717/peerj.4375   # then:
+$ ferref fetch piwowar2018
+'piwowar2018' (DOI 10.7717/peerj.4375) is open access, but Unpaywall has no
+direct PDF link for it -- only landing pages
+```
+
+ferref will not work around a paywall. If Unpaywall says there's no legal open
+copy, that's the end of it.
+
+### 7. Get the text back out
+
+This is the point of the whole thing. `show --json` carries the extracted text:
+
+```console
+$ ferref show harris2020 --json | jq -r '.attachments[].full_text' | head -3
+Review
+
+Array programming with NumPy
+```
+
+`list` and `search` omit full text unless you ask, because otherwise every
+listing would pull every PDF's text into memory:
+
+```sh
+ferref list --json --full-text | jq -r '.[] | "\(.cite_key)\t\(.attachments[0].full_text // "" | length)"'
+```
+
+### 8. Cite and export
+
+```console
+$ ferref cite jaynes1957
+Jaynes, E. T. (1957). Information Theory and Statistical Mechanics. Physical Review, 106, 620–630. https://doi.org/10.1103/PhysRev.106.620
+
+$ ferref cite jaynes1957 --style mla
+Jaynes, E. T. "Information Theory and Statistical Mechanics." Physical Review, vol. 106, 1957, pp. 620-630. https://doi.org/10.1103/PhysRev.106.620
+```
+
+APA lists every author (no 21-author truncation); MLA collapses three or more
+to `et al.`
+
+```sh
+ferref export > library.bib          # all entries as BibTeX
+ferref import someone-elses.bib      # duplicate cite keys are skipped, not fatal
+```
+
+## Command reference
+
+| Command | What it does |
+| --- | --- |
+| `add` | Create an entry. `--type/--key/--title`, or `--doi` to autofill from Crossref |
+| `list` | List everything. `--tag`, `--full-text` |
+| `show <key>` | One entry in full |
+| `edit <key>` | Change fields; only the flags you pass are touched |
+| `rm <key>` | Delete an entry (cascades to authors, tags, attachments) |
+| `search` | `--author --title --year --from --to --tag --full-text` |
+| `tag` / `untag <key> <tag>` | Add/remove a tag. Idempotent |
+| `attach <key> <path>` | Record a file path. `--extract` to pull text immediately |
+| `extract <key>` | (Re)extract text for all of an entry's attachments |
+| `open <key>` | Open attachments in the system viewer |
+| `fetch <key>` | Find and download an open-access PDF for the entry's DOI |
+| `cite <key>` | `--style apa` (default) or `--style mla` |
+| `import <path>` | Read a `.bib` file |
+| `export` | Write BibTeX to stdout, or `--out file.bib` |
+
+Every command above takes `--json` except `export`, whose output format is
+BibTeX by definition.
+
+## Scripting
+
+`--json` on everything is the feature, not a convenience. The examples below
+use [`jq`](https://jqlang.github.io/jq/), which ferref does not require — any
+JSON tool works:
+
+```sh
+ferref list --json | python3 -c 'import json,sys; [print(e["cite_key"]) for e in json.load(sys.stdin)]'
+```
+
+Some patterns:
+
+```sh
+# Every cite key, one per line
+ferref list --json | jq -r '.[].cite_key'
+
+# Extract text for the whole library
+ferref list --json | jq -r '.[].cite_key' | xargs -n1 ferref extract
+
+# Try to fetch an OA PDF for everything that has a DOI
+ferref list --json | jq -r '.[] | select(.doi) | .cite_key' | xargs -n1 ferref fetch
+
+# Bibliography for one tag
+ferref search --tag to-read --json | jq -r '.[].cite_key' | xargs -n1 ferref cite
+
+# Dump full text for an embedding pipeline
+ferref list --json --full-text \
+  | jq -r '.[] | select(.attachments[0].full_text) | [.cite_key, .attachments[0].full_text] | @tsv'
+```
+
+Exit codes: `0` on success, `1` on failure, `2` for a usage error from the
+argument parser. "No results" and "no open-access copy available" are successes.
+
+Output is safe to pipe into `head` — ferref exits cleanly on a closed pipe
+rather than panicking.
+
+### The JSON shape
+
+```json
+{
+  "id": 2,
+  "entry_type": "article",
+  "cite_key": "harris2020",
+  "title": "Array programming with NumPy",
+  "authors": [{ "first_name": "Charles R.", "last_name": "Harris" }],
+  "tags": [],
+  "attachments": [{ "path": "/home/you/papers/pdfs/harris2020.pdf", "full_text": "Review\n\nArray..." }],
+  "year": 2020,
+  "journal": "Nature",
+  "volume": "585",
+  "pages": "357-362",
+  "doi": "10.1038/s41586-020-2649-2",
+  "url": null,
+  "abstract": null,
+  "date_added": 1787430871,
+  "date_modified": 1787430871
+}
+```
+
+`full_text` is `null` when nothing has been extracted, and also in `list`/
+`search` output unless you pass `--full-text`. `abstract` is spelled `abstract`,
+not `abstract_text`, and there's a test pinning that.
+
+## The database
+
+It's just SQLite. Go read it:
+
+```sh
+sqlite3 ferref.db '.schema'
+sqlite3 ferref.db "SELECT cite_key, title FROM entries WHERE year > 2015;"
+```
+
+Tables: `entries`, `authors`, `tags`, `entry_tags`, `attachments`. Foreign keys
+cascade from `entries`, so deleting an entry cleans up after itself. `cite_key`
+and `id` are the stable identifiers — key your own tools against those.
+
+## Limitations worth knowing
+
+- The database is always `./ferref.db`, relative to the current directory.
+- `edit` can't clear a field back to null, and there's no `detach`.
+- Attachment paths are absolute and stored once; moving a file breaks the link
+  silently.
+- BibTeX export collapses non-legacy entry types (`@online`, `@dataset`) to
+  `@misc`, and tags don't survive a round trip.
+- `cite` covers APA and MLA only, and doesn't recase titles or handle APA's
+  21-author truncation.
+- Extraction is PDF-only, capped at 10 MB of text per attachment.
+
+`DESIGN.md` has the full list with the reasoning behind each.
+
+## Development
+
+```sh
+cargo test        # 52 tests, no network access required
+cargo build
+```
+
+No test touches the network; the Crossref and Unpaywall parsers are tested
+against captured fixture strings.
