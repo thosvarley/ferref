@@ -40,6 +40,14 @@ CREATE TABLE IF NOT EXISTS authors (
     FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    date_added INTEGER NOT NULL,
+    UNIQUE (entry_id, path)
+);
+
 CREATE INDEX IF NOT EXISTS idx_authors_entry ON authors(entry_id);
 CREATE INDEX IF NOT EXISTS idx_entries_cite_key ON entries(cite_key);
 CREATE INDEX IF NOT EXISTS idx_entries_year ON entries(year);
@@ -88,6 +96,7 @@ fn entry_from_row(row: &Row) -> Result<Entry> {
         title: row.get("title")?,
         authors: Vec::new(),
         tags: Vec::new(),
+        attachments: Vec::new(),
         year: row.get("year")?,
         journal: row.get("journal")?,
         volume: row.get("volume")?,
@@ -177,6 +186,7 @@ pub fn get_entry(conn: &Connection, cite_key: &str) -> Result<Option<Entry>> {
     let mut entry = entry_from_row(row)?;
     entry.authors = authors_for_entry(conn, entry.id.unwrap())?;
     entry.tags = tags_for_entry(conn, entry.id.unwrap())?;
+    entry.attachments = attachments_for_entry(conn, entry.id.unwrap())?;
     Ok(Some(entry))
 }
 
@@ -187,6 +197,32 @@ fn tags_for_entry(conn: &Connection, entry_id: i64) -> Result<Vec<String>> {
     )?;
     stmt.query_map([entry_id], |row| row.get(0))?
         .collect::<Result<Vec<String>>>()
+}
+
+fn attachments_for_entry(conn: &Connection, entry_id: i64) -> Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT path FROM attachments WHERE entry_id = ?1 ORDER BY id")?;
+    let paths = stmt
+        .query_map([entry_id], |row| row.get(0))?
+        .collect::<Result<Vec<String>>>()?;
+    Ok(paths)
+}
+
+// Records a path, never a copy of the file — see DESIGN.md. Idempotent per the
+// UNIQUE(entry_id, path) constraint; the bool reports whether a row was added.
+// An unknown cite_key is an error (QueryReturnedNoRows), same as add_tag.
+pub fn attach(conn: &Connection, cite_key: &str, path: &str) -> Result<bool> {
+    let entry_id: i64 = conn.query_row(
+        "SELECT id FROM entries WHERE cite_key = ?1",
+        [cite_key],
+        |row| row.get(0),
+    )?;
+
+    conn.execute(
+        "INSERT OR IGNORE INTO attachments (entry_id, path, date_added) VALUES (?1, ?2, ?3)",
+        rusqlite::params![entry_id, path, now()],
+    )?;
+    Ok(conn.changes() > 0)
 }
 
 // Single place tag names are normalized, so writes (add_tag/remove_tag) and
@@ -340,6 +376,7 @@ pub fn list_entries(conn: &Connection, filter: &Filter) -> Result<Vec<Entry>> {
     for entry in &mut entries {
         entry.authors = authors_for_entry(conn, entry.id.unwrap())?;
         entry.tags = tags_for_entry(conn, entry.id.unwrap())?;
+        entry.attachments = attachments_for_entry(conn, entry.id.unwrap())?;
     }
     Ok(entries)
 }
@@ -603,12 +640,38 @@ mod tests {
         };
         assert_eq!(keys(&conn, &by_tag), ["a", "b"]);
 
-        // delete_entry cascades to entry_tags.
+    // delete_entry cascades to entry_tags.
         delete_entry(&conn, "a").unwrap();
         delete_entry(&conn, "b").unwrap();
         let orphans: i64 = conn
             .query_row("SELECT COUNT(*) FROM entry_tags", [], |r| r.get(0))
             .unwrap();
         assert_eq!(orphans, 0, "delete_entry must cascade to entry_tags");
+    }
+
+    // Paths are stored, never copied (DESIGN.md), so these need not exist.
+    #[test]
+    fn attachments_are_idempotent_and_cascade() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        seed(&conn, "a", "Paper", 2024, "Smith", "John");
+
+        assert!(attach(&conn, "a", "/tmp/paper.pdf").unwrap());
+        // UNIQUE(entry_id, path) makes a repeat attach a no-op, not a duplicate.
+        assert!(!attach(&conn, "a", "/tmp/paper.pdf").unwrap());
+        assert!(attach(&conn, "a", "/tmp/supplement.pdf").unwrap());
+
+        assert_eq!(
+            get_entry(&conn, "a").unwrap().unwrap().attachments,
+            ["/tmp/paper.pdf", "/tmp/supplement.pdf"]
+        );
+
+        assert!(attach(&conn, "nonexistent", "/tmp/paper.pdf").is_err());
+
+        delete_entry(&conn, "a").unwrap();
+        let orphans: i64 = conn
+            .query_row("SELECT COUNT(*) FROM attachments", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(orphans, 0, "delete_entry must cascade to attachments");
     }
 }

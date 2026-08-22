@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
@@ -124,6 +124,20 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Record a file path against an entry. The file is not copied or moved;
+    /// only its path is stored.
+    Attach {
+        cite_key: String,
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open an entry's attachments in the system default application
+    Open {
+        cite_key: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Import entries from a BibTeX (.bib) file. Duplicate cite_keys are
     /// skipped, not fatal -- re-importing an overlapping file is normal.
     Import {
@@ -166,6 +180,24 @@ pub fn parse_author(raw: &str) -> Result<Author, String> {
     Ok(Author::new(last.to_string(), first_name))
 }
 
+// Attachment paths are stored absolute: the DB outlives any particular working
+// directory, and a relative path silently stops resolving after one `cd`.
+//
+// canonicalize also fails on a path that doesn't exist, which is the point —
+// an attach that can't be opened later is almost always a typo, and rejecting
+// it now beats discovering it at `open` time. The cost is that a file on an
+// unmounted drive can't be pre-registered.
+pub fn resolve_attachment_path(path: &Path) -> Result<String, String> {
+    let abs = path
+        .canonicalize()
+        .map_err(|e| format!("cannot attach {}: {e}", path.display()))?;
+
+    abs.to_str()
+        .map(|s| s.to_string())
+        // SQLite text is UTF-8; a non-UTF-8 path can't round-trip through it.
+        .ok_or_else(|| format!("path {} is not valid UTF-8", abs.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +235,20 @@ mod tests {
         let a = parse_author("  Smith  ,  John  ").unwrap();
         assert_eq!(a.last_name, "Smith");
         assert_eq!(a.first_name, Some("John".to_string()));
+    }
+
+    #[test]
+    fn resolve_attachment_path_is_absolute_and_rejects_missing() {
+        let dir = std::env::temp_dir().join("ferref-attach-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("paper.pdf");
+        std::fs::write(&file, b"x").unwrap();
+
+        let resolved = resolve_attachment_path(&file).unwrap();
+        assert!(Path::new(&resolved).is_absolute());
+
+        assert!(resolve_attachment_path(&dir.join("nope.pdf")).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // An empty last_name satisfies the NOT NULL column but is garbage data,

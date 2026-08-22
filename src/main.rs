@@ -190,7 +190,7 @@ fn main() {
                         emit(&format!("'{cite_key}' already tagged '{normalized}'"));
                     }
                 }
-                Err(e) => die(&tag_error(&cite_key, "tag", e)),
+                Err(e) => die(&entry_error(&cite_key, "tag entry", e)),
             }
         }
 
@@ -218,7 +218,7 @@ fn main() {
                         emit(&format!("'{cite_key}' was not tagged '{normalized}'"));
                     }
                 }
-                Err(e) => die(&tag_error(&cite_key, "untag", e)),
+                Err(e) => die(&entry_error(&cite_key, "untag entry", e)),
             }
         }
 
@@ -252,6 +252,65 @@ fn main() {
                     }
                 }
                 Err(e) => die(&format!("failed to search entries: {e}")),
+            }
+        }
+
+        Command::Attach {
+            cite_key,
+            path,
+            json,
+        } => {
+            let resolved = match cli::resolve_attachment_path(&path) {
+                Ok(p) => p,
+                Err(e) => die(&e),
+            };
+            match db::attach(&conn, &cite_key, &resolved) {
+                Ok(changed) => {
+                    if json {
+                        let out = serde_json::json!({
+                            "cite_key": cite_key,
+                            "path": resolved,
+                            "changed": changed,
+                        });
+                        emit(&serde_json::to_string_pretty(&out).unwrap());
+                    } else if changed {
+                        emit(&format!("Attached '{resolved}' to '{cite_key}'"));
+                    } else {
+                        emit(&format!("'{cite_key}' already has '{resolved}'"));
+                    }
+                }
+                Err(e) => die(&entry_error(&cite_key, "attach file", e)),
+            }
+        }
+
+        Command::Open { cite_key, json } => {
+            let entry = match db::get_entry(&conn, &cite_key) {
+                Ok(Some(e)) => e,
+                Ok(None) => die(&format!("no entry found with cite_key '{cite_key}'")),
+                Err(e) => die(&format!("failed to fetch entry: {e}")),
+            };
+            if entry.attachments.is_empty() {
+                die(&format!("'{cite_key}' has no attachments"));
+            }
+
+            // Every attachment, not just the first: an entry usually has one,
+            // and when it has two they're the paper and its supplement.
+            for path in &entry.attachments {
+                if let Err(e) = open_path(path) {
+                    die(&e);
+                }
+            }
+
+            if json {
+                let out = serde_json::json!({
+                    "cite_key": cite_key,
+                    "opened": entry.attachments,
+                });
+                emit(&serde_json::to_string_pretty(&out).unwrap());
+            } else {
+                for path in &entry.attachments {
+                    emit(&format!("Opened '{path}'"));
+                }
             }
         }
 
@@ -351,15 +410,32 @@ fn emit(s: &str) {
     }
 }
 
-// add_tag/remove_tag report an unknown cite_key as QueryReturnedNoRows, which
+// The system file opener. `status()` rather than `spawn()`: both xdg-open and
+// macOS `open` hand off and exit immediately, and waiting is what lets a
+// missing opener be reported instead of silently doing nothing.
+fn open_path(path: &str) -> Result<(), String> {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+
+    match std::process::Command::new(opener).arg(path).status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("{opener} failed on '{path}' ({status})")),
+        Err(e) => Err(format!("could not run {opener}: {e}")),
+    }
+}
+
+// add_tag/remove_tag/attach report an unknown cite_key as QueryReturnedNoRows, which
 // would otherwise reach the user as "Query returned no rows". Every other
 // command names the key it couldn't find; these should too.
-fn tag_error(cite_key: &str, verb: &str, e: rusqlite::Error) -> String {
+fn entry_error(cite_key: &str, action: &str, e: rusqlite::Error) -> String {
     match e {
         rusqlite::Error::QueryReturnedNoRows => {
             format!("no entry found with cite_key '{cite_key}'")
         }
-        e => format!("failed to {verb} entry: {e}"),
+        e => format!("failed to {action}: {e}"),
     }
 }
 
@@ -405,6 +481,9 @@ fn format_entry(entry: &Entry) -> String {
         if let Some(value) = value {
             out.push_str(&format!("  {label}: {value}\n"));
         }
+    }
+    for path in &entry.attachments {
+        out.push_str(&format!("  Attachment: {path}\n"));
     }
     out.pop(); // emit() adds the trailing newline
     out

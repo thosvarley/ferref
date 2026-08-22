@@ -39,10 +39,10 @@ Essential features that should be present at the end:
 
 ## Current state (2026-08-21)
 
-Phases 1–5 are complete. Phase 6 (attachments) is next.
+Phases 1–6 are complete. Phase 7 (full-text extraction) is next.
 
 - `src/models.rs` — `Entry`/`Author` + `now()`. `Serialize` derived; `abstract_text` serializes as `"abstract"` (Rust reserves `abstract`), locked by a test.
-- `src/db.rs` — schema + `insert_entry`/`get_entry`/`list_entries`/`update_entry`/`delete_entry`, all free functions over `&Connection`. `update_entry` stamps `date_modified` itself so callers can't forget. `list_entries` takes a `Filter`; an all-`None` filter matches everything, so `list` and `search` are one query. `add_tag`/`remove_tag` are idempotent and report whether anything changed; `normalize_tag` (trim + lowercase) is the single point both writes and the `tag` filter go through.
+- `src/db.rs` — schema + `insert_entry`/`get_entry`/`list_entries`/`update_entry`/`delete_entry`, all free functions over `&Connection`. `update_entry` stamps `date_modified` itself so callers can't forget. `list_entries` takes a `Filter`; an all-`None` filter matches everything, so `list` and `search` are one query. `add_tag`/`remove_tag` are idempotent and report whether anything changed; `normalize_tag` (trim + lowercase) is the single point both writes and the `tag` filter go through. `attach` stores a path, never a copy of the file.
 - `src/bibtex.rs` — `import`/`export` over the `biblatex` crate, plus the `biblatex::Entry` ↔ `models::Entry` mapping.
 - `src/cli.rs` — clap derive types for `add`/`list`/`show`/`edit`/`rm`/`search`/`import`/`export`, plus `parse_author`.
 - `src/main.rs` — thin dispatcher. All stdout goes through `emit()`, which exits 0 on a closed pipe instead of panicking. Failures exit non-zero with the message on stderr.
@@ -59,6 +59,11 @@ Phases 1–5 are complete. Phase 6 (attachments) is next.
 - Nothing lists all known tags, and a tag row orphaned by its last `untag` is
   left behind rather than garbage-collected. Both are worth fixing together, if
   a `ferref tags` command ever exists.
+- There is no `detach`, and no way to edit an attachment's path. Since `attach`
+  rejects a path that doesn't resolve, the usual cause (a typo) is caught up
+  front; a moved file still needs `rm` + re-add.
+- Attachment paths are absolute and stored at attach time. Moving the file, or
+  the library, breaks them silently — nothing revalidates them.
 - Tags don't survive a BibTeX round trip. BibLaTeX has a `keywords` field that
   would carry them; mapping it wasn't in Phase 5's scope.
 - The DB is always `./ferref.db`, relative to the current directory. Phase 8 adds
