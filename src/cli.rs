@@ -46,6 +46,10 @@ pub enum Command {
         /// Exact tag name (case/whitespace-insensitive)
         #[arg(long)]
         tag: Option<String>,
+        /// Include each attachment's extracted text (off by default: pulls
+        /// every extracted PDF's text into memory otherwise)
+        #[arg(long = "full-text")]
+        full_text: bool,
         #[arg(long)]
         json: bool,
     },
@@ -121,6 +125,10 @@ pub enum Command {
         /// Exact tag name (case/whitespace-insensitive)
         #[arg(long)]
         tag: Option<String>,
+        /// Include each attachment's extracted text (off by default: pulls
+        /// every extracted PDF's text into memory otherwise)
+        #[arg(long = "full-text")]
+        full_text: bool,
         #[arg(long)]
         json: bool,
     },
@@ -129,6 +137,15 @@ pub enum Command {
     Attach {
         cite_key: String,
         path: PathBuf,
+        /// Extract text immediately after attaching
+        #[arg(long)]
+        extract: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// (Re)extract full text for every attachment of an entry
+    Extract {
+        cite_key: String,
         #[arg(long)]
         json: bool,
     },

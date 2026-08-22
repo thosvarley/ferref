@@ -14,6 +14,15 @@ pub fn now() -> i64 {
         .as_secs() as i64
 }
 
+// full_text is always serialized (never skip_serializing_if): a script must
+// be able to tell "not extracted yet" (null) from "this field isn't carried
+// at all", and null is how it tells.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Attachment {
+    pub path: String,
+    pub full_text: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Entry {
     // Option<T> means "this might not exist"
@@ -32,7 +41,7 @@ pub struct Entry {
     // Vec<Author> means "a list of Author structs"
     pub authors: Vec<Author>,
     pub tags: Vec<String>,
-    pub attachments: Vec<String>,
+    pub attachments: Vec<Attachment>,
 
     // Optional fields use Option<T>
     // i32 is a 32-bit integer (good enough for years)

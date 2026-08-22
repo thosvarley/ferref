@@ -7,7 +7,7 @@ use rusqlite::{params_from_iter, Connection, Result, Row};
 // Path is used for working with file system paths
 use std::path::Path;
 
-use crate::models::{now, Author, Entry};
+use crate::models::{now, Attachment, Author, Entry};
 
 // Shared DDL for both init_db and the in-memory test connection.
 // PRAGMA foreign_keys is per-connection in SQLite, so it's set here too —
@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS attachments (
     entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
     path TEXT NOT NULL,
     date_added INTEGER NOT NULL,
+    full_text TEXT,
     UNIQUE (entry_id, path)
 );
 
@@ -63,8 +64,21 @@ CREATE TABLE IF NOT EXISTS entry_tags (
 );
 "#;
 
+// CREATE TABLE IF NOT EXISTS does not add a column to a table that already
+// exists. Phase 6 shipped `attachments` without `full_text`, so any DB
+// created before this phase needs the column added explicitly -- this is
+// the project's first migration.
 fn create_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(SCHEMA_SQL)
+    conn.execute_batch(SCHEMA_SQL)?;
+
+    let has_full_text = conn
+        .prepare("SELECT 1 FROM pragma_table_info('attachments') WHERE name = 'full_text'")?
+        .exists([])?;
+    if !has_full_text {
+        conn.execute("ALTER TABLE attachments ADD COLUMN full_text TEXT", [])?;
+    }
+
+    Ok(())
 }
 
 // 'pub' means "public" - other files can use this function
@@ -186,7 +200,7 @@ pub fn get_entry(conn: &Connection, cite_key: &str) -> Result<Option<Entry>> {
     let mut entry = entry_from_row(row)?;
     entry.authors = authors_for_entry(conn, entry.id.unwrap())?;
     entry.tags = tags_for_entry(conn, entry.id.unwrap())?;
-    entry.attachments = attachments_for_entry(conn, entry.id.unwrap())?;
+    entry.attachments = attachments_for_entry(conn, entry.id.unwrap(), true)?;
     Ok(Some(entry))
 }
 
@@ -199,19 +213,42 @@ fn tags_for_entry(conn: &Connection, entry_id: i64) -> Result<Vec<String>> {
         .collect::<Result<Vec<String>>>()
 }
 
-fn attachments_for_entry(conn: &Connection, entry_id: i64) -> Result<Vec<String>> {
-    let mut stmt =
-        conn.prepare("SELECT path FROM attachments WHERE entry_id = ?1 ORDER BY id")?;
-    let paths = stmt
-        .query_map([entry_id], |row| row.get(0))?
-        .collect::<Result<Vec<String>>>()?;
-    Ok(paths)
+// with_full_text controls whether extracted text is pulled along with the
+// path. list/search project it off by default -- otherwise printing a table
+// of entries would pull every byte of every extracted PDF in the library
+// into memory just to render four columns.
+fn attachments_for_entry(
+    conn: &Connection,
+    entry_id: i64,
+    with_full_text: bool,
+) -> Result<Vec<Attachment>> {
+    if with_full_text {
+        let mut stmt = conn
+            .prepare("SELECT path, full_text FROM attachments WHERE entry_id = ?1 ORDER BY id")?;
+        stmt.query_map([entry_id], |row| {
+            Ok(Attachment {
+                path: row.get(0)?,
+                full_text: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<Attachment>>>()
+    } else {
+        let mut stmt =
+            conn.prepare("SELECT path FROM attachments WHERE entry_id = ?1 ORDER BY id")?;
+        stmt.query_map([entry_id], |row| {
+            Ok(Attachment {
+                path: row.get(0)?,
+                full_text: None,
+            })
+        })?
+        .collect::<Result<Vec<Attachment>>>()
+    }
 }
 
 // Records a path, never a copy of the file — see DESIGN.md. Idempotent per the
 // UNIQUE(entry_id, path) constraint; the bool reports whether a row was added.
 // An unknown cite_key is an error (QueryReturnedNoRows), same as add_tag.
-pub fn attach(conn: &Connection, cite_key: &str, path: &str) -> Result<bool> {
+pub fn attach(conn: &Connection, cite_key: &str, path: &str) -> Result<(i64, bool)> {
     let entry_id: i64 = conn.query_row(
         "SELECT id FROM entries WHERE cite_key = ?1",
         [cite_key],
@@ -222,7 +259,44 @@ pub fn attach(conn: &Connection, cite_key: &str, path: &str) -> Result<bool> {
         "INSERT OR IGNORE INTO attachments (entry_id, path, date_added) VALUES (?1, ?2, ?3)",
         rusqlite::params![entry_id, path, now()],
     )?;
-    Ok(conn.changes() > 0)
+    let changed = conn.changes() > 0;
+
+    // Looked up rather than taken from last_insert_rowid(), which is stale
+    // when the INSERT was ignored. The id is what set_full_text needs.
+    let attachment_id: i64 = conn.query_row(
+        "SELECT id FROM attachments WHERE entry_id = ?1 AND path = ?2",
+        rusqlite::params![entry_id, path],
+        |row| row.get(0),
+    )?;
+    Ok((attachment_id, changed))
+}
+
+// Overwrites any previous extraction for this path -- re-extraction is meant
+// to replace, not accumulate.
+// Keyed by attachment id, not by path: the same file can be attached to two
+// entries, and matching on path would let `extract <one_key>` silently write
+// into a row belonging to an entry the command was never pointed at.
+// Ok(0) means the row is gone, which the caller must not report as success.
+pub fn set_full_text(conn: &Connection, attachment_id: i64, text: &str) -> Result<usize> {
+    conn.execute(
+        "UPDATE attachments SET full_text = ?1 WHERE id = ?2",
+        rusqlite::params![text, attachment_id],
+    )
+}
+
+// The attachment paths for one entry, unknown cite_key is an error
+// (QueryReturnedNoRows), same pattern as attach/add_tag.
+// (id, path) pairs -- the id is what set_full_text keys on.
+pub fn attachments_for_cite_key(conn: &Connection, cite_key: &str) -> Result<Vec<(i64, String)>> {
+    let entry_id: i64 = conn.query_row(
+        "SELECT id FROM entries WHERE cite_key = ?1",
+        [cite_key],
+        |row| row.get(0),
+    )?;
+    let mut stmt =
+        conn.prepare("SELECT id, path FROM attachments WHERE entry_id = ?1 ORDER BY id")?;
+    stmt.query_map([entry_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<Vec<(i64, String)>>>()
 }
 
 // Single place tag names are normalized, so writes (add_tag/remove_tag) and
@@ -315,7 +389,9 @@ fn like_pattern(s: &str) -> String {
     format!("%{escaped}%")
 }
 
-pub fn list_entries(conn: &Connection, filter: &Filter) -> Result<Vec<Entry>> {
+// with_full_text is a projection, not a filter, so it lives as a parameter
+// here rather than on Filter -- see attachments_for_entry's comment.
+pub fn list_entries(conn: &Connection, filter: &Filter, with_full_text: bool) -> Result<Vec<Entry>> {
     let mut clauses: Vec<&str> = Vec::new();
     let mut params: Vec<Value> = Vec::new();
 
@@ -376,7 +452,7 @@ pub fn list_entries(conn: &Connection, filter: &Filter) -> Result<Vec<Entry>> {
     for entry in &mut entries {
         entry.authors = authors_for_entry(conn, entry.id.unwrap())?;
         entry.tags = tags_for_entry(conn, entry.id.unwrap())?;
-        entry.attachments = attachments_for_entry(conn, entry.id.unwrap())?;
+        entry.attachments = attachments_for_entry(conn, entry.id.unwrap(), with_full_text)?;
     }
     Ok(entries)
 }
@@ -503,7 +579,7 @@ mod tests {
         assert_eq!(after.authors[0].first_name, None);
         assert!(after.date_modified > stale, "update_entry must stamp date_modified");
 
-        assert_eq!(list_entries(&conn, &Filter::default()).unwrap().len(), 1);
+        assert_eq!(list_entries(&conn, &Filter::default(), false).unwrap().len(), 1);
 
         delete_entry(&conn, "smith2024").unwrap();
         assert!(get_entry(&conn, "smith2024").unwrap().is_none());
@@ -522,7 +598,7 @@ mod tests {
     }
 
     fn keys(conn: &Connection, filter: &Filter) -> Vec<String> {
-        list_entries(conn, filter)
+        list_entries(conn, filter, false)
             .unwrap()
             .into_iter()
             .map(|e| e.cite_key)
@@ -656,15 +732,23 @@ mod tests {
         create_schema(&conn).unwrap();
         seed(&conn, "a", "Paper", 2024, "Smith", "John");
 
-        assert!(attach(&conn, "a", "/tmp/paper.pdf").unwrap());
-        // UNIQUE(entry_id, path) makes a repeat attach a no-op, not a duplicate.
-        assert!(!attach(&conn, "a", "/tmp/paper.pdf").unwrap());
-        assert!(attach(&conn, "a", "/tmp/supplement.pdf").unwrap());
+        let (first_id, changed) = attach(&conn, "a", "/tmp/paper.pdf").unwrap();
+        assert!(changed);
+        // UNIQUE(entry_id, path) makes a repeat attach a no-op, not a
+        // duplicate, and still reports the existing row's id.
+        let (again_id, changed) = attach(&conn, "a", "/tmp/paper.pdf").unwrap();
+        assert!(!changed);
+        assert_eq!(first_id, again_id);
+        assert!(attach(&conn, "a", "/tmp/supplement.pdf").unwrap().1);
 
-        assert_eq!(
-            get_entry(&conn, "a").unwrap().unwrap().attachments,
-            ["/tmp/paper.pdf", "/tmp/supplement.pdf"]
-        );
+        let paths: Vec<String> = get_entry(&conn, "a")
+            .unwrap()
+            .unwrap()
+            .attachments
+            .into_iter()
+            .map(|a| a.path)
+            .collect();
+        assert_eq!(paths, ["/tmp/paper.pdf", "/tmp/supplement.pdf"]);
 
         assert!(attach(&conn, "nonexistent", "/tmp/paper.pdf").is_err());
 
@@ -673,5 +757,74 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM attachments", [], |r| r.get(0))
             .unwrap();
         assert_eq!(orphans, 0, "delete_entry must cascade to attachments");
+    }
+
+    // Proves the Phase 7 migration: an old 4-column `attachments` table (no
+    // `full_text`, as Phase 6 shipped it) gets the column added, and existing
+    // rows survive.
+    #[test]
+    fn migration_adds_full_text_column_and_preserves_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_type TEXT NOT NULL,
+                cite_key TEXT UNIQUE NOT NULL,
+                title TEXT NOT NULL,
+                year INTEGER,
+                date_added INTEGER NOT NULL,
+                date_modified INTEGER NOT NULL
+            );
+            CREATE TABLE attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+                path TEXT NOT NULL,
+                date_added INTEGER NOT NULL,
+                UNIQUE (entry_id, path)
+            );
+            INSERT INTO entries (entry_type, cite_key, title, year, date_added, date_modified)
+                VALUES ('article', 'old2020', 'Old Entry', 2020, 0, 0);
+            INSERT INTO attachments (entry_id, path, date_added) VALUES (1, '/tmp/old.pdf', 0);
+            "#,
+        )
+        .unwrap();
+
+        create_schema(&conn).unwrap();
+
+        let has_full_text = conn
+            .prepare("SELECT 1 FROM pragma_table_info('attachments') WHERE name = 'full_text'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(has_full_text, "migration must add full_text column");
+
+        let path: String = conn
+            .query_row("SELECT path FROM attachments WHERE entry_id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(path, "/tmp/old.pdf", "migration must preserve existing rows");
+    }
+
+    // Regression: set_full_text once matched on `path`, so extracting for one
+    // entry silently wrote into every other entry sharing that file.
+    #[test]
+    fn extracting_one_entry_does_not_touch_another_sharing_the_file() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        seed(&conn, "e1", "One", 2024, "Smith", "John");
+        seed(&conn, "e2", "Two", 2024, "Jones", "Ada");
+
+        let (id1, _) = attach(&conn, "e1", "/tmp/shared.pdf").unwrap();
+        attach(&conn, "e2", "/tmp/shared.pdf").unwrap();
+
+        assert_eq!(set_full_text(&conn, id1, "text of e1").unwrap(), 1);
+
+        let e1 = get_entry(&conn, "e1").unwrap().unwrap();
+        let e2 = get_entry(&conn, "e2").unwrap().unwrap();
+        assert_eq!(e1.attachments[0].full_text.as_deref(), Some("text of e1"));
+        assert_eq!(e2.attachments[0].full_text, None, "e2 must be untouched");
+
+        // A vanished row reports 0 rather than silently succeeding.
+        assert_eq!(set_full_text(&conn, 9999, "orphan").unwrap(), 0);
     }
 }

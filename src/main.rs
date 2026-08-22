@@ -2,6 +2,7 @@ mod bibtex;
 mod cli;
 mod db;
 mod models;
+mod text;
 
 use std::path::Path;
 
@@ -57,12 +58,13 @@ fn main() {
             }
         }
 
-        Command::List { tag, json } => match db::list_entries(
+        Command::List { tag, full_text, json } => match db::list_entries(
             &conn,
             &db::Filter {
                 tag,
                 ..Default::default()
             },
+            full_text,
         ) {
             Ok(entries) => {
                 if json {
@@ -229,6 +231,7 @@ fn main() {
             from,
             to,
             tag,
+            full_text,
             json,
         } => {
             // --year is shorthand for a single-year range, so the filter only
@@ -241,7 +244,7 @@ fn main() {
                 tag,
             };
 
-            match db::list_entries(&conn, &filter) {
+            match db::list_entries(&conn, &filter, full_text) {
                 Ok(entries) => {
                     if json {
                         emit(&serde_json::to_string_pretty(&entries).unwrap());
@@ -258,28 +261,114 @@ fn main() {
         Command::Attach {
             cite_key,
             path,
+            extract,
             json,
         } => {
             let resolved = match cli::resolve_attachment_path(&path) {
                 Ok(p) => p,
                 Err(e) => die(&e),
             };
-            match db::attach(&conn, &cite_key, &resolved) {
-                Ok(changed) => {
-                    if json {
-                        let out = serde_json::json!({
-                            "cite_key": cite_key,
-                            "path": resolved,
-                            "changed": changed,
-                        });
-                        emit(&serde_json::to_string_pretty(&out).unwrap());
-                    } else if changed {
-                        emit(&format!("Attached '{resolved}' to '{cite_key}'"));
-                    } else {
-                        emit(&format!("'{cite_key}' already has '{resolved}'"));
+            let (attachment_id, changed) = match db::attach(&conn, &cite_key, &resolved) {
+                Ok(pair) => pair,
+                Err(e) => die(&entry_error(&cite_key, "attach file", e)),
+            };
+
+            // Extraction is independent of the attach: the path resolved (it
+            // exists), which is all `attach` promises. The attach row is
+            // committed above regardless of whether pdftotext can read it.
+            let extraction: Option<Result<usize, String>> = if extract {
+                Some(
+                    text::extract_text(Path::new(&resolved))
+                        .and_then(|extracted| save_extracted(&conn, attachment_id, &extracted)),
+                )
+            } else {
+                None
+            };
+
+            if json {
+                let mut out = serde_json::json!({
+                    "cite_key": cite_key,
+                    "path": resolved,
+                    "changed": changed,
+                });
+                if let Some(result) = &extraction {
+                    out["extracted"] = serde_json::json!(result.is_ok());
+                    match result {
+                        Ok(chars) => out["chars"] = serde_json::json!(chars),
+                        Err(e) => out["extract_error"] = serde_json::json!(e),
                     }
                 }
-                Err(e) => die(&entry_error(&cite_key, "attach file", e)),
+                emit(&serde_json::to_string_pretty(&out).unwrap());
+            } else if changed {
+                emit(&format!("Attached '{resolved}' to '{cite_key}'"));
+            } else {
+                emit(&format!("'{cite_key}' already has '{resolved}'"));
+            }
+
+            if let Some(Err(e)) = &extraction {
+                eprintln!("Warning: extraction failed for '{resolved}': {e}");
+                std::process::exit(1);
+            } else if let Some(Ok(chars)) = &extraction {
+                if !json {
+                    emit(&format!("Extracted {chars} characters from '{resolved}'"));
+                }
+            }
+        }
+
+        Command::Extract { cite_key, json } => {
+            let attachments = match db::attachments_for_cite_key(&conn, &cite_key) {
+                Ok(a) => a,
+                Err(e) => die(&entry_error(&cite_key, "extract text", e)),
+            };
+            if attachments.is_empty() {
+                die(&format!("'{cite_key}' has no attachments"));
+            }
+
+            // Per-attachment failures don't abort the rest -- collect every
+            // result and report them all.
+            let results: Vec<(String, Result<usize, String>)> = attachments
+                .into_iter()
+                .map(|(id, path)| {
+                    let result = text::extract_text(Path::new(&path))
+                        .and_then(|extracted| save_extracted(&conn, id, &extracted));
+                    (path, result)
+                })
+                .collect();
+
+            let any_failed = results.iter().any(|(_, r)| r.is_err());
+
+            if json {
+                let attachments: Vec<_> = results
+                    .iter()
+                    .map(|(path, result)| match result {
+                        Ok(chars) => serde_json::json!({
+                            "path": path,
+                            "extracted": true,
+                            "chars": chars,
+                        }),
+                        Err(e) => serde_json::json!({
+                            "path": path,
+                            "extracted": false,
+                            "error": e,
+                        }),
+                    })
+                    .collect();
+                let out = serde_json::json!({
+                    "cite_key": cite_key,
+                    "attachments": attachments,
+                });
+                emit(&serde_json::to_string_pretty(&out).unwrap());
+            } else {
+                for (path, result) in &results {
+                    match result {
+                        Ok(chars) => emit(&format!("Extracted {chars} characters from '{path}'")),
+                        Err(e) => emit(&format!("Failed to extract '{path}': {e}")),
+                    }
+                }
+            }
+
+            if any_failed {
+                std::process::exit(1);
             }
         }
 
@@ -295,8 +384,8 @@ fn main() {
 
             // Every attachment, not just the first: an entry usually has one,
             // and when it has two they're the paper and its supplement.
-            for path in &entry.attachments {
-                if let Err(e) = open_path(path) {
+            for attachment in &entry.attachments {
+                if let Err(e) = open_path(&attachment.path) {
                     die(&e);
                 }
             }
@@ -304,12 +393,12 @@ fn main() {
             if json {
                 let out = serde_json::json!({
                     "cite_key": cite_key,
-                    "opened": entry.attachments,
+                    "opened": entry.attachments.iter().map(|a| &a.path).collect::<Vec<_>>(),
                 });
                 emit(&serde_json::to_string_pretty(&out).unwrap());
             } else {
-                for path in &entry.attachments {
-                    emit(&format!("Opened '{path}'"));
+                for attachment in &entry.attachments {
+                    emit(&format!("Opened '{}'", attachment.path));
                 }
             }
         }
@@ -373,7 +462,7 @@ fn main() {
         }
 
         Command::Export { out } => {
-            let entries = match db::list_entries(&conn, &db::Filter::default()) {
+            let entries = match db::list_entries(&conn, &db::Filter::default(), false) {
                 Ok(e) => e,
                 Err(e) => die(&format!("failed to list entries: {e}")),
             };
@@ -424,6 +513,19 @@ fn open_path(path: &str) -> Result<(), String> {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => Err(format!("{opener} failed on '{path}' ({status})")),
         Err(e) => Err(format!("could not run {opener}: {e}")),
+    }
+}
+
+// Saves extracted text and returns its length in characters.
+//
+// A zero row count means the attachment row is gone (a concurrent `rm`, say).
+// Reporting that as a successful extraction would tell a script it has text in
+// the DB when nothing was written, so it's an error.
+fn save_extracted(conn: &rusqlite::Connection, attachment_id: i64, text: &str) -> Result<usize, String> {
+    match db::set_full_text(conn, attachment_id, text) {
+        Ok(0) => Err("attachment row no longer exists; nothing was saved".to_string()),
+        Ok(_) => Ok(text.chars().count()),
+        Err(e) => Err(format!("failed to save extracted text: {e}")),
     }
 }
 
@@ -482,8 +584,8 @@ fn format_entry(entry: &Entry) -> String {
             out.push_str(&format!("  {label}: {value}\n"));
         }
     }
-    for path in &entry.attachments {
-        out.push_str(&format!("  Attachment: {path}\n"));
+    for attachment in &entry.attachments {
+        out.push_str(&format!("  Attachment: {}\n", attachment.path));
     }
     out.pop(); // emit() adds the trailing newline
     out
