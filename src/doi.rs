@@ -44,7 +44,7 @@ pub fn fetch_metadata(doi: &str) -> Result<Entry, String> {
 
 /// Looks up an open-access PDF URL for `doi` via Unpaywall. `Ok(None)` means
 /// Unpaywall has no legal OA copy on record -- a normal answer, not an error.
-pub fn fetch_oa_pdf_url(doi: &str, email: &str) -> Result<Option<String>, String> {
+pub fn fetch_oa_pdf_url(doi: &str, email: &str) -> Result<OaStatus, String> {
     validate_doi(doi)?;
     let url = format!(
         "{UNPAYWALL_BASE}/{}?email={}",
@@ -433,17 +433,38 @@ fn parse_crossref(json: &str) -> Result<Entry, String> {
 /// Parses an Unpaywall response body, returning the OA PDF URL if one
 /// exists. `best_oa_location` (or its `url_for_pdf`) being `null` means no
 /// legal OA copy exists -- `Ok(None)`, not an error.
-fn parse_unpaywall(json: &str) -> Result<Option<String>, String> {
+/// What Unpaywall knows about a DOI. `is_oa` without a `pdf_url` is common --
+/// plenty of genuinely open papers are only linked as landing pages -- and the
+/// two cases deserve different messages, so they're kept apart here.
+pub struct OaStatus {
+    pub is_oa: bool,
+    pub pdf_url: Option<String>,
+}
+
+fn parse_unpaywall(json: &str) -> Result<OaStatus, String> {
     let v: serde_json::Value =
         serde_json::from_str(json).map_err(|e| format!("invalid Unpaywall JSON: {e}"))?;
 
-    let url = v
+    let is_oa = v.get("is_oa").and_then(|b| b.as_bool()).unwrap_or(false);
+
+    let pdf_of = |loc: &serde_json::Value| {
+        loc.get("url_for_pdf")
+            .and_then(|u| u.as_str())
+            .filter(|u| !u.is_empty())
+            .map(str::to_string)
+    };
+
+    // Only best_oa_location, deliberately. Scanning the other oa_locations for
+    // a url_for_pdf was tried and reverted: on live data the extra candidates
+    // it turned up were landing pages, so it converted a clean "no PDF
+    // available" into a "downloaded content is not a PDF" failure without
+    // fetching anything new.
+    let pdf_url = v
         .get("best_oa_location")
         .filter(|loc| !loc.is_null())
-        .and_then(|loc| loc.get("url_for_pdf"))
-        .and_then(|u| u.as_str())
-        .map(str::to_string);
-    Ok(url)
+        .and_then(pdf_of);
+
+    Ok(OaStatus { is_oa, pdf_url })
 }
 
 #[cfg(test)]
@@ -614,7 +635,7 @@ mod tests {
         }
         "#;
         assert_eq!(
-            parse_unpaywall(json).unwrap(),
+            parse_unpaywall(json).unwrap().pdf_url,
             Some(
                 "https://journals.plos.org/plosone/article/file?id=10.1371/journal.pone.0000308&type=printable"
                     .to_string()
@@ -627,7 +648,7 @@ mod tests {
     #[test]
     fn parses_unpaywall_response_with_no_oa_copy() {
         let json = r#"{ "doi": "10.1/paywalled", "is_oa": false, "best_oa_location": null }"#;
-        assert_eq!(parse_unpaywall(json).unwrap(), None);
+        assert_eq!(parse_unpaywall(json).unwrap().pdf_url, None);
     }
 
     // url_for_pdf itself can be null even when best_oa_location isn't.
@@ -636,7 +657,7 @@ mod tests {
         let json = r#"
         { "best_oa_location": { "url_for_pdf": null, "host_type": "repository" } }
         "#;
-        assert_eq!(parse_unpaywall(json).unwrap(), None);
+        assert_eq!(parse_unpaywall(json).unwrap().pdf_url, None);
     }
 
     #[test]
@@ -759,5 +780,47 @@ mod tests {
         let json = r#"{"message":{"type":"journal-article","title":["T"],
             "issued":{"date-parts":[[99999999999999]]}}}"#;
         assert_eq!(parse_crossref(json).unwrap().year, None);
+    }
+
+    // Real shape from 10.7717/peerj.4375: genuinely open access, but every
+    // location is a landing page. Reporting that as "not open access" sends
+    // the user looking for the wrong thing.
+    #[test]
+    fn open_access_without_a_pdf_link_is_distinguishable() {
+        let json = r#"{
+            "is_oa": true,
+            "best_oa_location": {"url": "https://doi.org/10.7717/peerj.4375",
+                                 "url_for_pdf": null, "host_type": "publisher"},
+            "oa_locations": [
+                {"url_for_pdf": null, "host_type": "publisher"},
+                {"url_for_pdf": null, "host_type": "repository"}
+            ]
+        }"#;
+        let oa = parse_unpaywall(json).unwrap();
+        assert!(oa.is_oa);
+        assert_eq!(oa.pdf_url, None);
+
+        let closed = parse_unpaywall(r#"{"is_oa": false, "best_oa_location": null}"#).unwrap();
+        assert!(!closed.is_oa);
+        assert_eq!(closed.pdf_url, None);
+    }
+
+    // Only best_oa_location is consulted; other oa_locations are ignored on
+    // purpose (see the comment in parse_unpaywall).
+    #[test]
+    fn other_oa_locations_are_not_consulted() {
+        let json = r#"{
+            "is_oa": true,
+            "best_oa_location": {"url_for_pdf": null},
+            "oa_locations": [{"url_for_pdf": "https://repo.example/paper.pdf"}]
+        }"#;
+        assert_eq!(parse_unpaywall(json).unwrap().pdf_url, None);
+
+        let both = r#"{"is_oa": true,
+            "best_oa_location": {"url_for_pdf": "https://best.example/a.pdf"}}"#;
+        assert_eq!(
+            parse_unpaywall(both).unwrap().pdf_url.as_deref(),
+            Some("https://best.example/a.pdf")
+        );
     }
 }

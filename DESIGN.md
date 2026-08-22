@@ -72,6 +72,11 @@ All nine phases are complete.
   APA truncation, or do ordinals. That's the documented ceiling: a third style
   or real edge-case correctness means adopting `hayagriva`, not extending
   `cite.rs`.
+- `fetch` only reads `best_oa_location.url_for_pdf`. Plenty of genuinely open
+  papers are linked only as landing pages, so "open access" and "fetchable PDF"
+  are reported as separate facts. Scanning the other `oa_locations` was tried
+  and reverted: on live DOIs the extra candidates were landing pages too, so it
+  turned a clean "no PDF available" into a download failure.
 - The Unpaywall contact email is never compiled in. It comes from `--email`,
   `FERREF_EMAIL`, or the config file, and is sent to Unpaywall and nowhere else.
 - SSRF protection resolves the host and then lets `ureq` resolve it again to

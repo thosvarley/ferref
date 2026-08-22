@@ -555,21 +555,29 @@ fn main() {
                 Err(e) => die(&e),
             };
 
-            let pdf_url = match doi::fetch_oa_pdf_url(&doi_value, &resolved_email) {
-                Ok(u) => u,
+            let oa = match doi::fetch_oa_pdf_url(&doi_value, &resolved_email) {
+                Ok(status) => status,
                 Err(e) => die(&format!("failed to query Unpaywall: {e}")),
             };
 
-            // No OA copy found is a normal, legitimate answer -- exit 0, not
-            // an error.
-            let Some(pdf_url) = pdf_url else {
+            // Having no PDF to fetch is a normal, legitimate answer -- exit 0,
+            // not an error. But "open access with no direct PDF link" and "not
+            // open access" are different facts, and telling a user their OA
+            // paper isn't OA would send them looking for the wrong thing.
+            let Some(pdf_url) = oa.pdf_url else {
                 if json {
                     let out = serde_json::json!({
                         "cite_key": cite_key,
                         "doi": doi_value,
                         "oa_found": false,
+                        "is_oa": oa.is_oa,
                     });
                     emit(&serde_json::to_string_pretty(&out).unwrap());
+                } else if oa.is_oa {
+                    emit(&format!(
+                        "'{cite_key}' (DOI {doi_value}) is open access, but Unpaywall \
+                         has no direct PDF link for it -- only landing pages"
+                    ));
                 } else {
                     emit(&format!(
                         "No open-access copy found for '{cite_key}' (DOI {doi_value})"
