@@ -161,6 +161,15 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Format an entry as a citation
+    Cite {
+        cite_key: String,
+        /// Citation style
+        #[arg(long, value_enum, default_value_t = CiteStyle::Apa)]
+        style: CiteStyle,
+        #[arg(long)]
+        json: bool,
+    },
     /// Import entries from a BibTeX (.bib) file. Duplicate cite_keys are
     /// skipped, not fatal -- re-importing an overlapping file is normal.
     Import {
@@ -188,6 +197,12 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum CiteStyle {
+    Apa,
+    Mla,
 }
 
 // "Last, First" -> Author. Splits on the first comma only (names can contain

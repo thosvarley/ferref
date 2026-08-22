@@ -39,7 +39,7 @@ Essential features that should be present at the end:
 
 ## Current state (2026-08-21)
 
-Phases 1–8 are complete. Phase 9 (citation formatting) is next.
+All nine phases are complete.
 
 - `src/models.rs` — `Entry`/`Author` + `now()`. `Serialize` derived; `abstract_text` serializes as `"abstract"` (Rust reserves `abstract`), locked by a test.
 - `src/db.rs` — schema + `insert_entry`/`get_entry`/`list_entries`/`update_entry`/`delete_entry`, all free functions over `&Connection`. `update_entry` stamps `date_modified` itself so callers can't forget. `list_entries` takes a `Filter`; an all-`None` filter matches everything, so `list` and `search` are one query. `add_tag`/`remove_tag` are idempotent and report whether anything changed; `normalize_tag` (trim + lowercase) is the single point both writes and the `tag` filter go through. `attach` stores a path, never a copy of the file.
@@ -47,6 +47,7 @@ Phases 1–8 are complete. Phase 9 (citation formatting) is next.
 - `src/text.rs` — `extract_text` over `pdftotext`. The project's trust boundary: bounded memory (the drain keeps the first 10MB and discards the rest rather than buffering it all), a 30s deadline covering *both* the child wait and the pipe drain, and a process-group kill so a wrapper script's descendants can't outlive us.
 - `src/doi.rs` — Crossref metadata + Unpaywall OA lookup over `ureq`. The network trust boundary: every request goes through `fetch_guarded`, which follows redirects by hand so each hop's scheme and resolved IP are revalidated, with capped reads and a `%PDF` magic-byte check before anything is written.
 - `src/config.rs` — reads one key (`email`) from `~/.config/ferref/config.toml`. Deliberately a line reader, not TOML, and not a settings system.
+- `src/cite.rs` — APA and MLA as string templates. Not a CSL engine, on purpose.
 - `src/cli.rs` — clap derive types for `add`/`list`/`show`/`edit`/`rm`/`search`/`import`/`export`, plus `parse_author`.
 - `src/main.rs` — thin dispatcher. All stdout goes through `emit()`, which exits 0 on a closed pipe instead of panicking. Failures exit non-zero with the message on stderr.
 
@@ -67,6 +68,10 @@ Phases 1–8 are complete. Phase 9 (citation formatting) is next.
   front; a moved file still needs `rm` + re-add.
 - Attachment paths are absolute and stored at attach time. Moving the file, or
   the library, breaks them silently — nothing revalidates them.
+- `cite` covers APA and MLA only, and doesn't recase titles, handle 21+ author
+  APA truncation, or do ordinals. That's the documented ceiling: a third style
+  or real edge-case correctness means adopting `hayagriva`, not extending
+  `cite.rs`.
 - The Unpaywall contact email is never compiled in. It comes from `--email`,
   `FERREF_EMAIL`, or the config file, and is sent to Unpaywall and nowhere else.
 - SSRF protection resolves the host and then lets `ureq` resolve it again to
