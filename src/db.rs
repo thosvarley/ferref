@@ -1,6 +1,7 @@
 // This imports the rusqlite library's Connection type
 // Connection represents a connection to a SQLite database file
-use rusqlite::{Connection, Result, Row};
+use rusqlite::types::Value;
+use rusqlite::{params_from_iter, Connection, Result, Row};
 
 // This imports the Path type from Rust's standard library
 // Path is used for working with file system paths
@@ -167,10 +168,69 @@ pub fn get_entry(conn: &Connection, cite_key: &str) -> Result<Option<Entry>> {
     Ok(Some(entry))
 }
 
-pub fn list_entries(conn: &Connection) -> Result<Vec<Entry>> {
-    let mut stmt = conn.prepare("SELECT * FROM entries ORDER BY id")?;
+// An all-None Filter matches everything, so `list` and `search` are the same
+// query with different arguments rather than two near-identical functions.
+#[derive(Default)]
+pub struct Filter {
+    pub author: Option<String>,
+    pub title: Option<String>,
+    pub year_min: Option<i32>,
+    pub year_max: Option<i32>,
+}
+
+// Wraps a user substring for LIKE, escaping the wildcards so searching for
+// "100%" or "a_b" means those literal characters. Paired with ESCAPE '\' in
+// the SQL below.
+fn like_pattern(s: &str) -> String {
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{escaped}%")
+}
+
+pub fn list_entries(conn: &Connection, filter: &Filter) -> Result<Vec<Entry>> {
+    let mut clauses: Vec<&str> = Vec::new();
+    let mut params: Vec<Value> = Vec::new();
+
+    if let Some(title) = &filter.title {
+        clauses.push("title LIKE ? ESCAPE '\\'");
+        params.push(Value::Text(like_pattern(title)));
+    }
+
+    if let Some(author) = &filter.author {
+        // EXISTS rather than a JOIN: a match on any one author shouldn't
+        // duplicate the entry row.
+        clauses.push(
+            "EXISTS (SELECT 1 FROM authors a WHERE a.entry_id = entries.id \
+             AND (a.last_name LIKE ? ESCAPE '\\' OR a.first_name LIKE ? ESCAPE '\\'))",
+        );
+        let pattern = like_pattern(author);
+        params.push(Value::Text(pattern.clone()));
+        params.push(Value::Text(pattern));
+    }
+
+    if let Some(min) = filter.year_min {
+        clauses.push("year >= ?");
+        params.push(Value::Integer(min.into()));
+    }
+    if let Some(max) = filter.year_max {
+        clauses.push("year <= ?");
+        params.push(Value::Integer(max.into()));
+    }
+
+    let sql = if clauses.is_empty() {
+        "SELECT * FROM entries ORDER BY id".to_string()
+    } else {
+        format!(
+            "SELECT * FROM entries WHERE {} ORDER BY id",
+            clauses.join(" AND ")
+        )
+    };
+
+    let mut stmt = conn.prepare(&sql)?;
     let mut entries = stmt
-        .query_map([], entry_from_row)?
+        .query_map(params_from_iter(params), entry_from_row)?
         .collect::<Result<Vec<Entry>>>()?;
 
     for entry in &mut entries {
@@ -301,7 +361,7 @@ mod tests {
         assert_eq!(after.authors[0].first_name, None);
         assert!(after.date_modified > stale, "update_entry must stamp date_modified");
 
-        assert_eq!(list_entries(&conn).unwrap().len(), 1);
+        assert_eq!(list_entries(&conn, &Filter::default()).unwrap().len(), 1);
 
         delete_entry(&conn, "smith2024").unwrap();
         assert!(get_entry(&conn, "smith2024").unwrap().is_none());
@@ -310,5 +370,92 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM authors", [], |r| r.get(0))
             .unwrap();
         assert_eq!(orphans, 0, "delete_entry must cascade to authors");
+    }
+
+    fn seed(conn: &Connection, key: &str, title: &str, year: i32, last: &str, first: &str) {
+        let mut entry = Entry::new("article".into(), key.into(), title.into());
+        entry.add_author(Author::new(last.into(), Some(first.into())));
+        entry.year = Some(year);
+        insert_entry(conn, &entry).unwrap();
+    }
+
+    fn keys(conn: &Connection, filter: &Filter) -> Vec<String> {
+        list_entries(conn, filter)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.cite_key)
+            .collect()
+    }
+
+    #[test]
+    fn filters_by_author_title_and_year_range() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        seed(&conn, "a", "Neural Networks", 2020, "Smith", "John");
+        seed(&conn, "b", "Graph Theory", 2024, "Smithson", "Jane");
+        seed(&conn, "c", "Neural Coding", 2022, "Jones", "Ada");
+
+        // Empty filter matches everything, so `list` keeps working.
+        assert_eq!(keys(&conn, &Filter::default()).len(), 3);
+
+        // Substring, case-insensitive, and matches Smithson too.
+        let by_author = Filter {
+            author: Some("smith".into()),
+            ..Default::default()
+        };
+        assert_eq!(keys(&conn, &by_author), ["a", "b"]);
+
+        // First names are searched as well as last.
+        let by_first = Filter {
+            author: Some("ada".into()),
+            ..Default::default()
+        };
+        assert_eq!(keys(&conn, &by_first), ["c"]);
+
+        let by_title = Filter {
+            title: Some("neural".into()),
+            ..Default::default()
+        };
+        assert_eq!(keys(&conn, &by_title), ["a", "c"]);
+
+        let by_range = Filter {
+            year_min: Some(2021),
+            year_max: Some(2023),
+            ..Default::default()
+        };
+        assert_eq!(keys(&conn, &by_range), ["c"]);
+
+        // Filters combine with AND.
+        let combined = Filter {
+            title: Some("neural".into()),
+            year_min: Some(2021),
+            ..Default::default()
+        };
+        assert_eq!(keys(&conn, &combined), ["c"]);
+    }
+
+    // Without ESCAPE, a literal % or _ in the query would act as a wildcard
+    // and match everything.
+    #[test]
+    fn like_wildcards_in_a_query_are_literal() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        seed(&conn, "pct", "Growth of 100% Yield", 2020, "Smith", "John");
+        seed(&conn, "other", "Unrelated Work", 2020, "Jones", "Ada");
+
+        let literal = Filter {
+            title: Some("100%".into()),
+            ..Default::default()
+        };
+        assert_eq!(keys(&conn, &literal), ["pct"]);
+
+        // A bare wildcard finds nothing, because no title contains "%_".
+        let wildcard = Filter {
+            title: Some("%_".into()),
+            ..Default::default()
+        };
+        assert!(keys(&conn, &wildcard).is_empty());
     }
 }

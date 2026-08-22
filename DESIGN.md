@@ -39,11 +39,12 @@ Essential features that should be present at the end:
 
 ## Current state (2026-08-21)
 
-Phases 1 and 2 are complete. Phase 3 (BibTeX) is next.
+Phases 1–4 are complete. Phase 5 (tags/collections) is next.
 
 - `src/models.rs` — `Entry`/`Author` + `now()`. `Serialize` derived; `abstract_text` serializes as `"abstract"` (Rust reserves `abstract`), locked by a test.
-- `src/db.rs` — schema + `insert_entry`/`get_entry`/`list_entries`/`update_entry`/`delete_entry`, all free functions over `&Connection`. `update_entry` stamps `date_modified` itself so callers can't forget.
-- `src/cli.rs` — clap derive types for `add`/`list`/`show`/`edit`/`rm`, plus `parse_author`.
+- `src/db.rs` — schema + `insert_entry`/`get_entry`/`list_entries`/`update_entry`/`delete_entry`, all free functions over `&Connection`. `update_entry` stamps `date_modified` itself so callers can't forget. `list_entries` takes a `Filter`; an all-`None` filter matches everything, so `list` and `search` are one query.
+- `src/bibtex.rs` — `import`/`export` over the `biblatex` crate, plus the `biblatex::Entry` ↔ `models::Entry` mapping.
+- `src/cli.rs` — clap derive types for `add`/`list`/`show`/`edit`/`rm`/`search`/`import`/`export`, plus `parse_author`.
 - `src/main.rs` — thin dispatcher. All stdout goes through `emit()`, which exits 0 on a closed pipe instead of panicking. Failures exit non-zero with the message on stderr.
 
 ### Known limitations

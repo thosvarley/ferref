@@ -83,6 +83,27 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Search entries. Filters combine with AND; substring matches are
+    /// case-insensitive for ASCII.
+    Search {
+        /// Substring of an author's first or last name
+        #[arg(long)]
+        author: Option<String>,
+        /// Substring of the title
+        #[arg(long)]
+        title: Option<String>,
+        /// Exact year; shorthand for --from Y --to Y
+        #[arg(long)]
+        year: Option<i32>,
+        /// Earliest year, inclusive
+        #[arg(long)]
+        from: Option<i32>,
+        /// Latest year, inclusive
+        #[arg(long)]
+        to: Option<i32>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Import entries from a BibTeX (.bib) file. Duplicate cite_keys are
     /// skipped, not fatal -- re-importing an overlapping file is normal.
     Import {

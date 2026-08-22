@@ -57,7 +57,7 @@ fn main() {
             }
         }
 
-        Command::List { json } => match db::list_entries(&conn) {
+        Command::List { json } => match db::list_entries(&conn, &db::Filter::default()) {
             Ok(entries) => {
                 if json {
                     emit(&serde_json::to_string_pretty(&entries).unwrap());
@@ -160,6 +160,37 @@ fn main() {
             }
         }
 
+        Command::Search {
+            author,
+            title,
+            year,
+            from,
+            to,
+            json,
+        } => {
+            // --year is shorthand for a single-year range, so the filter only
+            // has to understand min/max.
+            let filter = db::Filter {
+                author,
+                title,
+                year_min: year.or(from),
+                year_max: year.or(to),
+            };
+
+            match db::list_entries(&conn, &filter) {
+                Ok(entries) => {
+                    if json {
+                        emit(&serde_json::to_string_pretty(&entries).unwrap());
+                    } else {
+                        for entry in &entries {
+                            emit(&format_list_line(entry));
+                        }
+                    }
+                }
+                Err(e) => die(&format!("failed to search entries: {e}")),
+            }
+        }
+
         Command::Import { path, json } => {
             let entries = match bibtex::import(&path) {
                 Ok(e) => e,
@@ -219,7 +250,7 @@ fn main() {
         }
 
         Command::Export { out } => {
-            let entries = match db::list_entries(&conn) {
+            let entries = match db::list_entries(&conn, &db::Filter::default()) {
                 Ok(e) => e,
                 Err(e) => die(&format!("failed to list entries: {e}")),
             };
