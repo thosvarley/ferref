@@ -31,7 +31,8 @@ pub struct Entry {
     // Vec<T> is a "vector" - a growable array/list
     // Vec<Author> means "a list of Author structs"
     pub authors: Vec<Author>,
-    
+    pub tags: Vec<String>,
+
     // Optional fields use Option<T>
     // i32 is a 32-bit integer (good enough for years)
     pub year: Option<i32>,
@@ -85,6 +86,7 @@ impl Entry {
             cite_key,
             title,
             authors: Vec::new(),  // Empty vector of authors
+            tags: Vec::new(),
             year: None,
             journal: None,
             volume: None,

@@ -57,7 +57,13 @@ fn main() {
             }
         }
 
-        Command::List { json } => match db::list_entries(&conn, &db::Filter::default()) {
+        Command::List { tag, json } => match db::list_entries(
+            &conn,
+            &db::Filter {
+                tag,
+                ..Default::default()
+            },
+        ) {
             Ok(entries) => {
                 if json {
                     emit(&serde_json::to_string_pretty(&entries).unwrap());
@@ -160,12 +166,69 @@ fn main() {
             }
         }
 
+        Command::Tag {
+            cite_key,
+            tag,
+            json,
+        } => {
+            let normalized = match db::normalize_tag(&tag) {
+                Ok(t) => t,
+                Err(e) => die(&format!("invalid tag: {e}")),
+            };
+            match db::add_tag(&conn, &cite_key, &normalized) {
+                Ok(changed) => {
+                    if json {
+                        let out = serde_json::json!({
+                            "cite_key": cite_key,
+                            "tag": normalized,
+                            "changed": changed,
+                        });
+                        emit(&serde_json::to_string_pretty(&out).unwrap());
+                    } else if changed {
+                        emit(&format!("Tagged '{cite_key}' with '{normalized}'"));
+                    } else {
+                        emit(&format!("'{cite_key}' already tagged '{normalized}'"));
+                    }
+                }
+                Err(e) => die(&tag_error(&cite_key, "tag", e)),
+            }
+        }
+
+        Command::Untag {
+            cite_key,
+            tag,
+            json,
+        } => {
+            let normalized = match db::normalize_tag(&tag) {
+                Ok(t) => t,
+                Err(e) => die(&format!("invalid tag: {e}")),
+            };
+            match db::remove_tag(&conn, &cite_key, &normalized) {
+                Ok(changed) => {
+                    if json {
+                        let out = serde_json::json!({
+                            "cite_key": cite_key,
+                            "tag": normalized,
+                            "changed": changed,
+                        });
+                        emit(&serde_json::to_string_pretty(&out).unwrap());
+                    } else if changed {
+                        emit(&format!("Untagged '{cite_key}' from '{normalized}'"));
+                    } else {
+                        emit(&format!("'{cite_key}' was not tagged '{normalized}'"));
+                    }
+                }
+                Err(e) => die(&tag_error(&cite_key, "untag", e)),
+            }
+        }
+
         Command::Search {
             author,
             title,
             year,
             from,
             to,
+            tag,
             json,
         } => {
             // --year is shorthand for a single-year range, so the filter only
@@ -175,6 +238,7 @@ fn main() {
                 title,
                 year_min: year.or(from),
                 year_max: year.or(to),
+                tag,
             };
 
             match db::list_entries(&conn, &filter) {
@@ -287,6 +351,18 @@ fn emit(s: &str) {
     }
 }
 
+// add_tag/remove_tag report an unknown cite_key as QueryReturnedNoRows, which
+// would otherwise reach the user as "Query returned no rows". Every other
+// command names the key it couldn't find; these should too.
+fn tag_error(cite_key: &str, verb: &str, e: rusqlite::Error) -> String {
+    match e {
+        rusqlite::Error::QueryReturnedNoRows => {
+            format!("no entry found with cite_key '{cite_key}'")
+        }
+        e => format!("failed to {verb} entry: {e}"),
+    }
+}
+
 fn output_entry(entry: &Entry, json: bool) {
     if json {
         emit(&serde_json::to_string_pretty(entry).unwrap());
@@ -311,6 +387,9 @@ fn format_entry(entry: &Entry) -> String {
     out.push_str(&format!("  Type: {}\n", entry.entry_type));
     if !entry.authors.is_empty() {
         out.push_str(&format!("  Authors: {}\n", format_authors(&entry.authors)));
+    }
+    if !entry.tags.is_empty() {
+        out.push_str(&format!("  Tags: {}\n", entry.tags.join(", ")));
     }
     if let Some(year) = entry.year {
         out.push_str(&format!("  Year: {year}\n"));

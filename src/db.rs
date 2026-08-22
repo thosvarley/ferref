@@ -43,6 +43,16 @@ CREATE TABLE IF NOT EXISTS authors (
 CREATE INDEX IF NOT EXISTS idx_authors_entry ON authors(entry_id);
 CREATE INDEX IF NOT EXISTS idx_entries_cite_key ON entries(cite_key);
 CREATE INDEX IF NOT EXISTS idx_entries_year ON entries(year);
+
+CREATE TABLE IF NOT EXISTS tags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL
+);
+CREATE TABLE IF NOT EXISTS entry_tags (
+    entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    PRIMARY KEY (entry_id, tag_id)
+);
 "#;
 
 fn create_schema(conn: &Connection) -> Result<()> {
@@ -77,6 +87,7 @@ fn entry_from_row(row: &Row) -> Result<Entry> {
         cite_key: row.get("cite_key")?,
         title: row.get("title")?,
         authors: Vec::new(),
+        tags: Vec::new(),
         year: row.get("year")?,
         journal: row.get("journal")?,
         volume: row.get("volume")?,
@@ -165,7 +176,85 @@ pub fn get_entry(conn: &Connection, cite_key: &str) -> Result<Option<Entry>> {
 
     let mut entry = entry_from_row(row)?;
     entry.authors = authors_for_entry(conn, entry.id.unwrap())?;
+    entry.tags = tags_for_entry(conn, entry.id.unwrap())?;
     Ok(Some(entry))
+}
+
+fn tags_for_entry(conn: &Connection, entry_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.name FROM tags t JOIN entry_tags et ON et.tag_id = t.id \
+         WHERE et.entry_id = ?1 ORDER BY t.name",
+    )?;
+    stmt.query_map([entry_id], |row| row.get(0))?
+        .collect::<Result<Vec<String>>>()
+}
+
+// Single place tag names are normalized, so writes (add_tag/remove_tag) and
+// reads (the `tag` filter in list_entries) can't disagree about what counts
+// as the same tag. Rejects empty-after-trim rather than writing it, for the
+// same reason parse_author rejects an empty last name: NOT NULL still accepts "".
+// Returns Result<_, String> rather than a rusqlite error: this is input
+// validation, not a DB failure, and it matches cli::parse_author.
+pub fn normalize_tag(raw: &str) -> std::result::Result<String, String> {
+    let name = raw.trim().to_lowercase();
+    if name.is_empty() {
+        return Err("tag name cannot be empty".to_string());
+    }
+    Ok(name)
+}
+
+// Idempotent: returns Ok(false) (not an error) if the entry already had the
+// tag. An unknown cite_key is a real error (QueryReturnedNoRows), same as
+// update_entry's id lookup.
+pub fn add_tag(conn: &Connection, cite_key: &str, tag: &str) -> Result<bool> {
+    let name = normalize_tag(tag).map_err(rusqlite::Error::InvalidParameterName)?;
+    let tx = conn.unchecked_transaction()?;
+
+    let entry_id: i64 = tx.query_row(
+        "SELECT id FROM entries WHERE cite_key = ?1",
+        [cite_key],
+        |row| row.get(0),
+    )?;
+
+    // last_insert_rowid() is unsafe to rely on after INSERT OR IGNORE -- it's
+    // stale when the insert was ignored -- so the id is looked up explicitly.
+    tx.execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", [&name])?;
+    let tag_id: i64 =
+        tx.query_row("SELECT id FROM tags WHERE name = ?1", [&name], |row| row.get(0))?;
+
+    tx.execute(
+        "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)",
+        [entry_id, tag_id],
+    )?;
+    let changed = tx.changes() > 0;
+
+    tx.commit()?;
+    Ok(changed)
+}
+
+// Idempotent: returns Ok(false) if the entry wasn't tagged with it.
+//
+// ponytail: a tag row orphaned by its last untag is left in `tags` rather
+// than garbage-collected; harmless because nothing lists all tags yet.
+pub fn remove_tag(conn: &Connection, cite_key: &str, tag: &str) -> Result<bool> {
+    let name = normalize_tag(tag).map_err(rusqlite::Error::InvalidParameterName)?;
+    let tx = conn.unchecked_transaction()?;
+
+    let entry_id: i64 = tx.query_row(
+        "SELECT id FROM entries WHERE cite_key = ?1",
+        [cite_key],
+        |row| row.get(0),
+    )?;
+
+    tx.execute(
+        "DELETE FROM entry_tags WHERE entry_id = ?1 \
+         AND tag_id = (SELECT id FROM tags WHERE name = ?2)",
+        rusqlite::params![entry_id, name],
+    )?;
+    let changed = tx.changes() > 0;
+
+    tx.commit()?;
+    Ok(changed)
 }
 
 // An all-None Filter matches everything, so `list` and `search` are the same
@@ -176,6 +265,7 @@ pub struct Filter {
     pub title: Option<String>,
     pub year_min: Option<i32>,
     pub year_max: Option<i32>,
+    pub tag: Option<String>,
 }
 
 // Wraps a user substring for LIKE, escaping the wildcards so searching for
@@ -219,6 +309,20 @@ pub fn list_entries(conn: &Connection, filter: &Filter) -> Result<Vec<Entry>> {
         params.push(Value::Integer(max.into()));
     }
 
+    if let Some(tag) = &filter.tag {
+        // EXISTS, not a JOIN, for the same reason the author clause is: a
+        // join can duplicate the entry row. Exact match, not LIKE -- tags
+        // are identifiers, not prose. Normalized the same way add_tag/
+        // remove_tag write it, so "ML" finds what was stored as "ml"; an
+        // empty-after-trim filter just matches nothing (no tag row is ever
+        // empty), so the fallible normalize_tag error is not surfaced here.
+        clauses.push(
+            "EXISTS (SELECT 1 FROM entry_tags et JOIN tags t ON t.id = et.tag_id \
+             WHERE et.entry_id = entries.id AND t.name = ?)",
+        );
+        params.push(Value::Text(normalize_tag(tag).unwrap_or_default()));
+    }
+
     let sql = if clauses.is_empty() {
         "SELECT * FROM entries ORDER BY id".to_string()
     } else {
@@ -235,6 +339,7 @@ pub fn list_entries(conn: &Connection, filter: &Filter) -> Result<Vec<Entry>> {
 
     for entry in &mut entries {
         entry.authors = authors_for_entry(conn, entry.id.unwrap())?;
+        entry.tags = tags_for_entry(conn, entry.id.unwrap())?;
     }
     Ok(entries)
 }
@@ -457,5 +562,53 @@ mod tests {
             ..Default::default()
         };
         assert!(keys(&conn, &wildcard).is_empty());
+    }
+
+    #[test]
+    fn tagging_add_remove_normalize_filter_and_cascade() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        seed(&conn, "a", "Neural Networks", 2020, "Smith", "John");
+        seed(&conn, "b", "Graph Theory", 2024, "Smithson", "Jane");
+
+        // tag -> get_entry sees it; tagging again is a no-op, no duplicate.
+        assert_eq!(add_tag(&conn, "a", "ml").unwrap(), true);
+        assert_eq!(add_tag(&conn, "a", "ml").unwrap(), false);
+        assert_eq!(get_entry(&conn, "a").unwrap().unwrap().tags, vec!["ml".to_string()]);
+
+        // untag: true, then false the second time.
+        assert_eq!(remove_tag(&conn, "a", "ml").unwrap(), true);
+        assert_eq!(remove_tag(&conn, "a", "ml").unwrap(), false);
+        assert!(get_entry(&conn, "a").unwrap().unwrap().tags.is_empty());
+
+        // Unknown cite_key is a real error, not a silent no-op.
+        assert!(add_tag(&conn, "nonexistent", "ml").is_err());
+
+        // Empty-after-trim tag name is rejected before it reaches the DB.
+        assert!(normalize_tag("   ").is_err());
+
+        // Normalization: "  ML  " and "ml" collapse to one tag row.
+        add_tag(&conn, "a", "  ML  ").unwrap();
+        add_tag(&conn, "b", "ml").unwrap();
+        let tag_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tag_count, 1);
+
+        // Filtering by "ML" finds both, matched against the normalized name.
+        let by_tag = Filter {
+            tag: Some("ML".into()),
+            ..Default::default()
+        };
+        assert_eq!(keys(&conn, &by_tag), ["a", "b"]);
+
+        // delete_entry cascades to entry_tags.
+        delete_entry(&conn, "a").unwrap();
+        delete_entry(&conn, "b").unwrap();
+        let orphans: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entry_tags", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(orphans, 0, "delete_entry must cascade to entry_tags");
     }
 }

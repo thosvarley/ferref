@@ -43,6 +43,9 @@ pub enum Command {
     },
     /// List all entries
     List {
+        /// Exact tag name (case/whitespace-insensitive)
+        #[arg(long)]
+        tag: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -83,6 +86,20 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Add a tag to an entry. Idempotent -- tagging twice is not an error.
+    Tag {
+        cite_key: String,
+        tag: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a tag from an entry. Idempotent -- untagging twice is not an error.
+    Untag {
+        cite_key: String,
+        tag: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Search entries. Filters combine with AND; substring matches are
     /// case-insensitive for ASCII.
     Search {
@@ -101,6 +118,9 @@ pub enum Command {
         /// Latest year, inclusive
         #[arg(long)]
         to: Option<i32>,
+        /// Exact tag name (case/whitespace-insensitive)
+        #[arg(long)]
+        tag: Option<String>,
         #[arg(long)]
         json: bool,
     },

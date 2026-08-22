@@ -3,3 +3,5 @@
 # The library database is user data, not source. Matches ./ferref.db created by
 # running the CLI, and the stale src/ferref.db left over from early development.
 ferref.db
+
+restart_claude.sh
