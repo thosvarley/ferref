@@ -39,12 +39,14 @@ Essential features that should be present at the end:
 
 ## Current state (2026-08-21)
 
-Phases 1–7 are complete. Phase 8 (DOI lookup) is next.
+Phases 1–8 are complete. Phase 9 (citation formatting) is next.
 
 - `src/models.rs` — `Entry`/`Author` + `now()`. `Serialize` derived; `abstract_text` serializes as `"abstract"` (Rust reserves `abstract`), locked by a test.
 - `src/db.rs` — schema + `insert_entry`/`get_entry`/`list_entries`/`update_entry`/`delete_entry`, all free functions over `&Connection`. `update_entry` stamps `date_modified` itself so callers can't forget. `list_entries` takes a `Filter`; an all-`None` filter matches everything, so `list` and `search` are one query. `add_tag`/`remove_tag` are idempotent and report whether anything changed; `normalize_tag` (trim + lowercase) is the single point both writes and the `tag` filter go through. `attach` stores a path, never a copy of the file.
 - `src/bibtex.rs` — `import`/`export` over the `biblatex` crate, plus the `biblatex::Entry` ↔ `models::Entry` mapping.
 - `src/text.rs` — `extract_text` over `pdftotext`. The project's trust boundary: bounded memory (the drain keeps the first 10MB and discards the rest rather than buffering it all), a 30s deadline covering *both* the child wait and the pipe drain, and a process-group kill so a wrapper script's descendants can't outlive us.
+- `src/doi.rs` — Crossref metadata + Unpaywall OA lookup over `ureq`. The network trust boundary: every request goes through `fetch_guarded`, which follows redirects by hand so each hop's scheme and resolved IP are revalidated, with capped reads and a `%PDF` magic-byte check before anything is written.
+- `src/config.rs` — reads one key (`email`) from `~/.config/ferref/config.toml`. Deliberately a line reader, not TOML, and not a settings system.
 - `src/cli.rs` — clap derive types for `add`/`list`/`show`/`edit`/`rm`/`search`/`import`/`export`, plus `parse_author`.
 - `src/main.rs` — thin dispatcher. All stdout goes through `emit()`, which exits 0 on a closed pipe instead of panicking. Failures exit non-zero with the message on stderr.
 
@@ -65,6 +67,14 @@ Phases 1–7 are complete. Phase 8 (DOI lookup) is next.
   front; a moved file still needs `rm` + re-add.
 - Attachment paths are absolute and stored at attach time. Moving the file, or
   the library, breaks them silently — nothing revalidates them.
+- The Unpaywall contact email is never compiled in. It comes from `--email`,
+  `FERREF_EMAIL`, or the config file, and is sent to Unpaywall and nowhere else.
+- SSRF protection resolves the host and then lets `ureq` resolve it again to
+  connect, so a DNS record that changes between the two (rebinding) can still
+  get through. Closing that needs a resolver we control, i.e. a dependency.
+- Fetched PDFs land in `./pdfs/<cite_key>.pdf`. `sanitize_filename` is
+  many-to-one, so colliding keys get `-2`, `-3` suffixes rather than sharing a
+  file; an existing file is only reused when the same entry already has it.
 - Extraction is PDF-only and requires `pdftotext` (poppler-utils) on `PATH`.
 - Extracted text is capped at 10MB per attachment, with a truncation marker.
 - `full_text` is omitted from `list`/`search` unless `--full-text` is passed, so

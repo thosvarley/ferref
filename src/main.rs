@@ -1,6 +1,8 @@
 mod bibtex;
 mod cli;
+mod config;
 mod db;
+mod doi;
 mod models;
 mod text;
 
@@ -34,20 +36,48 @@ fn main() {
             abstract_text,
             json,
         } => {
-            let mut entry = Entry::new(entry_type, cite_key, title);
-            for raw in authors {
-                match cli::parse_author(&raw) {
-                    Ok(author) => entry.add_author(author),
-                    Err(e) => die(&e),
+            // --doi fetches metadata from Crossref instead of taking it from
+            // flags -- see Command::Add's docs. Everything else (--type,
+            // --title, --author, --year, ...) is ignored in this mode; only
+            // --key (to override the derived cite_key) still applies.
+            let mut entry = if let Some(doi_value) = doi {
+                let mut entry = match doi::fetch_metadata(&doi_value) {
+                    Ok(e) => e,
+                    Err(e) => die(&format!(
+                        "failed to fetch metadata for DOI '{doi_value}': {e}"
+                    )),
+                };
+                entry.doi = Some(doi_value);
+                entry.cite_key = match cite_key {
+                    Some(key) => key,
+                    None => match derive_cite_key(&conn, &entry) {
+                        Ok(key) => key,
+                        Err(e) => die(&e),
+                    },
+                };
+                entry
+            } else {
+                // clap's required_unless_present="doi" guarantees these are
+                // Some when --doi wasn't passed.
+                let mut entry = Entry::new(
+                    entry_type.expect("--type required by clap without --doi"),
+                    cite_key.expect("--key required by clap without --doi"),
+                    title.expect("--title required by clap without --doi"),
+                );
+                for raw in authors {
+                    match cli::parse_author(&raw) {
+                        Ok(author) => entry.add_author(author),
+                        Err(e) => die(&e),
+                    }
                 }
-            }
-            entry.year = year;
-            entry.journal = journal;
-            entry.volume = volume;
-            entry.pages = pages;
-            entry.doi = doi;
-            entry.url = url;
-            entry.abstract_text = abstract_text;
+                entry.year = year;
+                entry.journal = journal;
+                entry.volume = volume;
+                entry.pages = pages;
+                entry.url = url;
+                entry.abstract_text = abstract_text;
+                entry
+            };
 
             match db::insert_entry(&conn, &entry) {
                 Ok(id) => {
@@ -477,7 +507,175 @@ fn main() {
                 None => emit(bibtex_str.trim_end()),
             }
         }
+
+        Command::Fetch { cite_key, email, json } => {
+            let entry = match db::get_entry(&conn, &cite_key) {
+                Ok(Some(e)) => e,
+                Ok(None) => die(&format!("no entry found with cite_key '{cite_key}'")),
+                Err(e) => die(&format!("failed to fetch entry: {e}")),
+            };
+            let Some(doi_value) = entry.doi.clone() else {
+                die(&format!(
+                    "'{cite_key}' has no DOI on record; set one with `ferref edit {cite_key} --doi <doi>`"
+                ));
+            };
+
+            let resolved_email = match config::resolve_email(email) {
+                Ok(e) => e,
+                Err(e) => die(&e),
+            };
+
+            let pdf_url = match doi::fetch_oa_pdf_url(&doi_value, &resolved_email) {
+                Ok(u) => u,
+                Err(e) => die(&format!("failed to query Unpaywall: {e}")),
+            };
+
+            // No OA copy found is a normal, legitimate answer -- exit 0, not
+            // an error.
+            let Some(pdf_url) = pdf_url else {
+                if json {
+                    let out = serde_json::json!({
+                        "cite_key": cite_key,
+                        "doi": doi_value,
+                        "oa_found": false,
+                    });
+                    emit(&serde_json::to_string_pretty(&out).unwrap());
+                } else {
+                    emit(&format!(
+                        "No open-access copy found for '{cite_key}' (DOI {doi_value})"
+                    ));
+                }
+                return;
+            };
+
+            let filename = match doi::sanitize_filename(&cite_key) {
+                Ok(f) => f,
+                Err(e) => die(&e),
+            };
+            let pdf_dir = Path::new("pdfs");
+            if let Err(e) = std::fs::create_dir_all(pdf_dir) {
+                die(&format!("failed to create '{}': {e}", pdf_dir.display()));
+            }
+            let (target, already_present) =
+                match pdf_target(&conn, &cite_key, pdf_dir, &filename) {
+                    Ok(t) => t,
+                    Err(e) => die(&e),
+                };
+
+            if !already_present {
+                let bytes = match doi::download_pdf(&pdf_url) {
+                    Ok(b) => b,
+                    Err(e) => die(&format!("failed to download PDF: {e}")),
+                };
+                if let Err(e) = std::fs::write(&target, &bytes) {
+                    die(&format!("failed to save PDF to '{}': {e}", target.display()));
+                }
+            }
+
+            let abs_path = match target.canonicalize() {
+                Ok(p) => p,
+                Err(e) => die(&format!(
+                    "failed to resolve saved PDF path '{}': {e}",
+                    target.display()
+                )),
+            };
+            let path_str = match abs_path.to_str() {
+                Some(s) => s.to_string(),
+                None => die(&format!("path {} is not valid UTF-8", abs_path.display())),
+            };
+
+            let (attachment_id, _changed) = match db::attach(&conn, &cite_key, &path_str) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    // Don't leave a PDF on disk that nothing in the library
+                    // points at. Only remove what this run downloaded.
+                    if !already_present {
+                        let _ = std::fs::remove_file(&target);
+                    }
+                    die(&entry_error(&cite_key, "attach downloaded PDF", e))
+                }
+            };
+
+            // Partial failure: the attachment persists even if extraction
+            // fails -- same rule as `attach --extract` (Phase 7).
+            let extraction: Result<usize, String> = text::extract_text(&abs_path)
+                .and_then(|extracted| save_extracted(&conn, attachment_id, &extracted));
+
+            if json {
+                let mut out = serde_json::json!({
+                    "cite_key": cite_key,
+                    "doi": doi_value,
+                    "oa_found": true,
+                    "path": path_str,
+                    "already_present": already_present,
+                    "extracted": extraction.is_ok(),
+                });
+                match &extraction {
+                    Ok(chars) => out["chars"] = serde_json::json!(chars),
+                    Err(e) => out["extract_error"] = serde_json::json!(e),
+                }
+                emit(&serde_json::to_string_pretty(&out).unwrap());
+            } else {
+                emit(&format!(
+                    "Downloaded open-access PDF for '{cite_key}' to '{path_str}'"
+                ));
+                match &extraction {
+                    Ok(chars) => emit(&format!("Extracted {chars} characters from '{path_str}'")),
+                    Err(e) => emit(&format!("Warning: extraction failed for '{path_str}': {e}")),
+                }
+            }
+
+            if extraction.is_err() {
+                std::process::exit(1);
+            }
+        }
     }
+}
+
+// Derives a cite_key from the first author's last name + year when --doi is
+// used without an explicit --key (e.g. "kucsko2013"), ASCII-sanitized. On
+// collision with an existing key, appends "b", "c", ... up to "z" before
+// giving up -- good enough for the practically-never case of 25 same-author-
+// same-year entries.
+fn derive_cite_key(conn: &rusqlite::Connection, entry: &Entry) -> Result<String, String> {
+    let last_name = entry
+        .authors
+        .first()
+        .map(|a| a.last_name.as_str())
+        .unwrap_or("");
+    let sanitized_name: String = last_name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    let sanitized_name = if sanitized_name.is_empty() {
+        "entry".to_string()
+    } else {
+        sanitized_name
+    };
+    let base = match entry.year {
+        Some(y) => format!("{sanitized_name}{y}"),
+        None => sanitized_name,
+    };
+
+    let exists = |key: &str| -> Result<bool, String> {
+        db::get_entry(conn, key)
+            .map(|e| e.is_some())
+            .map_err(|e| format!("failed to check cite_key '{key}': {e}"))
+    };
+
+    if !exists(&base)? {
+        return Ok(base);
+    }
+    for suffix in 'b'..='z' {
+        let candidate = format!("{base}{suffix}");
+        if !exists(&candidate)? {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "could not derive a unique cite_key from '{base}' (too many collisions)"
+    ))
 }
 
 fn die(msg: &str) -> ! {
@@ -514,6 +712,52 @@ fn open_path(path: &str) -> Result<(), String> {
         Ok(status) => Err(format!("{opener} failed on '{path}' ({status})")),
         Err(e) => Err(format!("could not run {opener}: {e}")),
     }
+}
+
+// Picks where a fetched PDF goes, and says whether the file is already there.
+//
+// `doi::sanitize_filename` is many-to-one -- "a/b" and a literal "a_b" both
+// become "a_b" -- and on a case-insensitive filesystem "Smith2020" and
+// "smith2020" are one file as well. Treating whatever sits at the path as
+// "already downloaded" would then attach another entry's PDF and report
+// success, so a file is only reused when THIS entry already has it attached;
+// otherwise we move to the next free name.
+fn pdf_target(
+    conn: &rusqlite::Connection,
+    cite_key: &str,
+    dir: &Path,
+    base: &str,
+) -> Result<(std::path::PathBuf, bool), String> {
+    let mine: Vec<String> = db::attachments_for_cite_key(conn, cite_key)
+        .map_err(|e| format!("failed to list attachments for '{cite_key}': {e}"))?
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect();
+
+    for n in 1..=50 {
+        let candidate = if n == 1 {
+            dir.join(format!("{base}.pdf"))
+        } else {
+            dir.join(format!("{base}-{n}.pdf"))
+        };
+
+        if !candidate.exists() {
+            return Ok((candidate, false));
+        }
+        let is_mine = candidate
+            .canonicalize()
+            .ok()
+            .and_then(|abs| abs.to_str().map(str::to_string))
+            .is_some_and(|abs| mine.contains(&abs));
+        if is_mine {
+            return Ok((candidate, true));
+        }
+    }
+
+    Err(format!(
+        "could not find a free filename for '{base}' in {}",
+        dir.display()
+    ))
 }
 
 // Saves extracted text and returns its length in characters.

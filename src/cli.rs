@@ -13,14 +13,20 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Add a new entry
+    /// Add a new entry. Either give --type/--key/--title directly, or give
+    /// --doi and let Crossref fill them in.
     Add {
-        #[arg(long = "type")]
-        entry_type: String,
-        #[arg(long = "key")]
-        cite_key: String,
-        #[arg(long)]
-        title: String,
+        /// Required unless --doi is given, which fetches it from Crossref.
+        #[arg(long = "type", required_unless_present = "doi")]
+        entry_type: Option<String>,
+        /// Required unless --doi is given, which derives one (first
+        /// author's last name + year, e.g. "kucsko2013"). An explicit --key
+        /// always wins over a derived one.
+        #[arg(long = "key", required_unless_present = "doi")]
+        cite_key: Option<String>,
+        /// Required unless --doi is given, which fetches it from Crossref.
+        #[arg(long, required_unless_present = "doi")]
+        title: Option<String>,
         /// Repeatable, each as "Last, First"
         #[arg(long = "author")]
         authors: Vec<String>,
@@ -168,6 +174,19 @@ pub enum Command {
     Export {
         #[arg(long = "out")]
         out: Option<PathBuf>,
+    },
+    /// Look up an open-access PDF for an entry's DOI via Unpaywall, and
+    /// attach + extract it if one exists. No OA copy found is a normal
+    /// outcome (exit 0), not an error.
+    Fetch {
+        cite_key: String,
+        /// Contact email for Unpaywall's polite-pool policy. Falls back to
+        /// the FERREF_EMAIL environment variable, then
+        /// ~/.config/ferref/config.toml.
+        #[arg(long)]
+        email: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
