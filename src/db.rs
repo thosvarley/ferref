@@ -316,6 +316,19 @@ pub fn attachments_for_cite_key(conn: &Connection, cite_key: &str) -> Result<Vec
         .collect::<Result<Vec<(i64, String)>>>()
 }
 
+// Character length of each attachment's extracted text for one entry,
+// without loading the text itself. SQLite's length() on a TEXT column counts
+// characters, so this is what the TUI's details pane uses to show "text:
+// 41013 chars" without ever pulling full_text into memory (see
+// attachments_for_entry's with_full_text comment -- this is the same
+// concern one level more targeted).
+pub fn attachment_text_lengths(conn: &Connection, entry_id: i64) -> Result<Vec<(String, Option<i64>)>> {
+    let mut stmt = conn
+        .prepare("SELECT path, length(full_text) FROM attachments WHERE entry_id = ?1 ORDER BY id")?;
+    stmt.query_map([entry_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<Vec<(String, Option<i64>)>>>()
+}
+
 // Single place tag names are normalized, so writes (add_tag/remove_tag) and
 // reads (the `tag` filter in list_entries) can't disagree about what counts
 // as the same tag. Rejects empty-after-trim rather than writing it, for the
@@ -644,6 +657,20 @@ pub fn collection_tree(conn: &Connection) -> Result<Vec<(usize, Collection)>> {
     Ok(out)
 }
 
+// Slash-joined path for every row of a collection_tree() walk, same order.
+// Same stack-truncation algorithm `collection ls --json` builds inline in
+// main.rs -- factored out here so the TUI doesn't hand-roll a third copy.
+pub fn collection_tree_paths(tree: &[(usize, Collection)]) -> Vec<String> {
+    let mut stack: Vec<&str> = Vec::new();
+    tree.iter()
+        .map(|(depth, c)| {
+            stack.truncate(*depth);
+            stack.push(&c.name);
+            stack.join("/")
+        })
+        .collect()
+}
+
 // Descendant ids of `root` (inclusive), derived from collection_tree's
 // pre-order walk rather than a second traversal -- one place cycles are
 // handled. Valid because collection_tree emits a node's whole subtree
@@ -686,7 +713,7 @@ pub struct Filter {
     pub year_min: Option<i32>,
     pub year_max: Option<i32>,
     pub tag: Option<String>,
-    pub collection: Option<String>,
+    pub collection_id: Option<i64>,
     pub recursive: bool,
 }
 
@@ -749,17 +776,19 @@ pub fn list_entries(conn: &Connection, filter: &Filter, with_full_text: bool) ->
         params.push(Value::Text(normalize_tag(tag).unwrap_or_default()));
     }
 
-    if let Some(path) = &filter.collection {
+    if let Some(root_id) = filter.collection_id {
+        // An id, not a path: callers resolve the path themselves. The TUI
+        // already holds the id it clicked on, and round-tripping it through a
+        // slash-joined path silently filtered the wrong (empty) set for any
+        // collection whose name contains a literal "/" -- reachable by hand-
+        // editing the DB, which this project explicitly invites.
+        //
         // Resolved to concrete ids in Rust -- via collection_tree's
         // cycle-safe walk when `recursive` is set -- rather than a recursive
         // CTE, so there's one traversal implementation and one place cycles
         // are handled. EXISTS, not a JOIN, same reason as tag/author: an
         // entry in more than one matched collection must not duplicate the
         // entry row.
-        let Some(root_id) = collection_by_path(conn, path)? else {
-            // Unknown path matches nothing, same treatment as an unknown tag.
-            return Ok(Vec::new());
-        };
         let ids = if filter.recursive {
             subtree_ids(conn, root_id)?
         } else {
@@ -1285,25 +1314,49 @@ mod tests {
         add_to_collection(&conn, "Physics", "a").unwrap();
         add_to_collection(&conn, "Physics/Quantum", "b").unwrap();
 
+        let physics = collection_by_path(&conn, "Physics").unwrap().unwrap();
+
         let direct = Filter {
-            collection: Some("Physics".into()),
+            collection_id: Some(physics),
             ..Default::default()
         };
         assert_eq!(keys(&conn, &direct), ["a"]);
 
         let recursive = Filter {
-            collection: Some("Physics".into()),
+            collection_id: Some(physics),
             recursive: true,
             ..Default::default()
         };
         assert_eq!(keys(&conn, &recursive), ["a", "b"]);
 
-        // Unknown path matches nothing rather than erroring.
+        // An id that doesn't exist matches nothing rather than erroring --
+        // this is what main.rs substitutes for an unresolvable --collection.
         let unknown = Filter {
-            collection: Some("Nope".into()),
+            collection_id: Some(-1),
             ..Default::default()
         };
         assert!(keys(&conn, &unknown).is_empty());
+
+        // Regression: a collection whose NAME contains the path separator is
+        // unaddressable by path but must still filter correctly by id. The TUI
+        // reaches collections this way, and hand-editing the DB can create one.
+        conn.execute("INSERT INTO collections (name, parent_id) VALUES ('A/B', NULL)", [])
+            .unwrap();
+        let slash_id: i64 = conn
+            .query_row("SELECT id FROM collections WHERE name = 'A/B'", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO collection_entries (collection_id, entry_id) \
+             SELECT ?1, id FROM entries WHERE cite_key = 'a'",
+            [slash_id],
+        )
+        .unwrap();
+        let by_id = Filter {
+            collection_id: Some(slash_id),
+            ..Default::default()
+        };
+        assert_eq!(keys(&conn, &by_id), ["a"]);
+        assert!(collection_by_path(&conn, "A/B").unwrap().is_none());
     }
 
     // A naive recursive walk over a cyclic parent_id graph would never
@@ -1343,5 +1396,47 @@ mod tests {
         // A legitimate move still works.
         assert!(move_collection(&conn, "A/B/C", None).is_ok());
         assert_eq!(collection_by_path(&conn, "C").unwrap().is_some(), true);
+    }
+
+    // The TUI reconstructs paths from collection_tree's pre-order walk the
+    // same way `collection ls --json` does -- this is that shared algorithm.
+    #[test]
+    fn collection_tree_paths_matches_the_walk() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        create_collection(&conn, "Physics/Entropy").unwrap();
+        create_collection(&conn, "Biology").unwrap();
+
+        let tree = collection_tree(&conn).unwrap();
+        let paths = collection_tree_paths(&tree);
+        let by_name: HashMap<&str, &str> = tree
+            .iter()
+            .zip(paths.iter())
+            .map(|((_, c), p)| (c.name.as_str(), p.as_str()))
+            .collect();
+
+        assert_eq!(by_name["Physics"], "Physics");
+        assert_eq!(by_name["Entropy"], "Physics/Entropy");
+        assert_eq!(by_name["Biology"], "Biology");
+    }
+
+    // full_text is never loaded here (unlike attachments_for_entry(...,
+    // true)); only its character length is, via SQLite's length().
+    #[test]
+    fn attachment_text_lengths_reports_length_without_loading_text() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        let mut entry = Entry::new("article".into(), "k".into(), "T".into());
+        let id = insert_entry(&conn, &entry).unwrap();
+        entry.id = Some(id);
+
+        let (att_id, _) = attach(&conn, "k", "/tmp/a.pdf").unwrap();
+        attach(&conn, "k", "/tmp/b.pdf").unwrap();
+        set_full_text(&conn, att_id, "hello").unwrap();
+
+        let lens = attachment_text_lengths(&conn, id).unwrap();
+        assert_eq!(lens.len(), 2);
+        assert_eq!(lens[0], ("/tmp/a.pdf".to_string(), Some(5)));
+        assert_eq!(lens[1], ("/tmp/b.pdf".to_string(), None));
     }
 }

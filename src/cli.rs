@@ -215,6 +215,11 @@ pub enum Command {
         #[command(subcommand)]
         command: CollectionCommand,
     },
+    /// Browse the library in a three-pane terminal UI (collections, entries,
+    /// details). Read-only -- there is no --json here because it isn't a
+    /// data-printing command, it's an interactive screen; the CLI remains
+    /// the only way to change a library.
+    Tui,
 }
 
 // Collections are addressed by slash-separated path ("Physics/Entropy"),

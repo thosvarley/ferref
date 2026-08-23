@@ -6,6 +6,7 @@ mod db;
 mod doi;
 mod models;
 mod text;
+mod tui;
 
 use std::path::Path;
 
@@ -99,7 +100,7 @@ fn main() {
             &conn,
             &db::Filter {
                 tag,
-                collection,
+                collection_id: resolve_collection_filter(&conn, collection),
                 recursive,
                 ..Default::default()
             },
@@ -283,7 +284,7 @@ fn main() {
                 year_min: year.or(from),
                 year_max: year.or(to),
                 tag,
-                collection,
+                collection_id: resolve_collection_filter(&conn, collection),
                 recursive,
             };
 
@@ -681,6 +682,12 @@ fn main() {
         }
 
         Command::Collection { command } => dispatch_collection(&conn, command),
+
+        Command::Tui => {
+            if let Err(e) = tui::run(&conn) {
+                die(&e);
+            }
+        }
     }
 }
 
@@ -706,22 +713,20 @@ fn dispatch_collection(conn: &rusqlite::Connection, command: cli::CollectionComm
                 Err(e) => die(&format!("failed to list collections: {e}")),
             };
 
-            // path is rebuilt from the (depth, collection) pre-order walk: a
-            // stack of ancestor names truncated to the current depth before
-            // each push, same idea as walking a directory tree.
-            let mut path_stack: Vec<String> = Vec::new();
+            // path is rebuilt from the (depth, collection) pre-order walk --
+            // see db::collection_tree_paths, shared with the TUI.
             if json {
+                let paths = db::collection_tree_paths(&tree);
                 let rows: Vec<_> = tree
                     .iter()
-                    .map(|(depth, c)| {
-                        path_stack.truncate(*depth);
-                        path_stack.push(c.name.clone());
+                    .zip(paths.iter())
+                    .map(|((depth, c), path)| {
                         serde_json::json!({
                             "id": c.id,
                             "name": c.name,
                             "parent_id": c.parent_id,
                             "depth": depth,
-                            "path": path_stack.join("/"),
+                            "path": path,
                             "entry_count": c.entry_count,
                         })
                     })
@@ -940,6 +945,24 @@ fn pdf_target(
         "could not find a free filename for '{base}' in {}",
         dir.display()
     ))
+}
+
+// --collection takes a path; Filter takes a resolved id. An unresolvable path
+// matches nothing, the same treatment an unknown tag gets.
+//
+// SENTINEL is a collection id that cannot exist (ids are AUTOINCREMENT and
+// positive), so an unknown path filters everything out instead of silently
+// behaving like no collection filter at all -- which would print the whole
+// library and read like success.
+const NO_SUCH_COLLECTION: i64 = -1;
+
+fn resolve_collection_filter(conn: &rusqlite::Connection, path: Option<String>) -> Option<i64> {
+    let path = path?;
+    match db::collection_by_path(conn, &path) {
+        Ok(Some(id)) => Some(id),
+        Ok(None) => Some(NO_SUCH_COLLECTION),
+        Err(e) => die(&format!("failed to resolve collection '{path}': {e}")),
+    }
 }
 
 // Saves extracted text and returns its length in characters.
