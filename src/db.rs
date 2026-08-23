@@ -1,10 +1,11 @@
 // This imports the rusqlite library's Connection type
 // Connection represents a connection to a SQLite database file
 use rusqlite::types::Value;
-use rusqlite::{params_from_iter, Connection, Result, Row};
+use rusqlite::{params_from_iter, Connection, OptionalExtension, Result, Row};
 
 // This imports the Path type from Rust's standard library
 // Path is used for working with file system paths
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::models::{now, Attachment, Author, Entry};
@@ -62,6 +63,22 @@ CREATE TABLE IF NOT EXISTS entry_tags (
     tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
     PRIMARY KEY (entry_id, tag_id)
 );
+
+-- No UNIQUE(parent_id, name): SQLite treats NULLs as distinct, so that
+-- constraint would let two root-level (parent_id IS NULL) collections share
+-- a name. Sibling-uniqueness is instead enforced in code (create_collection),
+-- via a case-insensitive lookup before insert.
+CREATE TABLE IF NOT EXISTS collections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    parent_id INTEGER REFERENCES collections(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS collection_entries (
+    collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    PRIMARY KEY (collection_id, entry_id)
+);
+CREATE INDEX IF NOT EXISTS idx_collections_parent ON collections(parent_id);
 "#;
 
 // CREATE TABLE IF NOT EXISTS does not add a column to a table that already
@@ -367,6 +384,299 @@ pub fn remove_tag(conn: &Connection, cite_key: &str, tag: &str) -> Result<bool> 
     Ok(changed)
 }
 
+// A collection with its direct (non-recursive) entry count. Not `Serialize`
+// -- main.rs's `ls --json` output is flat with `path`/`depth` fields that
+// don't exist on this struct, so it builds the JSON by hand from
+// `collection_tree` instead of deriving off this type.
+#[derive(Debug, Clone)]
+pub struct Collection {
+    pub id: i64,
+    pub name: String,
+    pub parent_id: Option<i64>,
+    pub entry_count: i64,
+}
+
+// Validates one path segment: trimmed, non-empty, and free of '/' (the path
+// separator). Unlike normalize_tag, NOT lowercased -- a collection name is a
+// label a human reads ("Machine Learning" should display as typed).
+// Sibling-uniqueness is nonetheless checked case-insensitively; see
+// create_collection.
+fn validate_collection_name(raw: &str) -> std::result::Result<String, String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err("collection name cannot be empty".to_string());
+    }
+    if name.contains('/') {
+        return Err(format!("collection name {name:?} cannot contain '/'"));
+    }
+    Ok(name.to_string())
+}
+
+// Splits a slash-separated path into validated segment names. A leading,
+// trailing, or doubled '/' produces an empty segment, which
+// validate_collection_name rejects the same as any other empty name.
+fn split_path(path: &str) -> std::result::Result<Vec<String>, String> {
+    path.split('/').map(validate_collection_name).collect()
+}
+
+// Resolves a slash-separated path to a collection id, walking one segment at
+// a time. An invalid path (e.g. an empty segment) simply can't match
+// anything real -- creating one is rejected by create_collection -- so this
+// treats it as "not found" rather than a separate error.
+pub fn collection_by_path(conn: &Connection, path: &str) -> Result<Option<i64>> {
+    let Ok(segments) = split_path(path) else {
+        return Ok(None);
+    };
+
+    let mut current: Option<i64> = None;
+    for seg in segments {
+        // `IS` rather than `=` so this is null-safe: with current = NULL,
+        // "parent_id IS ?" correctly matches root-level collections.
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM collections WHERE lower(name) = lower(?1) AND parent_id IS ?2",
+                rusqlite::params![seg, current],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match found {
+            Some(id) => current = Some(id),
+            None => return Ok(None),
+        }
+    }
+    Ok(current)
+}
+
+// Creates intermediate collections as needed (mkdir -p semantics) and
+// returns the leaf id. Re-running with the same path is a no-op that returns
+// the existing leaf rather than duplicating it -- each segment is looked up
+// case-insensitively among its siblings before an insert is attempted, which
+// is also what makes sibling names unique without relying on a DB
+// constraint (see the schema comment on `collections`).
+pub fn create_collection(conn: &Connection, path: &str) -> Result<i64> {
+    let segments = split_path(path).map_err(rusqlite::Error::InvalidParameterName)?;
+
+    let mut id = 0i64;
+    let mut parent: Option<i64> = None;
+    for seg in &segments {
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM collections WHERE lower(name) = lower(?1) AND parent_id IS ?2",
+                rusqlite::params![seg, parent],
+                |row| row.get(0),
+            )
+            .optional()?;
+        id = match existing {
+            Some(existing_id) => existing_id,
+            None => {
+                conn.execute(
+                    "INSERT INTO collections (name, parent_id) VALUES (?1, ?2)",
+                    rusqlite::params![seg, parent],
+                )?;
+                conn.last_insert_rowid()
+            }
+        };
+        parent = Some(id);
+    }
+    Ok(id)
+}
+
+// Every collection with its direct entry count, in one query (LEFT JOIN +
+// GROUP BY, not N+1). Ordered by parent then name so a caller can build the
+// tree deterministically without a second sort.
+pub fn all_collections(conn: &Connection) -> Result<Vec<Collection>> {
+    let mut stmt = conn.prepare(
+        "SELECT c.id, c.name, c.parent_id, COUNT(ce.entry_id) AS entry_count \
+         FROM collections c \
+         LEFT JOIN collection_entries ce ON ce.collection_id = c.id \
+         GROUP BY c.id ORDER BY c.parent_id, c.name",
+    )?;
+    stmt.query_map([], |row| {
+        Ok(Collection {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            parent_id: row.get(2)?,
+            entry_count: row.get(3)?,
+        })
+    })?
+    .collect::<Result<Vec<Collection>>>()
+}
+
+// Idempotent, same shape as add_tag: returns whether membership actually
+// changed. Unknown cite_key -> Err(QueryReturnedNoRows), same as add_tag.
+// Unknown collection path -> Err(InvalidParameterName) with a message
+// naming the path, so it isn't confused with the cite_key error upstream.
+pub fn add_to_collection(conn: &Connection, path: &str, cite_key: &str) -> Result<bool> {
+    let entry_id: i64 = conn.query_row(
+        "SELECT id FROM entries WHERE cite_key = ?1",
+        [cite_key],
+        |row| row.get(0),
+    )?;
+    let collection_id = collection_by_path(conn, path)?.ok_or_else(|| {
+        rusqlite::Error::InvalidParameterName(format!("no collection found at path '{path}'"))
+    })?;
+
+    conn.execute(
+        "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id) VALUES (?1, ?2)",
+        rusqlite::params![collection_id, entry_id],
+    )?;
+    Ok(conn.changes() > 0)
+}
+
+// Idempotent: Ok(false) if the entry wasn't in the collection. Same error
+// shape as add_to_collection.
+pub fn remove_from_collection(conn: &Connection, path: &str, cite_key: &str) -> Result<bool> {
+    let entry_id: i64 = conn.query_row(
+        "SELECT id FROM entries WHERE cite_key = ?1",
+        [cite_key],
+        |row| row.get(0),
+    )?;
+    let collection_id = collection_by_path(conn, path)?.ok_or_else(|| {
+        rusqlite::Error::InvalidParameterName(format!("no collection found at path '{path}'"))
+    })?;
+
+    conn.execute(
+        "DELETE FROM collection_entries WHERE collection_id = ?1 AND entry_id = ?2",
+        rusqlite::params![collection_id, entry_id],
+    )?;
+    Ok(conn.changes() > 0)
+}
+
+// Reparents a collection. Refuses to create a cycle: walks up from the
+// proposed new parent, and rejects if the collection being moved appears in
+// that chain (or is the new parent itself). That walk is itself over the
+// graph it's validating, so it's bounded (32 hops) rather than trusting the
+// graph is acyclic going in.
+pub fn move_collection(conn: &Connection, path: &str, new_parent: Option<&str>) -> Result<()> {
+    let id = collection_by_path(conn, path)?.ok_or_else(|| {
+        rusqlite::Error::InvalidParameterName(format!("no collection found at path '{path}'"))
+    })?;
+
+    let new_parent_id: Option<i64> = match new_parent {
+        None => None,
+        Some(p) => Some(collection_by_path(conn, p)?.ok_or_else(|| {
+            rusqlite::Error::InvalidParameterName(format!("no collection found at path '{p}'"))
+        })?),
+    };
+
+    if let Some(np) = new_parent_id {
+        if np == id {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "a collection cannot be its own parent".to_string(),
+            ));
+        }
+        let mut cursor = Some(np);
+        let mut hops = 0;
+        while let Some(cur) = cursor {
+            if cur == id {
+                return Err(rusqlite::Error::InvalidParameterName(
+                    "cannot move a collection under its own descendant".to_string(),
+                ));
+            }
+            hops += 1;
+            if hops > 32 {
+                break;
+            }
+            cursor = conn.query_row(
+                "SELECT parent_id FROM collections WHERE id = ?1",
+                [cur],
+                |row| row.get(0),
+            )?;
+        }
+    }
+
+    conn.execute(
+        "UPDATE collections SET parent_id = ?1 WHERE id = ?2",
+        rusqlite::params![new_parent_id, id],
+    )?;
+    Ok(())
+}
+
+// Ordered (depth, collection) pairs for rendering a tree. Terminates on a
+// cyclic parent_id graph rather than recursing forever: built iteratively
+// from the flat `all_collections` list with an explicit stack (DFS
+// pre-order) and a visited set, so every node is walked at most once no
+// matter how the parent_id graph is shaped. A node never reached from a root
+// -- orphaned in a cycle, since the DB is a plain file anyone can edit by
+// hand -- is appended at depth 0 rather than silently dropped, so a
+// corrupted tree stays visible instead of losing rows. Depth is additionally
+// capped at 32 as a backstop.
+pub fn collection_tree(conn: &Connection) -> Result<Vec<(usize, Collection)>> {
+    let all = all_collections(conn)?;
+    let mut by_id: HashMap<i64, Collection> = all.into_iter().map(|c| (c.id, c)).collect();
+
+    let mut children: HashMap<Option<i64>, Vec<i64>> = HashMap::new();
+    for c in by_id.values() {
+        children.entry(c.parent_id).or_default().push(c.id);
+    }
+    for kids in children.values_mut() {
+        kids.sort_by_key(|id| by_id.get(id).map(|c| c.name.to_lowercase()));
+    }
+
+    let mut roots = children.get(&None).cloned().unwrap_or_default();
+    roots.sort_by_key(|id| by_id.get(id).map(|c| c.name.to_lowercase()));
+
+    let mut stack: Vec<(i64, usize)> = roots.into_iter().rev().map(|id| (id, 0)).collect();
+    let mut visited: HashSet<i64> = HashSet::new();
+    let mut out: Vec<(usize, Collection)> = Vec::new();
+
+    while let Some((id, depth)) = stack.pop() {
+        if !visited.insert(id) {
+            continue; // already rendered -- part of a cycle
+        }
+        if depth <= 32 {
+            if let Some(kids) = children.get(&Some(id)) {
+                for &k in kids.iter().rev() {
+                    stack.push((k, depth + 1));
+                }
+            }
+        }
+        if let Some(c) = by_id.remove(&id) {
+            out.push((depth, c));
+        }
+    }
+
+    // Anything left wasn't reachable from a root: orphaned in a cycle.
+    let mut orphans: Vec<Collection> = by_id.into_values().collect();
+    orphans.sort_by_key(|c| c.id);
+    out.extend(orphans.into_iter().map(|c| (0, c)));
+
+    Ok(out)
+}
+
+// Descendant ids of `root` (inclusive), derived from collection_tree's
+// pre-order walk rather than a second traversal -- one place cycles are
+// handled. Valid because collection_tree emits a node's whole subtree
+// contiguously right after it, at strictly greater depth.
+fn subtree_ids(conn: &Connection, root: i64) -> Result<Vec<i64>> {
+    let tree = collection_tree(conn)?;
+    let Some(root_pos) = tree.iter().position(|(_, c)| c.id == root) else {
+        return Ok(Vec::new());
+    };
+    let root_depth = tree[root_pos].0;
+
+    let mut ids = vec![root];
+    for (depth, c) in &tree[root_pos + 1..] {
+        if *depth <= root_depth {
+            break;
+        }
+        ids.push(c.id);
+    }
+    Ok(ids)
+}
+
+// Deletes the subtree (ON DELETE CASCADE on parent_id takes it) and returns
+// how many collections went. Entries are never touched -- only
+// collection_entries membership rows, which cascade off collection_id.
+pub fn delete_collection(conn: &Connection, path: &str) -> Result<usize> {
+    let id = collection_by_path(conn, path)?.ok_or_else(|| {
+        rusqlite::Error::InvalidParameterName(format!("no collection found at path '{path}'"))
+    })?;
+    let count = subtree_ids(conn, id)?.len();
+    conn.execute("DELETE FROM collections WHERE id = ?1", [id])?;
+    Ok(count)
+}
+
 // An all-None Filter matches everything, so `list` and `search` are the same
 // query with different arguments rather than two near-identical functions.
 #[derive(Default)]
@@ -376,6 +686,8 @@ pub struct Filter {
     pub year_min: Option<i32>,
     pub year_max: Option<i32>,
     pub tag: Option<String>,
+    pub collection: Option<String>,
+    pub recursive: bool,
 }
 
 // Wraps a user substring for LIKE, escaping the wildcards so searching for
@@ -392,11 +704,11 @@ fn like_pattern(s: &str) -> String {
 // with_full_text is a projection, not a filter, so it lives as a parameter
 // here rather than on Filter -- see attachments_for_entry's comment.
 pub fn list_entries(conn: &Connection, filter: &Filter, with_full_text: bool) -> Result<Vec<Entry>> {
-    let mut clauses: Vec<&str> = Vec::new();
+    let mut clauses: Vec<String> = Vec::new();
     let mut params: Vec<Value> = Vec::new();
 
     if let Some(title) = &filter.title {
-        clauses.push("title LIKE ? ESCAPE '\\'");
+        clauses.push("title LIKE ? ESCAPE '\\'".to_string());
         params.push(Value::Text(like_pattern(title)));
     }
 
@@ -405,7 +717,8 @@ pub fn list_entries(conn: &Connection, filter: &Filter, with_full_text: bool) ->
         // duplicate the entry row.
         clauses.push(
             "EXISTS (SELECT 1 FROM authors a WHERE a.entry_id = entries.id \
-             AND (a.last_name LIKE ? ESCAPE '\\' OR a.first_name LIKE ? ESCAPE '\\'))",
+             AND (a.last_name LIKE ? ESCAPE '\\' OR a.first_name LIKE ? ESCAPE '\\'))"
+                .to_string(),
         );
         let pattern = like_pattern(author);
         params.push(Value::Text(pattern.clone()));
@@ -413,11 +726,11 @@ pub fn list_entries(conn: &Connection, filter: &Filter, with_full_text: bool) ->
     }
 
     if let Some(min) = filter.year_min {
-        clauses.push("year >= ?");
+        clauses.push("year >= ?".to_string());
         params.push(Value::Integer(min.into()));
     }
     if let Some(max) = filter.year_max {
-        clauses.push("year <= ?");
+        clauses.push("year <= ?".to_string());
         params.push(Value::Integer(max.into()));
     }
 
@@ -430,9 +743,34 @@ pub fn list_entries(conn: &Connection, filter: &Filter, with_full_text: bool) ->
         // empty), so the fallible normalize_tag error is not surfaced here.
         clauses.push(
             "EXISTS (SELECT 1 FROM entry_tags et JOIN tags t ON t.id = et.tag_id \
-             WHERE et.entry_id = entries.id AND t.name = ?)",
+             WHERE et.entry_id = entries.id AND t.name = ?)"
+                .to_string(),
         );
         params.push(Value::Text(normalize_tag(tag).unwrap_or_default()));
+    }
+
+    if let Some(path) = &filter.collection {
+        // Resolved to concrete ids in Rust -- via collection_tree's
+        // cycle-safe walk when `recursive` is set -- rather than a recursive
+        // CTE, so there's one traversal implementation and one place cycles
+        // are handled. EXISTS, not a JOIN, same reason as tag/author: an
+        // entry in more than one matched collection must not duplicate the
+        // entry row.
+        let Some(root_id) = collection_by_path(conn, path)? else {
+            // Unknown path matches nothing, same treatment as an unknown tag.
+            return Ok(Vec::new());
+        };
+        let ids = if filter.recursive {
+            subtree_ids(conn, root_id)?
+        } else {
+            vec![root_id]
+        };
+        let placeholders = vec!["?"; ids.len()].join(",");
+        clauses.push(format!(
+            "EXISTS (SELECT 1 FROM collection_entries ce WHERE ce.entry_id = entries.id \
+             AND ce.collection_id IN ({placeholders}))"
+        ));
+        params.extend(ids.into_iter().map(Value::Integer));
     }
 
     let sql = if clauses.is_empty() {
@@ -826,5 +1164,184 @@ mod tests {
 
         // A vanished row reports 0 rather than silently succeeding.
         assert_eq!(set_full_text(&conn, 9999, "orphan").unwrap(), 0);
+    }
+
+    // mkdir -p semantics: creates every missing intermediate collection, and
+    // running it again returns the same leaf rather than duplicating.
+    #[test]
+    fn create_collection_is_mkdir_p_and_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        let leaf = create_collection(&conn, "Physics/Quantum/Entropy").unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM collections", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3, "all three levels must be created");
+
+        let leaf_again = create_collection(&conn, "Physics/Quantum/Entropy").unwrap();
+        assert_eq!(leaf, leaf_again);
+        let count_again: i64 = conn
+            .query_row("SELECT COUNT(*) FROM collections", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count_again, 3, "re-creating must not duplicate rows");
+
+        assert_eq!(collection_by_path(&conn, "Physics/Quantum/Entropy").unwrap(), Some(leaf));
+        assert_eq!(collection_by_path(&conn, "Physics/Nope").unwrap(), None);
+    }
+
+    // Sibling names are unique case-insensitively, including at the root --
+    // the SQLite-NULL trap a UNIQUE(parent_id, name) constraint wouldn't
+    // catch, since NULL parent_id values are never equal to each other.
+    #[test]
+    fn sibling_names_are_unique_case_insensitively_even_at_root() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        let first = create_collection(&conn, "Physics").unwrap();
+        let second = create_collection(&conn, "physics").unwrap();
+        assert_eq!(first, second, "case-insensitive root sibling must reuse the row");
+
+        let root_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM collections WHERE parent_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(root_count, 1, "two root collections must not both exist");
+
+        // Same check one level down.
+        let child = create_collection(&conn, "Physics/Entropy").unwrap();
+        let child_again = create_collection(&conn, "physics/ENTROPY").unwrap();
+        assert_eq!(child, child_again);
+    }
+
+    #[test]
+    fn collection_name_validation() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        assert!(create_collection(&conn, "").is_err());
+        assert!(create_collection(&conn, "   ").is_err());
+        assert!(create_collection(&conn, "Has/Slash").is_ok()); // two valid segments
+        assert!(create_collection(&conn, "Physics//Entropy").is_err()); // empty segment
+    }
+
+    #[test]
+    fn collection_membership_is_idempotent_and_errors_on_unknowns() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        seed(&conn, "a", "Paper", 2024, "Smith", "John");
+        create_collection(&conn, "Physics").unwrap();
+
+        assert_eq!(add_to_collection(&conn, "Physics", "a").unwrap(), true);
+        assert_eq!(add_to_collection(&conn, "Physics", "a").unwrap(), false);
+        assert_eq!(remove_from_collection(&conn, "Physics", "a").unwrap(), true);
+        assert_eq!(remove_from_collection(&conn, "Physics", "a").unwrap(), false);
+
+        assert!(add_to_collection(&conn, "Physics", "nonexistent").is_err());
+        assert!(add_to_collection(&conn, "NoSuchCollection", "a").is_err());
+    }
+
+    // delete_collection removes the subtree and its membership rows, but
+    // never the entries themselves.
+    #[test]
+    fn delete_collection_removes_subtree_but_not_entries() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        seed(&conn, "a", "Paper", 2024, "Smith", "John");
+
+        create_collection(&conn, "Physics/Quantum/Entropy").unwrap();
+        add_to_collection(&conn, "Physics/Quantum", "a").unwrap();
+
+        let removed = delete_collection(&conn, "Physics").unwrap();
+        assert_eq!(removed, 3, "Physics + Quantum + Entropy");
+
+        let collections_left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM collections", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(collections_left, 0);
+
+        let memberships_left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM collection_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(memberships_left, 0);
+
+        // The entry itself must survive.
+        assert!(get_entry(&conn, "a").unwrap().is_some());
+    }
+
+    // Direct membership vs. --recursive, which pulls in descendant
+    // collections too.
+    #[test]
+    fn filter_by_collection_direct_vs_recursive() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        seed(&conn, "a", "Top Paper", 2024, "Smith", "John");
+        seed(&conn, "b", "Deep Paper", 2024, "Jones", "Ada");
+
+        create_collection(&conn, "Physics/Quantum").unwrap();
+        add_to_collection(&conn, "Physics", "a").unwrap();
+        add_to_collection(&conn, "Physics/Quantum", "b").unwrap();
+
+        let direct = Filter {
+            collection: Some("Physics".into()),
+            ..Default::default()
+        };
+        assert_eq!(keys(&conn, &direct), ["a"]);
+
+        let recursive = Filter {
+            collection: Some("Physics".into()),
+            recursive: true,
+            ..Default::default()
+        };
+        assert_eq!(keys(&conn, &recursive), ["a", "b"]);
+
+        // Unknown path matches nothing rather than erroring.
+        let unknown = Filter {
+            collection: Some("Nope".into()),
+            ..Default::default()
+        };
+        assert!(keys(&conn, &unknown).is_empty());
+    }
+
+    // A naive recursive walk over a cyclic parent_id graph would never
+    // terminate. Built by direct SQL UPDATE, bypassing move_collection's own
+    // guard, since that guard is the thing under test elsewhere.
+    #[test]
+    fn collection_tree_terminates_on_a_cycle_and_loses_no_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        let a = create_collection(&conn, "A").unwrap();
+        let b = create_collection(&conn, "A/B").unwrap();
+        // Make A a child of B -- A's ancestor chain now cycles A -> B -> A.
+        conn.execute("UPDATE collections SET parent_id = ?1 WHERE id = ?2", [b, a])
+            .unwrap();
+
+        let tree = collection_tree(&conn).unwrap();
+        assert_eq!(tree.len(), 2, "both rows must still be present, just not lost");
+
+        let ids: HashSet<i64> = tree.iter().map(|(_, c)| c.id).collect();
+        assert!(ids.contains(&a) && ids.contains(&b));
+    }
+
+    // move_collection must refuse to create the cycle in the first place.
+    #[test]
+    fn move_collection_refuses_to_create_a_cycle() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        create_collection(&conn, "A/B/C").unwrap();
+
+        // A collection can't become its own parent...
+        assert!(move_collection(&conn, "A", Some("A")).is_err());
+        // ...nor be moved under its own descendant.
+        assert!(move_collection(&conn, "A", Some("A/B/C")).is_err());
+
+        // A legitimate move still works.
+        assert!(move_collection(&conn, "A/B/C", None).is_ok());
+        assert_eq!(collection_by_path(&conn, "C").unwrap().is_some(), true);
     }
 }

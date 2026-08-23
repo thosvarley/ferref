@@ -39,7 +39,7 @@ Essential features that should be present at the end:
 
 ## Current state (2026-08-21)
 
-All nine phases are complete.
+Phases 1–10 are complete. Phase 11 (TUI) is next.
 
 - `src/models.rs` — `Entry`/`Author` + `now()`. `Serialize` derived; `abstract_text` serializes as `"abstract"` (Rust reserves `abstract`), locked by a test.
 - `src/db.rs` — schema + `insert_entry`/`get_entry`/`list_entries`/`update_entry`/`delete_entry`, all free functions over `&Connection`. `update_entry` stamps `date_modified` itself so callers can't forget. `list_entries` takes a `Filter`; an all-`None` filter matches everything, so `list` and `search` are one query. `add_tag`/`remove_tag` are idempotent and report whether anything changed; `normalize_tag` (trim + lowercase) is the single point both writes and the `tag` filter go through. `attach` stores a path, never a copy of the file.
@@ -48,6 +48,7 @@ All nine phases are complete.
 - `src/doi.rs` — Crossref metadata + Unpaywall OA lookup over `ureq`. The network trust boundary: every request goes through `fetch_guarded`, which follows redirects by hand so each hop's scheme and resolved IP are revalidated, with capped reads and a `%PDF` magic-byte check before anything is written.
 - `src/config.rs` — reads one key (`email`) from `~/.config/ferref/config.toml`. Deliberately a line reader, not TOML, and not a settings system.
 - `src/cite.rs` — APA and MLA as string templates. Not a CSL engine, on purpose.
+- Collections (Phase 10) nest; tags (Phase 5) don't. A tag describes a paper, a collection is where it lives. `collection_tree` is the single traversal, and it terminates on a cyclic `parent_id` graph because the DB is hand-editable by design.
 - `src/cli.rs` — clap derive types for `add`/`list`/`show`/`edit`/`rm`/`search`/`import`/`export`, plus `parse_author`.
 - `src/main.rs` — thin dispatcher. All stdout goes through `emit()`, which exits 0 on a closed pipe instead of panicking. Failures exit non-zero with the message on stderr.
 
@@ -305,6 +306,71 @@ ferref cite <cite_key> --style apa
 
 ---
 
+## Phase 10 — Collections
+
+Phase 5 delivered flat tags, not the nested collections listed as an essential
+feature. This is the gap. Tags stay as they are — a paper can carry many, they
+describe it. A collection is *where a paper lives*, it nests, and it's what the
+TUI's tree pane reads.
+
+```sql
+CREATE TABLE IF NOT EXISTS collections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    parent_id INTEGER REFERENCES collections(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS collection_entries (
+    collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    PRIMARY KEY (collection_id, entry_id)
+);
+```
+
+Collections are addressed by slash-separated path (`Physics/Entropy`), since
+names are unique among siblings. A `UNIQUE (parent_id, name)` constraint will
+*not* enforce that at the root: SQLite treats NULLs as distinct, so two
+top-level collections could share a name. Uniqueness is checked in code.
+
+CLI:
+```
+ferref collection new <path> ferref collection ls [--json]
+ferref collection add <path> <cite_key>   ferref collection rm <path> <cite_key>
+ferref collection mv <path> --parent <path>|--root
+ferref collection delete <path>
+ferref list --collection <path> [--recursive]
+```
+
+> The tree reader must terminate on a cyclic `parent_id` graph. The database is
+> a plain SQLite file anyone can edit by hand — that is the project's core
+> premise — so a cycle is reachable no matter how careful `mv` is, and a naive
+> recursive walk would hang the TUI's render loop.
+
+---
+
+## Phase 11 — TUI
+
+Three panes, Zotero's arrangement: collections tree on the left, entry table in
+the middle, details for the selected entry on the right. Read-only over the same
+SQLite file the CLI writes.
+
+Add `ratatui` + `crossterm`. DESIGN.md has said "TUI later" from the start; a
+terminal UI is not something to hand-roll over raw ANSI escapes, and ratatui is
+the standard choice with crossterm as its backend. No async runtime.
+
+```
+┌─────────────┬────────────────────────────────┬──────────────┐
+│ COLLECTIONS │ Title        Authors  Year Jrnl │ DETAILS      │
+│ ▾ All (12)  │ Array progr… Harris  2020 Natu │ Jaynes, E.T. │
+│   ▾ Physics │ Information… Jaynes  1957 Phys │ Phys Rev 106 │
+│     Entropy │ A Mathemati… Shannon 1948 Bell │ #entropy     │
+└─────────────┴────────────────────────────────┴──────────────┘
+```
+
+Read-only in this phase: no editing, no deletion. The CLI remains the way to
+change anything, so the TUI can't corrupt a library through a mis-keypress.
+
+---
+
 ## Explicit non-goals for v1
 
 - Doing the AI work ourselves — no embeddings, no bibliometric analysis, no LLM calls inside ferref. ferref's job stops at handing clean, structured, scriptable data to whatever does that work.
@@ -315,7 +381,7 @@ ferref cite <cite_key> --style apa
 
 ## Order of work
 
-Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
+Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
 
 ---
 
@@ -335,6 +401,8 @@ Which phases get farmed out to a `coder` subagent, and which get an
 | 7 — Full text | yes | **yes** | Shells out to `pdftotext` with untrusted PDFs and arbitrary paths. Trust boundary. |
 | 8 — DOI fetch | yes | **yes** | Network, remote JSON we don't control, a config file, partial-failure paths. Riskiest phase in the plan. |
 | 9 — Citations | no | no | String templates over fields that already exist. Trivially testable. |
+| 10 — Collections | yes | no | Schema + subcommands, like tags. One real trap (cycles), specified in the brief and tested. |
+| 11 — TUI | yes | **yes** | New dep, terminal state that must be restored on panic, and a render loop that must not hang on malformed data. |
 
 The table is a default, not a rule. The reasoning behind it, which outlives the
 table if the phases change:

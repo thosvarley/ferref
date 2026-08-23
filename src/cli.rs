@@ -52,6 +52,12 @@ pub enum Command {
         /// Exact tag name (case/whitespace-insensitive)
         #[arg(long)]
         tag: Option<String>,
+        /// Slash-separated collection path, e.g. "Physics/Entropy"
+        #[arg(long)]
+        collection: Option<String>,
+        /// With --collection, also include entries in descendant collections
+        #[arg(long)]
+        recursive: bool,
         /// Include each attachment's extracted text (off by default: pulls
         /// every extracted PDF's text into memory otherwise)
         #[arg(long = "full-text")]
@@ -131,6 +137,12 @@ pub enum Command {
         /// Exact tag name (case/whitespace-insensitive)
         #[arg(long)]
         tag: Option<String>,
+        /// Slash-separated collection path, e.g. "Physics/Entropy"
+        #[arg(long)]
+        collection: Option<String>,
+        /// With --collection, also include entries in descendant collections
+        #[arg(long)]
+        recursive: bool,
         /// Include each attachment's extracted text (off by default: pulls
         /// every extracted PDF's text into memory otherwise)
         #[arg(long = "full-text")]
@@ -194,6 +206,66 @@ pub enum Command {
         /// ~/.config/ferref/config.toml.
         #[arg(long)]
         email: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage collections -- nested groupings a paper lives in (unlike tags,
+    /// which describe a paper and don't nest).
+    Collection {
+        #[command(subcommand)]
+        command: CollectionCommand,
+    },
+}
+
+// Collections are addressed by slash-separated path ("Physics/Entropy"),
+// since names are unique among siblings -- see db::create_collection.
+#[derive(Subcommand)]
+pub enum CollectionCommand {
+    /// Create a collection, creating any missing intermediate collections
+    /// along the path (mkdir -p semantics). Re-running with the same path is
+    /// a no-op, not an error.
+    New {
+        path: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List every collection as an indented tree with entry counts.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add an entry to a collection. Idempotent.
+    Add {
+        path: String,
+        cite_key: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove an entry from a collection. Idempotent. Does not delete the
+    /// entry itself.
+    Rm {
+        path: String,
+        cite_key: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Move (reparent) a collection. Exactly one of --parent or --root is
+    /// required. Refuses to move a collection under itself or a descendant.
+    Mv {
+        path: String,
+        /// New parent's path
+        #[arg(long)]
+        parent: Option<String>,
+        /// Move to the top level (no parent)
+        #[arg(long)]
+        root: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a collection and its subtree. Entries are never deleted --
+    /// only their membership in the deleted collections.
+    Delete {
+        path: String,
         #[arg(long)]
         json: bool,
     },

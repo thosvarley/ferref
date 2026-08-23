@@ -89,10 +89,18 @@ fn main() {
             }
         }
 
-        Command::List { tag, full_text, json } => match db::list_entries(
+        Command::List {
+            tag,
+            collection,
+            recursive,
+            full_text,
+            json,
+        } => match db::list_entries(
             &conn,
             &db::Filter {
                 tag,
+                collection,
+                recursive,
                 ..Default::default()
             },
             full_text,
@@ -262,6 +270,8 @@ fn main() {
             from,
             to,
             tag,
+            collection,
+            recursive,
             full_text,
             json,
         } => {
@@ -273,6 +283,8 @@ fn main() {
                 year_min: year.or(from),
                 year_max: year.or(to),
                 tag,
+                collection,
+                recursive,
             };
 
             match db::list_entries(&conn, &filter, full_text) {
@@ -667,6 +679,138 @@ fn main() {
                 std::process::exit(1);
             }
         }
+
+        Command::Collection { command } => dispatch_collection(&conn, command),
+    }
+}
+
+fn dispatch_collection(conn: &rusqlite::Connection, command: cli::CollectionCommand) {
+    use cli::CollectionCommand;
+
+    match command {
+        CollectionCommand::New { path, json } => match db::create_collection(conn, &path) {
+            Ok(id) => {
+                if json {
+                    let out = serde_json::json!({ "path": path, "id": id });
+                    emit(&serde_json::to_string_pretty(&out).unwrap());
+                } else {
+                    emit(&format!("Created collection '{path}' (id {id})"));
+                }
+            }
+            Err(e) => die(&db_error("create collection", e)),
+        },
+
+        CollectionCommand::Ls { json } => {
+            let tree = match db::collection_tree(conn) {
+                Ok(t) => t,
+                Err(e) => die(&format!("failed to list collections: {e}")),
+            };
+
+            // path is rebuilt from the (depth, collection) pre-order walk: a
+            // stack of ancestor names truncated to the current depth before
+            // each push, same idea as walking a directory tree.
+            let mut path_stack: Vec<String> = Vec::new();
+            if json {
+                let rows: Vec<_> = tree
+                    .iter()
+                    .map(|(depth, c)| {
+                        path_stack.truncate(*depth);
+                        path_stack.push(c.name.clone());
+                        serde_json::json!({
+                            "id": c.id,
+                            "name": c.name,
+                            "parent_id": c.parent_id,
+                            "depth": depth,
+                            "path": path_stack.join("/"),
+                            "entry_count": c.entry_count,
+                        })
+                    })
+                    .collect();
+                emit(&serde_json::to_string_pretty(&rows).unwrap());
+            } else {
+                for (depth, c) in &tree {
+                    emit(&format!("{}{} ({})", "  ".repeat(*depth), c.name, c.entry_count));
+                }
+            }
+        }
+
+        CollectionCommand::Add { path, cite_key, json } => {
+            match db::add_to_collection(conn, &path, &cite_key) {
+                Ok(changed) => {
+                    if json {
+                        let out = serde_json::json!({
+                            "path": path,
+                            "cite_key": cite_key,
+                            "changed": changed,
+                        });
+                        emit(&serde_json::to_string_pretty(&out).unwrap());
+                    } else if changed {
+                        emit(&format!("Added '{cite_key}' to '{path}'"));
+                    } else {
+                        emit(&format!("'{cite_key}' is already in '{path}'"));
+                    }
+                }
+                Err(e) => die(&collection_entry_error(&cite_key, "add entry to collection", e)),
+            }
+        }
+
+        CollectionCommand::Rm { path, cite_key, json } => {
+            match db::remove_from_collection(conn, &path, &cite_key) {
+                Ok(changed) => {
+                    if json {
+                        let out = serde_json::json!({
+                            "path": path,
+                            "cite_key": cite_key,
+                            "changed": changed,
+                        });
+                        emit(&serde_json::to_string_pretty(&out).unwrap());
+                    } else if changed {
+                        emit(&format!("Removed '{cite_key}' from '{path}'"));
+                    } else {
+                        emit(&format!("'{cite_key}' was not in '{path}'"));
+                    }
+                }
+                Err(e) => {
+                    die(&collection_entry_error(&cite_key, "remove entry from collection", e))
+                }
+            }
+        }
+
+        CollectionCommand::Mv { path, parent, root, json } => {
+            let new_parent = match (parent, root) {
+                (Some(p), false) => Some(p),
+                (None, true) => None,
+                (None, false) => die("collection mv requires either --parent <path> or --root"),
+                (Some(_), true) => die("collection mv cannot take both --parent and --root"),
+            };
+
+            match db::move_collection(conn, &path, new_parent.as_deref()) {
+                Ok(()) => {
+                    if json {
+                        let out = serde_json::json!({ "path": path, "new_parent": new_parent });
+                        emit(&serde_json::to_string_pretty(&out).unwrap());
+                    } else {
+                        match &new_parent {
+                            Some(p) => emit(&format!("Moved '{path}' under '{p}'")),
+                            None => emit(&format!("Moved '{path}' to the root")),
+                        }
+                    }
+                }
+                Err(e) => die(&db_error("move collection", e)),
+            }
+        }
+
+        CollectionCommand::Delete { path, json } => match db::delete_collection(conn, &path) {
+            Ok(count) => {
+                if json {
+                    let out = serde_json::json!({ "path": path, "deleted": count });
+                    emit(&serde_json::to_string_pretty(&out).unwrap());
+                } else {
+                    emit(&format!("Deleted '{path}' and {count} collection(s)"));
+                }
+            }
+            Err(e) => die(&db_error("delete collection", e)),
+        },
     }
 }
 
@@ -819,6 +963,30 @@ fn entry_error(cite_key: &str, action: &str, e: rusqlite::Error) -> String {
         rusqlite::Error::QueryReturnedNoRows => {
             format!("no entry found with cite_key '{cite_key}'")
         }
+        e => format!("failed to {action}: {e}"),
+    }
+}
+
+// Collection functions (create_collection, move_collection, delete_collection)
+// report an unknown/invalid path via InvalidParameterName(msg), where msg is
+// already a complete, human-readable message -- see db.rs.
+fn db_error(action: &str, e: rusqlite::Error) -> String {
+    match e {
+        rusqlite::Error::InvalidParameterName(msg) => msg,
+        e => format!("failed to {action}: {e}"),
+    }
+}
+
+// add_to_collection/remove_from_collection can fail on either an unknown
+// cite_key (QueryReturnedNoRows, same as add_tag) or an unknown collection
+// path (InvalidParameterName, already human-readable). Combines entry_error
+// and db_error's handling.
+fn collection_entry_error(cite_key: &str, action: &str, e: rusqlite::Error) -> String {
+    match e {
+        rusqlite::Error::QueryReturnedNoRows => {
+            format!("no entry found with cite_key '{cite_key}'")
+        }
+        rusqlite::Error::InvalidParameterName(msg) => msg,
         e => format!("failed to {action}: {e}"),
     }
 }
