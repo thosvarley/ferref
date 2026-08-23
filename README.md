@@ -93,7 +93,49 @@ $ ferref tag jaynes1957 entropy
 'jaynes1957' already tagged 'entropy'
 ```
 
-### 4. Search
+### 4. Organise into collections
+
+Tags and collections do different jobs and both exist. A **tag** describes a
+paper and doesn't nest; a **collection** is *where a paper lives*, and it does.
+
+Paths are `mkdir -p`-style — creating a nested path creates every level:
+
+```console
+$ ferref collection new "Information Theory/Foundations"
+Created collection 'Information Theory/Foundations' (id 2)
+
+$ ferref collection add "Information Theory/Foundations" shannon1948
+Added 'shannon1948' to 'Information Theory/Foundations'
+$ ferref collection add "Information Theory" jaynes1957
+Added 'jaynes1957' to 'Information Theory'
+
+$ ferref collection ls
+Information Theory (1)
+  Foundations (1)
+```
+
+Filtering is direct by default; `--recursive` includes descendants:
+
+```console
+$ ferref list --collection "Information Theory"
+jaynes1957      1957   Information Theory and Statistical Mechanics       Jaynes, E. T.
+
+$ ferref list --collection "Information Theory" --recursive
+jaynes1957      1957   Information Theory and Statistical Mechanics       Jaynes, E. T.
+shannon1948     1948   A Mathematical Theory of Communication             Shannon, Claude E.
+```
+
+`collection mv` reparents a subtree and refuses to create a loop:
+
+```console
+$ ferref collection mv "Information Theory" --parent "Information Theory/Foundations"
+Error: cannot move a collection under its own descendant
+```
+
+`collection delete` removes a collection and its subtree. It never deletes
+entries — only their membership.
+
+### 5. Search
 
 Filters combine with AND. `--author` and `--title` are case-insensitive
 substring matches; `--tag` is an exact match, because tags are identifiers.
@@ -106,7 +148,7 @@ ferref search --tag ENTROPY --year 1957
 
 No matches prints nothing and exits 0 — it's a query, not a test.
 
-### 5. Attach a PDF you already have
+### 6. Attach a PDF you already have
 
 ferref records the **path**, and never copies or moves your file. The path is
 resolved to an absolute one, so it survives you `cd`-ing elsewhere.
@@ -123,7 +165,7 @@ Extracted 148204 characters from '/home/you/Downloads/shannon1948.pdf'
 `ferref extract shannon1948` later. `ferref open shannon1948` opens the
 attachments in your default viewer.
 
-### 6. Fetch an open-access PDF automatically
+### 7. Fetch an open-access PDF automatically
 
 `fetch` asks Unpaywall whether a legal open-access copy exists, and if one does,
 downloads it to `./pdfs/`, attaches it, and extracts the text.
@@ -163,7 +205,7 @@ direct PDF link for it -- only landing pages
 ferref will not work around a paywall. If Unpaywall says there's no legal open
 copy, that's the end of it.
 
-### 7. Get the text back out
+### 8. Get the text back out
 
 This is the point of the whole thing. `show --json` carries the extracted text:
 
@@ -181,7 +223,7 @@ listing would pull every PDF's text into memory:
 ferref list --json --full-text | jq -r '.[] | "\(.cite_key)\t\(.attachments[0].full_text // "" | length)"'
 ```
 
-### 8. Cite and export
+### 9. Cite and export
 
 ```console
 $ ferref cite jaynes1957
@@ -199,27 +241,63 @@ ferref export > library.bib          # all entries as BibTeX
 ferref import someone-elses.bib      # duplicate cite keys are skipped, not fatal
 ```
 
+## Browsing in the terminal
+
+`ferref tui` opens a three-pane browser: collections on the left, entries in the
+middle, details for the highlighted entry on the right.
+
+```
+┌─────────────┬────────────────────────────────┬──────────────┐
+│ COLLECTIONS │ Title        Authors  Year Jrnl │ DETAILS      │
+│ ▾ All (12)  │ Array progr… Harris  2020 Natu │ Jaynes, E.T. │
+│   ▾ Physics │ Information… Jaynes  1957 Phys │ Phys Rev 106 │
+│     Entropy │ A Mathemati… Shannon 1948 Bell │ #entropy     │
+└─────────────┴────────────────────────────────┴──────────────┘
+ Tab pane · ↑↓ move · ←→ fold · r reload · q quit
+```
+
+| Key | Does |
+| --- | --- |
+| `Tab` / `Shift-Tab` | Cycle focus between panes |
+| `↑` `↓` or `k` `j` | Move the selection |
+| `←` `→` or `h` `l` | Collapse / expand a collection |
+| `PgUp` `PgDn` `Home` `End` | Page through the entry table |
+| `r` | Reload from the database |
+| `q`, `Esc`, `Ctrl-C` | Quit |
+
+Selecting a collection filters the middle pane recursively, so a parent shows
+everything beneath it. **The TUI is read-only** — the CLI remains the only way
+to change a library, so a mis-keypress can't damage one. Press `r` to pick up
+changes made from another shell.
+
 ## Command reference
 
 | Command | What it does |
 | --- | --- |
 | `add` | Create an entry. `--type/--key/--title`, or `--doi` to autofill from Crossref |
-| `list` | List everything. `--tag`, `--full-text` |
+| `list` | List everything. `--tag`, `--collection`, `--recursive`, `--full-text` |
 | `show <key>` | One entry in full |
 | `edit <key>` | Change fields; only the flags you pass are touched |
 | `rm <key>` | Delete an entry (cascades to authors, tags, attachments) |
-| `search` | `--author --title --year --from --to --tag --full-text` |
-| `tag` / `untag <key> <tag>` | Add/remove a tag. Idempotent |
+| `search` | `--author --title --year --from --to --tag --collection --recursive --full-text` |
+| `tag` / `untag <key> <tag>` | Add/remove a tag (flat, describes a paper). Idempotent |
 | `attach <key> <path>` | Record a file path. `--extract` to pull text immediately |
 | `extract <key>` | (Re)extract text for all of an entry's attachments |
 | `open <key>` | Open attachments in the system viewer |
 | `fetch <key>` | Find and download an open-access PDF for the entry's DOI |
 | `cite <key>` | `--style apa` (default) or `--style mla` |
+| `collection new <path>` | Create a collection, `mkdir -p` style |
+| `collection ls` | The whole tree, with entry counts |
+| `collection add` / `rm` | Add or remove an entry's membership. Idempotent |
+| `collection mv <path>` | Reparent a subtree: `--parent <path>` or `--root` |
+| `collection delete <path>` | Delete a subtree; entries are never deleted |
+| `tui` | Three-pane terminal browser (read-only) |
 | `import <path>` | Read a `.bib` file |
 | `export` | Write BibTeX to stdout, or `--out file.bib` |
 
 Every command above takes `--json` except `export`, whose output format is
-BibTeX by definition.
+BibTeX by definition, and `tui`, which is an interactive screen rather than a
+data-printing command.
 
 ## Scripting
 
@@ -245,6 +323,10 @@ ferref list --json | jq -r '.[] | select(.doi) | .cite_key' | xargs -n1 ferref f
 
 # Bibliography for one tag
 ferref search --tag to-read --json | jq -r '.[].cite_key' | xargs -n1 ferref cite
+
+# Export one collection (and everything under it) as BibTeX
+ferref list --collection "Information Theory" --recursive --json \
+  | jq -r '.[].cite_key' > keys.txt
 
 # Dump full text for an embedding pipeline
 ferref list --json --full-text \
@@ -293,9 +375,11 @@ sqlite3 ferref.db '.schema'
 sqlite3 ferref.db "SELECT cite_key, title FROM entries WHERE year > 2015;"
 ```
 
-Tables: `entries`, `authors`, `tags`, `entry_tags`, `attachments`. Foreign keys
-cascade from `entries`, so deleting an entry cleans up after itself. `cite_key`
-and `id` are the stable identifiers — key your own tools against those.
+Tables: `entries`, `authors`, `tags`, `entry_tags`, `attachments`, `collections`,
+`collection_entries`. Foreign keys cascade from `entries`, so deleting an entry
+cleans up after itself, and from `collections`, so deleting a collection takes
+its subtree without touching the papers. `cite_key` and `id` are the stable
+identifiers — key your own tools against those.
 
 ## Limitations worth knowing
 
@@ -308,13 +392,18 @@ and `id` are the stable identifiers — key your own tools against those.
 - `cite` covers APA and MLA only, and doesn't recase titles or handle APA's
   21-author truncation.
 - Extraction is PDF-only, capped at 10 MB of text per attachment.
+- A collection whose *name* contains `/` can't be addressed by the CLI's path
+  syntax. The CLI won't create one; only hand-editing the database can. The TUI
+  reaches collections by id and handles them fine.
+- The TUI is read-only, and doesn't sort or filter beyond the collection tree —
+  use the CLI, then press `r`.
 
 `DESIGN.md` has the full list with the reasoning behind each.
 
 ## Development
 
 ```sh
-cargo test        # 52 tests, no network access required
+cargo test        # 66 tests, no network access required
 cargo build
 ```
 
