@@ -76,6 +76,13 @@ fn main() {
                     )),
                 };
                 entry.doi = Some(doi_value);
+                // Keep the page we were pointed at. Crossref supplies the
+                // metadata but not this, and dropping it only on the DOI path
+                // meant the common --from-url case lost the URL the user typed
+                // while the rarer fallback kept it.
+                if entry.url.is_none() {
+                    entry.url = from_url.clone();
+                }
                 entry.cite_key = match cite_key {
                     Some(key) => key,
                     None => match derive_cite_key(&conn, &entry) {
@@ -1040,22 +1047,26 @@ fn land_downloaded_pdf(
         }
     }
 
-    let abs = target
-        .canonicalize()
-        .map_err(|e| format!("failed to resolve saved PDF path '{}': {e}", target.display()))?;
-    let path_str = abs
-        .to_str()
-        .ok_or_else(|| format!("path {} is not valid UTF-8", abs.display()))?
-        .to_string();
-
-    let (attachment_id, _changed) = db::attach(conn, cite_key, &path_str).map_err(|e| {
-        // Don't leave a PDF on disk that nothing in the library points at.
-        // Only remove what this run downloaded.
+    // Every failure from here on has to clean up too, not just the attach: a
+    // file this run wrote but never attached is invisible to `pdf_target`'s
+    // "is it mine?" check, so it would squat on the name forever.
+    let cleanup = |e: String| {
         if !already_present {
             let _ = std::fs::remove_file(&target);
         }
-        entry_error(cite_key, "attach downloaded PDF", e)
-    })?;
+        e
+    };
+
+    let abs = target
+        .canonicalize()
+        .map_err(|e| cleanup(format!("failed to resolve saved PDF path '{}': {e}", target.display())))?;
+    let path_str = abs
+        .to_str()
+        .ok_or_else(|| cleanup(format!("path {} is not valid UTF-8", abs.display())))?
+        .to_string();
+
+    let (attachment_id, _changed) = db::attach(conn, cite_key, &path_str)
+        .map_err(|e| cleanup(entry_error(cite_key, "attach downloaded PDF", e)))?;
 
     Ok((path_str, attachment_id, already_present))
 }

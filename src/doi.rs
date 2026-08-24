@@ -70,7 +70,7 @@ pub fn fetch_oa_pdf_url(doi: &str, email: &str) -> Result<OaStatus, String> {
 /// `url_for_pdf` not infrequently lands on an HTML interstitial instead of
 /// the actual paper.
 pub fn download_pdf(url: &str) -> Result<Vec<u8>, String> {
-    let bytes = fetch_guarded(url, PDF_TIMEOUT, MAX_PDF_BYTES, "PDF download")?;
+    let (bytes, _final_url) = fetch_guarded(url, PDF_TIMEOUT, MAX_PDF_BYTES, "PDF download")?;
 
     if !has_pdf_magic(&bytes) {
         return Err(
@@ -146,12 +146,15 @@ pub fn sanitize_filename(cite_key: &str) -> Result<String, String> {
 /// bypasses an access control, it just makes an ordinary request and reads what
 /// comes back.
 pub fn fetch_page_metadata(url: &str) -> Result<PageMetadata, String> {
-    let bytes = fetch_guarded(url, JSON_TIMEOUT, MAX_HTML_BYTES, "landing page")?;
+    let (bytes, final_url) = fetch_guarded(url, JSON_TIMEOUT, MAX_HTML_BYTES, "landing page")?;
     // Lossy, not strict: a publisher page is a document to skim for six
     // attributes, not a protocol payload. Mis-declared encodings are common and
     // shouldn't cost the whole fetch.
     let html = String::from_utf8_lossy(&bytes);
-    let base = validate_url(url)?;
+    // The URL the page actually came from, not the one that was typed: a DOI
+    // resolver, a www redirect, or an SSO proxy all land somewhere else, and a
+    // relative citation_pdf_url has to resolve against where we ended up.
+    let base = validate_url(&final_url)?;
     Ok(parse_citation_meta(&html, &base))
 }
 
@@ -168,12 +171,11 @@ pub struct PageMetadata {
     pub year: Option<i32>,
 }
 
-// Scans raw HTML for <meta name="citation_*" content="..."> without parsing
-// the document. Crude on purpose, in the same spirit as strip_jats_tags: an
-// HTML parser is a dependency bought to read six attributes off a
-// well-established convention. The convention is Highwire Press's, which
-// Google Scholar indexing depends on, so publishers emit it reliably and in a
-// narrow range of shapes.
+// Scans raw HTML for <meta name="citation_*" content="..."> without parsing the
+// document. Crude on purpose, in the same spirit as strip_jats_tags: an HTML
+// parser is a dependency bought to read six attributes off a well-established
+// convention. The convention is Highwire Press's, which Google Scholar indexing
+// depends on, so publishers emit it reliably.
 //
 // What this deliberately does NOT handle: tags inside comments or <script>
 // strings, and any per-publisher DOM structure. A page that doesn't emit the
@@ -181,14 +183,20 @@ pub struct PageMetadata {
 fn parse_citation_meta(html: &str, base: &Uri) -> PageMetadata {
     let mut meta = PageMetadata::default();
 
-    for tag in meta_tags(html) {
-        let Some(name) = tag_attr(&tag, "name").or_else(|| tag_attr(&tag, "property")) else {
+    for attrs in meta_attributes(html) {
+        let get = |want: &str| {
+            attrs
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(want))
+                .map(|(_, v)| v.as_str())
+        };
+        let Some(name) = get("name").or_else(|| get("property")) else {
             continue;
         };
-        let Some(content) = tag_attr(&tag, "content") else {
+        let Some(content) = get("content") else {
             continue;
         };
-        let content = unescape_html(&content);
+        let content = unescape_html(content);
         if content.trim().is_empty() {
             continue;
         }
@@ -230,70 +238,129 @@ fn set_once(slot: &mut Option<String>, value: String) {
     }
 }
 
-// Yields the inner text of each <meta ...> tag. Bounded by the closing '>',
-// which is safe here because an unquoted attribute value containing '>' is
-// invalid HTML and a quoted one is handled by tag_attr's own quote tracking
-// only insofar as the tag is truncated -- worst case a tag is skipped, never
-// misread as another tag's value.
-fn meta_tags(html: &str) -> Vec<String> {
-    let lower = html.to_ascii_lowercase();
+// Returns each <meta> tag's attributes as (name, value) pairs.
+//
+// This tracks quotes, which the obvious version -- find `<meta`, slice to the
+// next '>', then substring-search for `content=` -- does not, and all three of
+// its failures were real:
+//   * a decoy attribute whose *value* contained the text ` content=` was read
+//     as the content attribute, letting a page choose which PDF got downloaded;
+//   * a '>' inside a quoted value truncated the tag and silently dropped it;
+//   * one unclosed `<meta` swallowed every following tag up to the next '>'
+//     anywhere in the document.
+//
+// Byte indexing is safe here without char-boundary checks: the scanner only
+// ever stops on ASCII delimiters, and every byte of a multi-byte UTF-8 sequence
+// is >= 0x80, so it can never be mistaken for one.
+fn meta_attributes(html: &str) -> Vec<Vec<(String, String)>> {
+    let b = html.as_bytes();
     let mut tags = Vec::new();
-    let mut from = 0;
+    let mut i = 0;
 
-    while let Some(start) = lower[from..].find("<meta") {
-        let start = from + start;
-        // Must be followed by whitespace or '/' -- otherwise "<metadata" hits.
-        let after = lower[start + 5..].chars().next();
-        let end = match html[start..].find('>') {
-            Some(e) => start + e,
-            None => break,
+    while i < b.len() {
+        let Some(offset) = b[i..].iter().position(|&c| c == b'<') else {
+            break;
         };
-        if matches!(after, Some(c) if c.is_whitespace() || c == '/') {
-            tags.push(html[start + 5..end].to_string());
+        let start = i + offset;
+        // Resume inside the tag we just found, so a malformed one can't consume
+        // the tags after it.
+        i = start + 1;
+
+        if b.len() - start < 5 || !b[start..start + 5].eq_ignore_ascii_case(b"<meta") {
+            continue;
         }
-        from = end + 1;
+        // "<metadata" must not match.
+        if !matches!(b.get(start + 5), Some(c) if c.is_ascii_whitespace() || *c == b'/') {
+            continue;
+        }
+
+        let mut p = start + 5;
+        let mut attrs: Vec<(String, String)> = Vec::new();
+        let mut closed = false;
+
+        loop {
+            while p < b.len() && b[p].is_ascii_whitespace() {
+                p += 1;
+            }
+            match b.get(p) {
+                None => break,
+                Some(b'>') => {
+                    closed = true;
+                    p += 1;
+                    break;
+                }
+                Some(b'/') => {
+                    p += 1;
+                    continue;
+                }
+                // A '<' cannot begin an attribute name, so the tag we're in was
+                // never closed. Abandon it rather than reading the next tag as
+                // this one's attributes -- the outer loop resumes at this '<'.
+                Some(b'<') => break,
+                _ => {}
+            }
+
+            let name_start = p;
+            while p < b.len()
+                && !b[p].is_ascii_whitespace()
+                && b[p] != b'='
+                && b[p] != b'>'
+                && b[p] != b'/'
+            {
+                p += 1;
+            }
+            let name = &html[name_start..p];
+
+            let before_eq = p;
+            while p < b.len() && b[p].is_ascii_whitespace() {
+                p += 1;
+            }
+            if b.get(p) != Some(&b'=') {
+                // Valueless attribute; rewind so the next round sees what follows.
+                attrs.push((name.to_string(), String::new()));
+                p = before_eq;
+                continue;
+            }
+            p += 1;
+            while p < b.len() && b[p].is_ascii_whitespace() {
+                p += 1;
+            }
+
+            let value = match b.get(p) {
+                None => break,
+                Some(&q @ (b'"' | b'\'')) => {
+                    p += 1;
+                    let value_start = p;
+                    // Stop at '<' as well as the closing quote: no citation_*
+                    // value contains one, so hitting it means the quote was
+                    // never closed and we are about to eat the next tag.
+                    while p < b.len() && b[p] != q && b[p] != b'<' {
+                        p += 1;
+                    }
+                    if p >= b.len() || b[p] == b'<' {
+                        break; // unterminated quote: abandon this tag
+                    }
+                    let v = &html[value_start..p];
+                    p += 1;
+                    v
+                }
+                Some(_) => {
+                    let value_start = p;
+                    while p < b.len() && !b[p].is_ascii_whitespace() && b[p] != b'>' {
+                        p += 1;
+                    }
+                    &html[value_start..p]
+                }
+            };
+            attrs.push((name.to_string(), value.to_string()));
+        }
+
+        if closed && !attrs.is_empty() {
+            tags.push(attrs);
+            i = p;
+        }
     }
     tags
-}
-
-// Pulls one attribute's value out of a tag body. Handles double quotes, single
-// quotes, and unquoted values, and requires the name to be a whole attribute
-// (so `content` doesn't match inside `data-content`).
-fn tag_attr(tag: &str, attr: &str) -> Option<String> {
-    let lower = tag.to_ascii_lowercase();
-    let mut from = 0;
-
-    while let Some(found) = lower[from..].find(attr) {
-        let at = from + found;
-        from = at + attr.len();
-
-        let before_ok = at == 0
-            || lower[..at]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_whitespace() || c == '/');
-        if !before_ok {
-            continue;
-        }
-
-        let rest = tag[at + attr.len()..].trim_start();
-        let Some(rest) = rest.strip_prefix('=') else {
-            continue;
-        };
-        let rest = rest.trim_start();
-
-        return match rest.chars().next() {
-            Some(q @ ('"' | '\'')) => rest[1..].find(q).map(|e| rest[1..1 + e].to_string()),
-            Some(_) => Some(
-                rest.split(|c: char| c.is_whitespace())
-                    .next()
-                    .unwrap_or("")
-                    .to_string(),
-            ),
-            None => None,
-        };
-    }
-    None
 }
 
 // The five predefined XML entities plus numeric escapes, which is what actually
@@ -342,7 +409,7 @@ fn unescape_html(s: &str) -> String {
 }
 
 fn get_json(url: &str, service: &str) -> Result<String, String> {
-    let bytes = fetch_guarded(url, JSON_TIMEOUT, MAX_JSON_BYTES, service)?;
+    let (bytes, _final_url) = fetch_guarded(url, JSON_TIMEOUT, MAX_JSON_BYTES, service)?;
     String::from_utf8(bytes).map_err(|_| format!("{service} returned invalid UTF-8"))
 }
 
@@ -360,12 +427,17 @@ fn get_json(url: &str, service: &str) -> Result<String, String> {
 // again when it connects, so a DNS entry that changes between the two (a
 // rebinding attack) can still slip past. Closing that needs a resolver we
 // control, i.e. a dependency; the check below stops the realistic case.
+// Returns the bytes and the URL they actually came from -- which is not the URL
+// passed in whenever a redirect was followed. Callers that resolve relative
+// links against the page (parse_citation_meta) need the final one, or a
+// publisher reached via a cross-host redirect resolves its citation_pdf_url
+// against the wrong host.
 fn fetch_guarded(
     url: &str,
     timeout: Duration,
     limit: u64,
     what: &str,
-) -> Result<Vec<u8>, String> {
+) -> Result<(Vec<u8>, String), String> {
     let agent: Agent = Agent::config_builder()
         .timeout_global(Some(timeout))
         .http_status_as_error(false)
@@ -406,14 +478,15 @@ fn fetch_guarded(
             _ => {}
         }
 
-        return resp
+        let body = resp
             .into_body()
             .with_config()
             .limit(limit + 1)
             .read_to_vec()
             .map_err(|e| {
                 format!("failed reading {what} response (over the {limit}-byte cap): {e}")
-            });
+            })?;
+        return Ok((body, current));
     }
 
     Err(format!("{what}: too many redirects (limit {MAX_REDIRECTS})"))
@@ -485,13 +558,27 @@ fn is_internal(ip: IpAddr) -> bool {
 
 // Location may be absolute or relative; resolve it against the hop we were on.
 fn resolve_location(base: &Uri, location: &str) -> Result<String, String> {
-    if location.starts_with("http://") || location.starts_with("https://") {
+    let scheme = base.scheme_str().unwrap_or("https");
+
+    // Schemes are case-insensitive per RFC 3986, and matching only lowercase
+    // turned "HTTPS://host/x" into a *relative* path glued onto the base host --
+    // silently going somewhere other than where the server said. (Harmless for
+    // safety, since the result is revalidated either way, but it breaks the
+    // redirect.)
+    let lower = location.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
         return Ok(location.to_string());
     }
-    let scheme = base.scheme_str().unwrap_or("https");
+
     let authority = base
         .authority()
         .ok_or_else(|| "redirect target has no host".to_string())?;
+
+    // Protocol-relative ("//host/path") is a different host, not a path on this
+    // one. Institutional proxy and CDN rewrites use it.
+    if let Some(rest) = location.strip_prefix("//") {
+        return Ok(format!("{scheme}://{rest}"));
+    }
     if location.starts_with('/') {
         Ok(format!("{scheme}://{authority}{location}"))
     } else {
@@ -914,6 +1001,58 @@ mod tests {
         // `data-content` must not be read as `content`.
         let m = meta_of(r#"<meta name="citation_title" data-content="wrong" content="right">"#);
         assert_eq!(m.title.as_deref(), Some("right"));
+    }
+
+    // A landing page is untrusted input, and the scanner that reads it decides
+    // which PDF gets downloaded. Each of these was a real defect in the version
+    // that sliced to the next '>' and substring-searched for the attribute.
+    #[test]
+    fn the_meta_scanner_tracks_quotes() {
+        // A decoy attribute whose VALUE contains " content=" must not be read
+        // as the content attribute -- that let a page choose the download URL.
+        let hijack = r#"<meta name="citation_pdf_url" data-note="see content=http://evil.example/x.pdf ok" content="https://good.example/real.pdf">"#;
+        assert_eq!(
+            meta_of(hijack).pdf_url.as_deref(),
+            Some("https://good.example/real.pdf")
+        );
+
+        // '>' inside a quoted value is content, not the end of the tag.
+        let gt = r#"<meta name="citation_title" content="A > B">"#;
+        assert_eq!(meta_of(gt).title.as_deref(), Some("A > B"));
+
+        // An unclosed <meta must not swallow the tags after it.
+        let unclosed = "<meta name=\"citation_pdf_url\" content=\"decoy.pdf\"\n\
+                        <meta name=\"citation_doi\" content=\"10.1/found\">";
+        assert_eq!(meta_of(unclosed).doi.as_deref(), Some("10.1/found"));
+
+        // An unterminated quote abandons its own tag and nothing else.
+        let unterminated = "<meta name=\"citation_title\" content=\"never closed\n\
+                            <meta name=\"citation_doi\" content=\"10.2/ok\">";
+        assert_eq!(meta_of(unterminated).doi.as_deref(), Some("10.2/ok"));
+    }
+
+    // A redirect's Location may be protocol-relative or use a shouted scheme;
+    // both are absolute, and treating either as a relative path sends the next
+    // hop to the wrong host.
+    #[test]
+    fn resolve_location_treats_absolute_forms_as_absolute() {
+        let base: Uri = "https://good.example/a/b".parse().unwrap();
+        assert_eq!(
+            resolve_location(&base, "//cdn.example/x").unwrap(),
+            "https://cdn.example/x"
+        );
+        assert_eq!(
+            resolve_location(&base, "HTTPS://other.example/x").unwrap(),
+            "HTTPS://other.example/x"
+        );
+        assert_eq!(
+            resolve_location(&base, "/rooted").unwrap(),
+            "https://good.example/rooted"
+        );
+        assert_eq!(
+            resolve_location(&base, "relative").unwrap(),
+            "https://good.example/relative"
+        );
     }
 
     #[test]

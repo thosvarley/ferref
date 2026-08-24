@@ -488,9 +488,23 @@ Landing the PDF (claim a name under `./pdfs/`, write, attach, clean up on
 failure) is shared with `fetch` rather than written twice — `fetch`'s copy also
 had the exists-then-write race that `attach` was fixed for.
 
-No new dependencies. Meta-tag scanning is ~60 lines over the raw HTML, in the
-same spirit as `strip_jats_tags`: crude, documented as crude, and tested. An
-HTML parser would be a dependency bought to read six attributes.
+No new dependencies. Meta-tag scanning is a small hand-rolled tokenizer over the
+raw HTML, in the same spirit as `strip_jats_tags`: crude, documented as crude,
+and tested. An HTML parser would be a dependency bought to read six attributes.
+
+It does have to **track quotes**, which the obvious version (find `<meta`, slice
+to the next `>`, substring-search for `content=`) does not. All three of that
+version's failures were real and are locked down by tests: a decoy attribute
+whose *value* contained ` content=` was read as the content attribute, letting
+the page choose which PDF got downloaded; a `>` inside a quoted value truncated
+the tag and silently dropped it; and one unclosed `<meta` swallowed every
+following tag. A `<` where an attribute name or quoted value should be means the
+tag was never closed, so it is abandoned rather than merged with the next one.
+
+Relative `citation_pdf_url`s resolve against the URL the page **actually came
+from**, not the one that was typed — `fetch_guarded` returns its final URL for
+exactly this. A DOI resolver, a `www` redirect, or an SSO proxy all land
+somewhere else, and that is the case this phase exists to serve.
 
 ---
 
