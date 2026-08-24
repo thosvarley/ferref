@@ -59,8 +59,10 @@ pub enum Command {
         #[arg(long)]
         recursive: bool,
         /// Include each attachment's extracted text (off by default: pulls
-        /// every extracted PDF's text into memory otherwise)
-        #[arg(long = "full-text")]
+        /// every extracted PDF's text into memory otherwise). Requires --json,
+        /// because the plain-text listing has no column for it -- without that
+        /// guard the flag reads the whole library's text and prints none of it.
+        #[arg(long = "full-text", requires = "json")]
         full_text: bool,
         #[arg(long)]
         json: bool,
@@ -144,8 +146,10 @@ pub enum Command {
         #[arg(long)]
         recursive: bool,
         /// Include each attachment's extracted text (off by default: pulls
-        /// every extracted PDF's text into memory otherwise)
-        #[arg(long = "full-text")]
+        /// every extracted PDF's text into memory otherwise). Requires --json,
+        /// because the plain-text listing has no column for it -- without that
+        /// guard the flag reads the whole library's text and prints none of it.
+        #[arg(long = "full-text", requires = "json")]
         full_text: bool,
         #[arg(long)]
         json: bool,

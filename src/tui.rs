@@ -729,11 +729,14 @@ impl App {
     }
 }
 
+// Counts here are RECURSIVE, unlike `collection ls`. Selecting a row filters
+// the table recursively (see load_entries), so a direct count beside it made
+// the pane disagree with itself: a parent whose papers all live in its children
+// read "(0)" and then filled the table when you clicked it.
 fn load_tree(conn: &Connection) -> Result<Vec<TreeRow>, String> {
     let tree = db::collection_tree(conn).map_err(|e| e.to_string())?;
-    let total = db::list_entries(conn, &Filter::default(), false)
-        .map_err(|e| e.to_string())?
-        .len() as i64;
+    let total = db::count_entries(conn).map_err(|e| e.to_string())?;
+    let counts = db::recursive_entry_counts(conn).map_err(|e| e.to_string())?;
 
     let mut rows = Vec::with_capacity(tree.len() + 1);
     rows.push(TreeRow {
@@ -747,7 +750,10 @@ fn load_tree(conn: &Connection) -> Result<Vec<TreeRow>, String> {
             id: Some(c.id),
             depth: depth + 1,
             name: c.name.clone(),
-            entry_count: c.entry_count,
+            // A collection missing from the map can't happen -- the CTE seeds
+            // from every row of `collections` -- but falling back to the direct
+            // count beats panicking in a render path.
+            entry_count: *counts.get(&c.id).unwrap_or(&c.entry_count),
         });
     }
     Ok(rows)

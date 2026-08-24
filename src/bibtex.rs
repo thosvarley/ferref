@@ -244,6 +244,10 @@ fn parse_pages(s: &str) -> PermissiveType<Vec<Range<u32>>> {
 
     let numbers: Option<Vec<u32>> = parts.iter().map(|p| p.trim().parse::<u32>().ok()).collect();
 
+    // clippy's `single_range_in_vec_init` fires here and its suggestion is
+    // wrong: biblatex's API wants a Vec<Range<u32>> (a page *range* list), and
+    // collecting the range would produce a Vec<u32> of every page number in it.
+    #[allow(clippy::single_range_in_vec_init)]
     match numbers.as_deref() {
         Some([n]) => PermissiveType::Typed(vec![*n..*n]),
         Some([start, end]) => PermissiveType::Typed(vec![*start..*end]),

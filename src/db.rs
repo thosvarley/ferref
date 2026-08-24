@@ -324,8 +324,11 @@ fn attachments_for_entry(
     }
 }
 
-// Records a path, never a copy of the file — see DESIGN.md. Idempotent per the
-// UNIQUE(entry_id, path) constraint; the bool reports whether a row was added.
+// Records a path. This function never copies anything -- `main::copy_into_library`
+// is what puts the file in `./pdfs/` first and hands the copy's path down here,
+// so an attachment row points into the library directory, not at wherever the
+// file was downloaded. Idempotent per the UNIQUE(entry_id, path) constraint; the
+// bool reports whether a row was added.
 // An unknown cite_key is an error (QueryReturnedNoRows), same as add_tag.
 pub fn attach(conn: &Connection, cite_key: &str, path: &str) -> Result<(i64, bool)> {
     let entry_id: i64 = conn.query_row(
@@ -571,6 +574,40 @@ pub fn create_collection(conn: &Connection, path: &str) -> Result<i64> {
         parent = Some(id);
     }
     Ok(id)
+}
+
+// Just the number, for callers that only want the number. The TUI's tree pane
+// was loading every entry, author, tag and attachment in the library and then
+// calling .len() on it to render "All Papers (n)" -- and did so again after
+// every collection-picker toggle.
+pub fn count_entries(conn: &Connection) -> Result<i64> {
+    conn.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+}
+
+// Entry count per collection *including its descendants*, in one recursive CTE.
+//
+// `all_collections` counts direct membership, which is what `collection ls`
+// shows and what `list --collection` returns without `--recursive`. The TUI
+// needs the other number: it always filters recursively, so a direct count
+// beside a recursively-filtered table makes the pane contradict itself.
+//
+// COUNT(DISTINCT) because a paper filed in both a parent and its child is one
+// paper, not two -- summing direct counts up the tree would double it. UNION
+// rather than UNION ALL so a cyclic parent_id graph (this database is
+// hand-editable) terminates instead of spinning.
+pub fn recursive_entry_counts(conn: &Connection) -> Result<HashMap<i64, i64>> {
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE subtree(root, id) AS ( \
+             SELECT id, id FROM collections \
+             UNION \
+             SELECT s.root, c.id FROM collections c JOIN subtree s ON c.parent_id = s.id \
+         ) \
+         SELECT s.root, COUNT(DISTINCT ce.entry_id) \
+         FROM subtree s LEFT JOIN collection_entries ce ON ce.collection_id = s.id \
+         GROUP BY s.root",
+    )?;
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<HashMap<i64, i64>>>()
 }
 
 // Every collection with its direct entry count, in one query (LEFT JOIN +
@@ -899,25 +936,94 @@ pub fn list_entries(conn: &Connection, filter: &Filter, with_full_text: bool) ->
         params.extend(ids.into_iter().map(Value::Integer));
     }
 
-    let sql = if clauses.is_empty() {
+    let where_clause = clauses.join(" AND ");
+    let sql = if where_clause.is_empty() {
         "SELECT * FROM entries ORDER BY id".to_string()
     } else {
-        format!(
-            "SELECT * FROM entries WHERE {} ORDER BY id",
-            clauses.join(" AND ")
-        )
+        format!("SELECT * FROM entries WHERE {where_clause} ORDER BY id")
     };
 
     let mut stmt = conn.prepare(&sql)?;
     let mut entries = stmt
-        .query_map(params_from_iter(params), entry_from_row)?
+        .query_map(params_from_iter(params.clone()), entry_from_row)?
         .collect::<Result<Vec<Entry>>>()?;
 
-    for entry in &mut entries {
-        entry.authors = authors_for_entry(conn, entry.id.unwrap())?;
-        entry.tags = tags_for_entry(conn, entry.id.unwrap())?;
-        entry.attachments = attachments_for_entry(conn, entry.id.unwrap(), with_full_text)?;
+    // Three bulk queries for the children, not three per entry. The per-entry
+    // form cost 15,000 queries (and 15,000 SQL compilations) on a 5,000-entry
+    // library, and was measured 9.4x slower than this on the same data -- most
+    // of `ferref list`'s runtime, and `list` is the hottest path in the tool.
+    //
+    // The scope is the entry query's own WHERE clause reapplied as a subquery
+    // rather than an `IN (?,?,...)` list of the ids just fetched: the id list
+    // runs into SQLite's bound-variable ceiling on a large result, and this way
+    // the filter is written once. Each child query rebinds the same params.
+    let index: HashMap<i64, usize> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| e.id.map(|id| (id, i)))
+        .collect();
+
+    let scope = |column: &str| {
+        if where_clause.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {column} IN (SELECT id FROM entries WHERE {where_clause})")
+        }
+    };
+
+    // Ordering within each entry is the ORDER BY's second key, so authors keep
+    // their author_order and attachments their id order, exactly as the
+    // per-entry queries produced.
+    let mut stmt = conn.prepare(&format!(
+        "SELECT entry_id, first_name, last_name FROM authors{} \
+         ORDER BY entry_id, author_order",
+        scope("entry_id")
+    ))?;
+    let mut rows = stmt.query(params_from_iter(params.clone()))?;
+    while let Some(row) = rows.next()? {
+        if let Some(&i) = index.get(&row.get::<_, i64>(0)?) {
+            entries[i].authors.push(Author {
+                first_name: row.get(1)?,
+                last_name: row.get(2)?,
+            });
+        }
     }
+
+    let mut stmt = conn.prepare(&format!(
+        "SELECT et.entry_id, t.name FROM tags t \
+         JOIN entry_tags et ON et.tag_id = t.id \
+         {} ORDER BY et.entry_id, t.name",
+        scope("et.entry_id")
+    ))?;
+    let mut rows = stmt.query(params_from_iter(params.clone()))?;
+    while let Some(row) = rows.next()? {
+        if let Some(&i) = index.get(&row.get::<_, i64>(0)?) {
+            entries[i].tags.push(row.get(1)?);
+        }
+    }
+
+    // full_text is selected only when asked for: it is the whole reason the
+    // projection exists (see the comment on attachments_for_entry).
+    let columns = if with_full_text {
+        "entry_id, path, full_text"
+    } else {
+        "entry_id, path, NULL"
+    };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {} FROM attachments{} ORDER BY entry_id, id",
+        columns,
+        scope("entry_id")
+    ))?;
+    let mut rows = stmt.query(params_from_iter(params))?;
+    while let Some(row) = rows.next()? {
+        if let Some(&i) = index.get(&row.get::<_, i64>(0)?) {
+            entries[i].attachments.push(Attachment {
+                path: row.get(1)?,
+                full_text: row.get(2)?,
+            });
+        }
+    }
+
     Ok(entries)
 }
 
@@ -1055,6 +1161,79 @@ mod tests {
         let mut steal = get_entry(&conn, "a").unwrap().unwrap();
         steal.doi = Some("10.1186/s12859-020-3494-x".into());
         assert!(update_entry(&conn, &steal).is_err());
+    }
+
+    // The tree pane counts recursively while `collection ls` counts directly.
+    // The trap is double-counting: a paper filed in both a parent and its child
+    // is one paper.
+    #[test]
+    fn recursive_counts_include_descendants_without_double_counting() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        for key in ["p1", "p2"] {
+            insert_entry(&conn, &Entry::new("article".into(), key.into(), "T".into())).unwrap();
+        }
+        create_collection(&conn, "Phys/Sub").unwrap();
+        let phys = collection_by_path(&conn, "Phys").unwrap().unwrap();
+        let sub = collection_by_path(&conn, "Phys/Sub").unwrap().unwrap();
+
+        add_to_collection(&conn, "Phys/Sub", "p1").unwrap();
+        add_to_collection(&conn, "Phys", "p2").unwrap();
+
+        let counts = recursive_entry_counts(&conn).unwrap();
+        assert_eq!(counts[&phys], 2, "parent should include its child's papers");
+        assert_eq!(counts[&sub], 1);
+
+        // p1 now sits in both. It is still one paper.
+        add_to_collection(&conn, "Phys", "p1").unwrap();
+        let counts = recursive_entry_counts(&conn).unwrap();
+        assert_eq!(counts[&phys], 2, "a paper in both parent and child counts once");
+
+        assert_eq!(count_entries(&conn).unwrap(), 2);
+    }
+
+    // list_entries loads authors/tags/attachments in three bulk queries and
+    // folds them back by entry_id. A filtered query is where that fold can
+    // silently attach one entry's children to another.
+    #[test]
+    fn filtered_list_still_folds_children_onto_the_right_entries() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        let mut first = Entry::new("article".into(), "zhou2020".into(), "Alpha".into());
+        first.add_author(Author::new("Zhou".into(), Some("Yi".into())));
+        first.add_author(Author::new("Smith".into(), None));
+        first.year = Some(2020);
+        first.tags = vec!["entropy".into()];
+        insert_entry(&conn, &first).unwrap();
+
+        let mut second = Entry::new("article".into(), "jones1990".into(), "Beta".into());
+        second.add_author(Author::new("Jones".into(), None));
+        second.year = Some(1990);
+        insert_entry(&conn, &second).unwrap();
+
+        attach(&conn, "zhou2020", "/tmp/zhou.pdf").unwrap();
+
+        let filter = Filter {
+            author: Some("zhou".into()),
+            ..Default::default()
+        };
+        let found = list_entries(&conn, &filter, false).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].cite_key, "zhou2020");
+        // Author order is author_order, not insertion order of the bulk query.
+        assert_eq!(found[0].authors[0].last_name, "Zhou");
+        assert_eq!(found[0].authors[1].last_name, "Smith");
+        assert_eq!(found[0].tags, vec!["entropy"]);
+        assert_eq!(found[0].attachments.len(), 1);
+
+        // The unfiltered case must not leak zhou2020's children onto jones1990.
+        let all = list_entries(&conn, &Filter::default(), false).unwrap();
+        let jones = all.iter().find(|e| e.cite_key == "jones1990").unwrap();
+        assert!(jones.tags.is_empty());
+        assert!(jones.attachments.is_empty());
+        assert_eq!(jones.authors.len(), 1);
     }
 
     #[test]

@@ -50,7 +50,7 @@ All twelve phases are complete.
 - Collections (Phase 10) nest; tags (Phase 5) don't. A tag describes a paper, a collection is where it lives. `collection_tree` is the single traversal, and it terminates on a cyclic `parent_id` graph because the DB is hand-editable by design.
 - `src/tui.rs` — three-pane TUI over ratatui. Blocking `event::read()`, DB queried only on state change, and `Filter` addressed by collection **id** rather than path. Sorts, filters, creates collections and files papers into them (Phase 12); everything else is still CLI-only.
 - `src/cli.rs` — clap derive types for `add`/`list`/`show`/`edit`/`rm`/`search`/`import`/`export`, plus `parse_author`.
-- `src/main.rs` — thin dispatcher. All stdout goes through `emit()`, which exits 0 on a closed pipe instead of panicking. Failures exit non-zero with the message on stderr.
+- `src/main.rs` — thin dispatcher; the four biggest commands (`attach`, `extract`, `import`, `fetch`) live in their own `cmd_*` functions rather than inline match arms, the same shape `dispatch_collection` already had. All JSON goes through `emit_json`, which streams to stdout instead of building the document as a `String` first — that halved peak memory on `list --full-text --json`. All stdout goes through `emit()`, which exits 0 on a closed pipe instead of panicking. Failures exit non-zero with the message on stderr.
 
 ### Known limitations
 
@@ -104,22 +104,31 @@ All twelve phases are complete.
 - Extraction is PDF-only and requires `pdftotext` (poppler-utils) on `PATH`.
 - Extracted text is capped at 10MB per attachment, with a truncation marker.
 - `full_text` is omitted from `list`/`search` unless `--full-text` is passed, so
-  the common case doesn't read the whole library's text into memory.
-- Tags don't survive a BibTeX round trip. BibLaTeX has a `keywords` field that
-  would carry them; mapping it wasn't in Phase 5's scope.
-- The DB is always `./ferref.db`, relative to the current directory. Phase 8 adds
-  a config file and is the natural point to fix this.
+  the common case doesn't read the whole library's text into memory. `--full-text`
+  requires `--json`, because the plain-text listing has no column for it: without
+  that guard the flag read 270MB and printed none of it.
+- `list_entries` loads authors, tags and attachments in three bulk queries, not
+  three per entry. The per-entry form was measured 9.4x slower on a 5,000-entry
+  library — most of `ferref list`'s runtime.
+- The TUI's tree counts are **recursive**; `collection ls` counts **directly**.
+  They differ on purpose: selecting a tree row filters recursively, so a direct
+  count beside it made the pane disagree with itself.
+- The DB is always `./ferref.db`, relative to the current directory. A library is
+  a folder you `cd` into, like a git repo, and that has held up — but it means two
+  libraries can't be worked with from one shell. `config.rs` exists and reads one
+  key, so a `database` key is the obvious home if that ever bites.
 
 BibTeX round trips (Phase 3) lose two things, both inherent to the target format
 rather than fixable in our mapping:
 
-- **Non-legacy `entry_type`s collapse to `misc` on export.** We serialize with
-  `to_bibtex_string()`, and legacy BibTeX has no `@online`/`@dataset`/`@software`,
-  nor any custom type like `@preprint`. Switching to `to_biblatex_string()` would
-  preserve them but emit `journaltitle`/`date` instead of `journal`/`year`, which
-  plain BibTeX and LaTeX can't read — a worse loss for the main use case. If both
-  audiences ever need serving, the fix is an `export --format bibtex|biblatex`
-  flag, not a change of default.
+- **Non-legacy `entry_type`s collapse to `misc` on export** — *unless you pass
+  `--biblatex`.* Legacy BibTeX has no `@online`/`@dataset`/`@software`, nor any
+  custom type like `@preprint`, so `to_bibtex_string()` downgrades them.
+  `to_biblatex_string()` preserves them but emits `journaltitle`/`date` instead
+  of `journal`/`year`, which plain BibTeX styles can't read — a worse loss for
+  the default audience. This section originally called for "an `export --format
+  bibtex|biblatex` flag, not a change of default"; that is what shipped, as a
+  boolean `--biblatex`.
 - **Newlines inside a field collapse to single spaces** on re-import. This is
   standard BibTeX field-content normalization, not specific to our parser. A
   multi-paragraph abstract survives as one paragraph.
@@ -246,7 +255,7 @@ CREATE TABLE IF NOT EXISTS attachments (
 );
 ```
 
-Store the path, not the file — copying/managing a file store is a separate feature, out of scope for v1.
+Store the path, not the file — copying/managing a file store is a separate feature, out of scope for v1. **Superseded:** `attach` now copies into `./pdfs/` under the same `<cite_key>.<ext>` scheme `fetch` uses, so a library is one directory of papers. The DB still stores only a path; it's the path of the copy.
 
 CLI:
 ```
