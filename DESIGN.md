@@ -533,11 +533,14 @@ database wherever the command happens to run.
 - `cargo build --release`.
 - Asks where the library should live (default `~/.ferref`); if the user picks
   somewhere else, writes `export FERREF_HOME=<path>` into their shell rc.
-- Symlinks the built binary into `~/.local/bin` (creating it if needed) and adds
+- Copies the built binary into `~/.local/bin` (creating it if needed) and adds
   that directory to `PATH` in the shell rc if it isn't already there — the
   standard place for a user-local binary on a Linux desktop, so `ferref` works
-  without `sudo` or touching `/usr/local`.
-- Re-running it is safe: it overwrites the symlink and only appends a `PATH`/
+  without `sudo` or touching `/usr/local`. A copy, not a symlink, so the
+  installed binary keeps working if the repo checkout moves or is deleted;
+  the tradeoff is re-running `install.sh` after every `cargo build --release`
+  you want to pick up.
+- Re-running it is safe: it overwrites the copy and only appends a `PATH`/
   `FERREF_HOME` line if grep doesn't already find one.
 
 Not delegated — see the delegation table. Not reviewed — the only trust boundary
@@ -545,6 +548,97 @@ touched is "where does this process read `$HOME` from," which was already true
 of `config.rs`.
 
 ---
+
+## Phase 15 — `search --text`: full-text content search with snippets
+
+**Scoped, not yet built.**
+
+Today `--full-text` (on both `list` and `search`) is a projection flag, not a
+filter — it decides whether extracted PDF text rides along in the `--json`
+output, but there is no way to ask "which entries' attachments *contain*
+this string." `Filter` (`db.rs:844`) has no field for it, and `list_entries`
+never touches `attachments.full_text` except to project it. This phase adds
+that missing filter, plus enough of a result shape to make it useful without
+dumping a whole PDF's text at you.
+
+**Filtering.** A new `Filter.text: Option<String>` field, wired into
+`list_entries` as one more `EXISTS` clause, following the exact pattern the
+`tag` and `author` clauses already use:
+
+```sql
+EXISTS (SELECT 1 FROM attachments att WHERE att.entry_id = entries.id
+        AND att.full_text LIKE ? ESCAPE '\')
+```
+
+Same `like_pattern` escaping, same case-insensitive-for-ASCII substring
+semantics as every other `search` filter, and it ANDs with `--author`,
+`--title`, `--tag`, `--collection`, etc. exactly like those already do.
+Exposed as `--text <QUERY>` on `search` only (not `list` — substring filters
+already live on `search`, not `list`, and `--text` would collide with the
+existing boolean `--full-text` if named too close to it).
+
+**Snippets.** SQL only tells you an entry matched, not where. Once
+`list_entries` returns the (now much smaller) matching set, a second pass
+loads full text for just those entries' attachments and locates the matches
+in Rust: a pure function,
+
+```rust
+fn find_snippets(text: &str, query: &str, context_chars: usize, max_matches: usize) -> Vec<String>
+```
+
+ASCII-case-insensitive substring search (matching the SQL side), a fixed
+character window on each side of a hit, runs of whitespace collapsed to one
+space (PDF extraction leaves ugly line-wrapping), `…` at a window edge that
+was truncated mid-string, and capped at `max_matches` hits with a "+N more"
+count rather than printing every occurrence of a common word. Pure and
+DB-free, so it gets a real `#[test]`: overlapping matches, a hit at the very
+start/end of the text, more matches than the cap, no match (shouldn't be
+reachable given SQL already filtered, but the function must not panic on it).
+
+**Output.** Plain text: cite_key/title header per matching entry, then the
+capped snippets indented underneath, one per line. `--json`: a dedicated
+small struct (`cite_key`, `title`, and a `matches: [{path, snippet, count}]`
+per attachment) — not the shared `Entry` type, so `list`/`show`/export are
+untouched and this doesn't force a full unbounded-text dump the way reusing
+`Entry` with `with_full_text` would.
+
+**Known ceiling, not fixed here.** `LIKE '%…%'` over a `TEXT` column is a full
+scan of every attachment's extracted text — no index, so cost scales with
+total corpus size, not match count. SQLite FTS5 would fix that, but it's a
+virtual table plus triggers to keep it in sync with `attachments`, a real
+schema migration, and a dependency decision (rusqlite's `bundled` feature may
+not compile FTS5 in without an explicit feature flag — needs checking, not
+assumed). Out of scope for v1: a personal library's PDF corpus is small
+enough that a full scan is milliseconds, not seconds. Upgrade path if that
+stops being true.
+
+No new dependency either way — string search and the SQL `LIKE` SQLite
+already has.
+
+Delegation: **no / no**. Same shape as Phase 4 (search/filter) — extends one
+already-tested clause-building function with one more clause of the same
+kind, plus one small pure function with its own test. Writing the brief
+would be most of the work.
+
+---
+
+## Roadmap (not yet scoped)
+
+Ideas worth doing sometime, deliberately not designed in detail yet — see
+DESIGN.md's "read the phase's section before starting" rule; these don't have
+one yet.
+
+- **`ferref merge <a> <b>`** — fold a duplicate entry's tags, collections, and
+  attachments into another and delete the loser. Motivated by the existing
+  limitation that nothing stops the same paper being added twice (two DOIs,
+  or one DOI and one manual entry). Nontrivial: attachment filenames collide
+  on the target's cite_key and need re-landing under it, not just a DB row
+  move.
+- **`ferref doctor`** — scan attachment paths against the filesystem and
+  report ones that no longer resolve. Motivated by the existing limitation
+  that attachment paths are absolute and don't move with the library.
+  Read-only report to start; a `--fix` that offers to re-point or drop dead
+  rows is a separate question once the report itself exists.
 
 ## Explicit non-goals for v1
 
@@ -556,7 +650,7 @@ of `config.rs`.
 
 ## Order of work
 
-Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
+Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
 
 ---
 
@@ -581,6 +675,7 @@ Which phases get farmed out to a `coder` subagent, and which get an
 | 12 — TUI writes | yes | **yes** | Big mechanical grind (modes, key table, picker, sort/filter view), and the first phase where a keypress mutates the database. |
 | 13 — `add --from-url` | no | **yes** | Specifying it *was* the work — the design question (why meta tags and not translators) is the whole phase. Review earns its keep: it's a new network path taking untrusted HTML. |
 | 14 — Fixed library location + `install.sh` | no | no | Small, mechanical, same env-var-then-`$HOME` pattern `config.rs` already has. `install.sh` is an install script, not a trust boundary in the running program. |
+| 15 — `search --text` | no | no | Extends one already-tested clause-building function with one more clause of the same kind, plus one small pure function. Same shape as Phase 4. |
 
 The table is a default, not a rule. The reasoning behind it, which outlives the
 table if the phases change:
