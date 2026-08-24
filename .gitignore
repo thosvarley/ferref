@@ -8,3 +8,5 @@ ferref.db
 pdfs/
 
 restart_claude.sh
+
+.claude/
