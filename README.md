@@ -156,20 +156,23 @@ left where it is. The point is that every paper in a library sits in one
 directory, whether it arrived by hand or over the network, so backing the whole
 thing up is `pdfs/` plus one `.db` file.
 
+Say you've already downloaded a paper and added its entry (`ferref add --doi
+10.1186/s12859-020-3494-x`, which the next step covers):
+
 ```console
-$ ferref attach shannon1948 ~/Downloads/shannon1948.pdf --extract
-Attached '/home/you/papers/pdfs/shannon1948.pdf' to 'shannon1948'
-Extracted 148204 characters from '/home/you/papers/pdfs/shannon1948.pdf'
+$ ferref attach zhou2020 ~/Downloads/zhou2020.pdf --extract
+Attached '/home/you/papers/pdfs/zhou2020.pdf' to 'zhou2020'
+Extracted 35163 characters from '/home/you/papers/pdfs/zhou2020.pdf'
 ```
 
 (The character count is whatever's in your PDF.)
 
 Attaching the same file twice is a no-op. Attaching a *second*, different file
-to the same entry — a paper and its supplement — gets `shannon1948-2.pdf`
+to the same entry — a paper and its supplement — gets `zhou2020-2.pdf`
 rather than overwriting the first.
 
 `--extract` runs `pdftotext` and stores the result. Without it, use
-`ferref extract shannon1948` later. `ferref open shannon1948` opens the
+`ferref extract zhou2020` later. `ferref open zhou2020` opens the
 attachments in your default viewer.
 
 ### 7. Fetch an open-access PDF automatically
