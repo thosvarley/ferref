@@ -125,7 +125,8 @@ pub fn sanitize_filename(cite_key: &str) -> Result<String, String> {
 // Shared GET+status-check+size-capped-read for both APIs. `http_status_as_error`
 // is turned off so a 4xx/5xx comes back as Ok(response) instead of Err,
 // letting the status be checked explicitly here -- ureq 3.4's own default is
-// actually the opposite (see module test / final report), but checking it
+// actually the opposite -- its `http_status_as_error` defaults to true -- but
+// checking it
 // ourselves either way is the point: a raw status dump is not an
 // actionable error message.
 fn get_json(url: &str, service: &str) -> Result<String, String> {

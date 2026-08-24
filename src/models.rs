@@ -1,9 +1,3 @@
-// A struct is like a blueprint for data
-// It defines what fields an object has and their types
-
-// #[derive(Debug, Clone)] is an "attribute" - it automatically generates code
-// Debug: lets us print the struct with {:?} for debugging
-// Clone: lets us make copies of the struct
 // Current Unix timestamp in seconds. Shared by Entry::new and db::update_entry
 // so "modified" times are stamped the same way everywhere.
 pub fn now() -> i64 {
@@ -14,6 +8,11 @@ pub fn now() -> i64 {
         .as_secs() as i64
 }
 
+// A struct is like a blueprint for data: it defines what fields a value has
+// and their types. #[derive(...)] is an "attribute" -- it generates code for
+// you. Debug lets us print the struct with {:?}; Clone lets us copy it;
+// Serialize is what makes `--json` work.
+//
 // full_text is always serialized (never skip_serializing_if): a script must
 // be able to tell "not extracted yet" (null) from "this field isn't carried
 // at all", and null is how it tells.

@@ -401,11 +401,13 @@ enum InputKind {
 // (id = None) that db::collection_tree never produces -- it isn't a DB row,
 // it means "no collection filter".
 struct TreeRow {
+    // The Filter::collection_id to fetch this row's entries with; None means
+    // "All Papers", i.e. no collection filter at all.
     id: Option<i64>,
     depth: usize,
     name: String,
+    // Recursive: this collection plus its descendants. See load_tree.
     entry_count: i64,
-    // Filter::collection value; None for "All Papers".
 }
 
 type AttachmentLengths = HashMap<i64, Vec<(String, Option<i64>)>>;
