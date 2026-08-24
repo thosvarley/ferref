@@ -174,17 +174,9 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Format an entry as a citation
-    Cite {
-        cite_key: String,
-        /// Citation style
-        #[arg(long, value_enum, default_value_t = CiteStyle::Apa)]
-        style: CiteStyle,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Import entries from a BibTeX (.bib) file. Duplicate cite_keys are
-    /// skipped, not fatal -- re-importing an overlapping file is normal.
+    /// Import entries from a BibTeX (.bib) file. Entries you already hold --
+    /// by cite_key or by DOI -- are skipped, not fatal; re-importing an
+    /// overlapping file is normal. Tags are read from the `keywords` field.
     Import {
         path: PathBuf,
         #[arg(long)]
@@ -196,6 +188,12 @@ pub enum Command {
     Export {
         #[arg(long = "out")]
         out: Option<PathBuf>,
+        /// Write BibLaTeX instead of legacy BibTeX: keeps `@online` and
+        /// `@dataset` (legacy BibTeX has neither, so they come out as
+        /// `@misc`), and writes `date`/`journaltitle` rather than
+        /// `year`/`journal`. Use it if your document loads `biblatex`.
+        #[arg(long)]
+        biblatex: bool,
     },
     /// Look up an open-access PDF for an entry's DOI via Unpaywall, and
     /// attach + extract it if one exists. No OA copy found is a normal
@@ -278,11 +276,6 @@ pub enum CollectionCommand {
     },
 }
 
-#[derive(Clone, Copy, clap::ValueEnum)]
-pub enum CiteStyle {
-    Apa,
-    Mla,
-}
 
 // "Last, First" -> Author. Splits on the first comma only (names can contain
 // more); no comma means the whole string is the last name.

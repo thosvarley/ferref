@@ -254,6 +254,16 @@ pub fn insert_entry(conn: &Connection, entry: &Entry) -> Result<i64> {
     let entry_id = tx.last_insert_rowid();
     insert_authors(&tx, entry_id, &entry.authors)?;
 
+    // Tags travel with the entry, so a BibTeX `keywords` field survives an
+    // import. A tag the normalizer rejects (empty, whitespace) is skipped
+    // rather than failing the whole insert -- one junk keyword shouldn't cost
+    // you the paper.
+    for tag in &entry.tags {
+        if let Ok(name) = normalize_tag(tag) {
+            attach_tag(&tx, entry_id, &name)?;
+        }
+    }
+
     tx.commit()?;
     Ok(entry_id)
 }
@@ -398,6 +408,23 @@ pub fn normalize_tag(raw: &str) -> std::result::Result<String, String> {
 // Idempotent: returns Ok(false) (not an error) if the entry already had the
 // tag. An unknown cite_key is a real error (QueryReturnedNoRows), same as
 // update_entry's id lookup.
+// Tagging by entry id, shared by `add_tag` (which resolves a cite_key first)
+// and `insert_entry` (which already holds the id it just wrote). Takes an
+// already-normalized name.
+fn attach_tag(conn: &Connection, entry_id: i64, name: &str) -> Result<bool> {
+    // last_insert_rowid() is unsafe to rely on after INSERT OR IGNORE -- it's
+    // stale when the insert was ignored -- so the id is looked up explicitly.
+    conn.execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", [name])?;
+    let tag_id: i64 =
+        conn.query_row("SELECT id FROM tags WHERE name = ?1", [name], |row| row.get(0))?;
+
+    conn.execute(
+        "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)",
+        [entry_id, tag_id],
+    )?;
+    Ok(conn.changes() > 0)
+}
+
 pub fn add_tag(conn: &Connection, cite_key: &str, tag: &str) -> Result<bool> {
     let name = normalize_tag(tag).map_err(rusqlite::Error::InvalidParameterName)?;
     let tx = conn.unchecked_transaction()?;
@@ -408,17 +435,7 @@ pub fn add_tag(conn: &Connection, cite_key: &str, tag: &str) -> Result<bool> {
         |row| row.get(0),
     )?;
 
-    // last_insert_rowid() is unsafe to rely on after INSERT OR IGNORE -- it's
-    // stale when the insert was ignored -- so the id is looked up explicitly.
-    tx.execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", [&name])?;
-    let tag_id: i64 =
-        tx.query_row("SELECT id FROM tags WHERE name = ?1", [&name], |row| row.get(0))?;
-
-    tx.execute(
-        "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)",
-        [entry_id, tag_id],
-    )?;
-    let changed = tx.changes() > 0;
+    let changed = attach_tag(&tx, entry_id, &name)?;
 
     tx.commit()?;
     Ok(changed)

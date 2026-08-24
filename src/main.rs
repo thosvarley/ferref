@@ -1,5 +1,4 @@
 mod bibtex;
-mod cite;
 mod cli;
 mod config;
 mod db;
@@ -461,35 +460,6 @@ fn main() {
             }
         }
 
-        Command::Cite {
-            cite_key,
-            style,
-            json,
-        } => {
-            let entry = match db::get_entry(&conn, &cite_key) {
-                Ok(Some(e)) => e,
-                Ok(None) => die(&format!("no entry found with cite_key '{cite_key}'")),
-                Err(e) => die(&format!("failed to fetch entry: {e}")),
-            };
-
-            let (style_name, style) = match style {
-                cli::CiteStyle::Apa => ("apa", cite::Style::Apa),
-                cli::CiteStyle::Mla => ("mla", cite::Style::Mla),
-            };
-            let citation = cite::format(&entry, &style);
-
-            if json {
-                let out = serde_json::json!({
-                    "cite_key": cite_key,
-                    "style": style_name,
-                    "citation": citation,
-                });
-                emit(&serde_json::to_string_pretty(&out).unwrap());
-            } else {
-                emit(&citation);
-            }
-        }
-
         Command::Import { path, json } => {
             let entries = match bibtex::import(&path) {
                 Ok(e) => e,
@@ -548,12 +518,12 @@ fn main() {
             }
         }
 
-        Command::Export { out } => {
+        Command::Export { out, biblatex } => {
             let entries = match db::list_entries(&conn, &db::Filter::default(), false) {
                 Ok(e) => e,
                 Err(e) => die(&format!("failed to list entries: {e}")),
             };
-            let bibtex_str = bibtex::export(&entries);
+            let bibtex_str = bibtex::export(&entries, biblatex);
 
             match out {
                 Some(path) => {

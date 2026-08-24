@@ -24,12 +24,22 @@ fn parse_bibtex_str(src: &str) -> Result<Vec<Entry>, String> {
     Ok(bib.iter().map(from_biblatex).collect())
 }
 
-pub fn export(entries: &[Entry]) -> String {
+// Two output formats, because they are genuinely two formats and not a
+// quality setting. Legacy BibTeX has no `@online` or `@dataset`, so the
+// `biblatex` crate downgrades both to `@misc` on its way out, and writes
+// `year`/`journal` where BibLaTeX writes `date`/`journaltitle`. Emitting
+// BibLaTeX by default would hand a plain-BibTeX pipeline fields its styles
+// don't read, so the caller says which one it wants.
+pub fn export(entries: &[Entry], biblatex_syntax: bool) -> String {
     let mut bib = Bibliography::new();
     for entry in entries {
         bib.insert(to_biblatex(entry));
     }
-    bib.to_bibtex_string()
+    if biblatex_syntax {
+        bib.to_biblatex_string()
+    } else {
+        bib.to_bibtex_string()
+    }
 }
 
 // --- biblatex::Entry -> our Entry ---------------------------------------
@@ -59,8 +69,25 @@ fn from_biblatex(e: &BibEntry) -> Entry {
     entry.doi = e.doi().ok();
     entry.url = e.url().ok();
     entry.abstract_text = e.abstract_().ok().map(|c| c.format_verbatim());
+    entry.tags = e
+        .keywords()
+        .ok()
+        .map(|c| split_keywords(&c.format_verbatim()))
+        .unwrap_or_default();
 
     entry
+}
+
+// BibTeX's `keywords` is a free-text field with no agreed separator; comma
+// and semicolon are both common in the wild, so both are honoured. The values
+// are left as written -- db::insert_entry normalizes them on the way in, the
+// same as `ferref tag` does.
+fn split_keywords(raw: &str) -> Vec<String> {
+    raw.split([',', ';'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 // last_name = prefix + " " + name (trimmed) so "van der Berg" survives as
@@ -160,6 +187,9 @@ fn to_biblatex(entry: &Entry) -> BibEntry {
     if let Some(abstract_text) = &entry.abstract_text {
         e.set_abstract_(abstract_text.to_chunks());
     }
+    if !entry.tags.is_empty() {
+        e.set_keywords(entry.tags.join(", ").to_chunks());
+    }
 
     e
 }
@@ -235,7 +265,7 @@ mod tests {
         entry.pages = Some("123--145".into());
         entry.abstract_text = Some("An abstract about things.".into());
 
-        let bibtex_str = export(std::slice::from_ref(&entry));
+        let bibtex_str = export(std::slice::from_ref(&entry), false);
         let imported = parse_bibtex_str(&bibtex_str).unwrap();
         assert_eq!(imported.len(), 1);
         let round_tripped = &imported[0];
@@ -306,7 +336,7 @@ mod tests {
     }
 
     fn round_trip(entry: Entry) -> Entry {
-        let exported = export(&[entry]);
+        let exported = export(&[entry], false);
         parse_bibtex_str(&exported)
             .expect("exported BibTeX should re-parse")
             .pop()
@@ -327,6 +357,40 @@ mod tests {
         assert_eq!(back.authors[0].first_name, Some("John, Jr.".to_string()));
         assert_eq!(back.authors[1].last_name, "van der Berg");
         assert_eq!(back.authors[1].first_name, Some("Jan".to_string()));
+    }
+
+    // The two things a BibTeX -> LaTeX pipeline actually loses: tags, which
+    // have a home in `keywords`, and BibLaTeX-only entry types, which legacy
+    // BibTeX has no slot for and so silently become @misc.
+    #[test]
+    fn tags_and_biblatex_types_survive_export() {
+        let mut entry = Entry::new("online".into(), "web2024".into(), "A Web Thing".into());
+        entry.tags = vec!["entropy".into(), "information theory".into()];
+
+        // Legacy BibTeX has no @online, so it downgrades -- expected, and why
+        // the flag exists.
+        let legacy = export(std::slice::from_ref(&entry), false);
+        assert!(legacy.contains("@misc{"), "legacy BibTeX should downgrade: {legacy}");
+        assert!(legacy.contains("keywords"), "keywords should still be written: {legacy}");
+
+        // BibLaTeX keeps it.
+        let modern = export(std::slice::from_ref(&entry), true);
+        assert!(modern.contains("@online{"), "BibLaTeX should keep @online: {modern}");
+
+        // Tags round-trip through `keywords`, in order, either way.
+        for exported in [legacy, modern] {
+            let back = parse_bibtex_str(&exported).unwrap().pop().unwrap();
+            assert_eq!(back.tags, vec!["entropy", "information theory"]);
+        }
+    }
+
+    // A `keywords` field written by hand may use either separator, and may
+    // carry the stray whitespace a human leaves behind.
+    #[test]
+    fn keywords_split_on_either_separator() {
+        assert_eq!(split_keywords("a, b ,c"), vec!["a", "b", "c"]);
+        assert_eq!(split_keywords("a; b;;c "), vec!["a", "b", "c"]);
+        assert!(split_keywords("   ").is_empty());
     }
 
     // biblatex's i64 parser also accepts Roman numerals, so reading volume

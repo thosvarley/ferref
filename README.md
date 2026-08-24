@@ -233,22 +233,41 @@ listing would pull every PDF's text into memory:
 ferref list --json --full-text | jq -r '.[] | "\(.cite_key)\t\(.attachments[0].full_text // "" | length)"'
 ```
 
-### 9. Cite and export
+### 9. Export to BibTeX
 
-```console
-$ ferref cite jaynes1957
-Jaynes, E. T. (1957). Information Theory and Statistical Mechanics. Physical Review, 106, 620–630. https://doi.org/10.1103/PhysRev.106.620
-
-$ ferref cite jaynes1957 --style mla
-Jaynes, E. T. "Information Theory and Statistical Mechanics." Physical Review, vol. 106, 1957, pp. 620-630. https://doi.org/10.1103/PhysRev.106.620
-```
-
-APA lists every author (no 21-author truncation); MLA collapses three or more
-to `et al.`
+Formatting citations is LaTeX's job, not ferref's — hand it a `.bib` and let
+biblatex do the work it's better at (it computes `2020a`/`2020b` across the
+whole bibliography, which ferref can't see one entry at a time).
 
 ```sh
 ferref export > library.bib          # all entries as BibTeX
-ferref import someone-elses.bib      # duplicate cite keys are skipped, not fatal
+ferref export --biblatex > library.bib
+ferref import someone-elses.bib      # entries you already hold are skipped, not fatal
+```
+
+Tags travel in the `keywords` field, so they survive a round trip:
+
+```console
+$ ferref export
+@article{jaynes1957,
+author = {Jaynes, E. T.},
+year = {1957},
+journal = {{Physical Review}},
+keywords = {{entropy, statistical mechanics}},
+title = {{Information Theory and Statistical Mechanics}},
+}
+```
+
+Use `--biblatex` if your document loads the `biblatex` package. Legacy BibTeX
+has no `@online` or `@dataset`, so those come out as `@misc` without it, and it
+writes `date`/`journaltitle` where plain BibTeX wants `year`/`journal`:
+
+```console
+$ ferref export --biblatex
+@online{blog2024,
+title = {{A Web Thing}},
+url = {{https://example.org}},
+}
 ```
 
 ## Browsing in the terminal
@@ -307,7 +326,6 @@ CLI-only, so a mis-keypress can misfile a paper but can't destroy data. Press
 | `extract <key>` | (Re)extract text for all of an entry's attachments |
 | `open <key>` | Open attachments in the system viewer |
 | `fetch <key>` | Find and download an open-access PDF for the entry's DOI |
-| `cite <key>` | `--style apa` (default) or `--style mla` |
 | `collection new <path>` | Create a collection, `mkdir -p` style |
 | `collection ls` | The whole tree, with entry counts |
 | `collection add` / `rm` | Add or remove an entry's membership. Idempotent |
@@ -413,10 +431,9 @@ identifiers — key your own tools against those.
 - Attachment paths are absolute and stored once. The files live in `pdfs/`, but
   the paths don't move with the library — relocating the directory breaks every
   link silently.
-- BibTeX export collapses non-legacy entry types (`@online`, `@dataset`) to
-  `@misc`, and tags don't survive a round trip.
-- `cite` covers APA and MLA only, and doesn't recase titles or handle APA's
-  21-author truncation.
+- BibTeX export writes legacy BibTeX by default; `@online` and `@dataset` need
+  `--biblatex`, which legacy BibTeX styles can't read. Collections don't survive
+  a round trip (tags do, via `keywords`).
 - Extraction is PDF-only, capped at 10 MB of text per attachment.
 - A collection whose *name* contains `/` can't be addressed by the CLI's path
   syntax. The CLI won't create one; only hand-editing the database can. The TUI

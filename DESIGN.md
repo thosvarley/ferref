@@ -47,7 +47,6 @@ All twelve phases are complete.
 - `src/text.rs` — `extract_text` over `pdftotext`. The project's trust boundary: bounded memory (the drain keeps the first 10MB and discards the rest rather than buffering it all), a 30s deadline covering *both* the child wait and the pipe drain, and a process-group kill so a wrapper script's descendants can't outlive us.
 - `src/doi.rs` — Crossref metadata + Unpaywall OA lookup over `ureq`. The network trust boundary: every request goes through `fetch_guarded`, which follows redirects by hand so each hop's scheme and resolved IP are revalidated, with capped reads and a `%PDF` magic-byte check before anything is written.
 - `src/config.rs` — reads one key (`email`) from `~/.config/ferref/config.toml`. Deliberately a line reader, not TOML, and not a settings system.
-- `src/cite.rs` — APA and MLA as string templates. Not a CSL engine, on purpose.
 - Collections (Phase 10) nest; tags (Phase 5) don't. A tag describes a paper, a collection is where it lives. `collection_tree` is the single traversal, and it terminates on a cyclic `parent_id` graph because the DB is hand-editable by design.
 - `src/tui.rs` — three-pane TUI over ratatui. Blocking `event::read()`, DB queried only on state change, and `Filter` addressed by collection **id** rather than path. Sorts, filters, creates collections and files papers into them (Phase 12); everything else is still CLI-only.
 - `src/cli.rs` — clap derive types for `add`/`list`/`show`/`edit`/`rm`/`search`/`import`/`export`, plus `parse_author`.
@@ -64,6 +63,9 @@ All twelve phases are complete.
   unsuffixed key is already taken by the first, and it can't be rewritten. APA's
   own `2020a`/`2020b` convention needs *both* suffixed, so real disambiguation
   belongs at cite time, computed from the colliding set, not in the key.
+- Tags export to BibTeX's `keywords` field and are read back from it, so they
+  survive a round trip. `insert_entry` writes them alongside authors, which is
+  what makes `import` pick them up.
 - Two entries can't hold the same DOI (`reject_duplicate_doi`, checked on insert
   and update). Enforced in code rather than as a UNIQUE index on purpose: the
   database is hand-editable by design, and an index would refuse to build on an
@@ -82,10 +84,10 @@ All twelve phases are complete.
   both copy into `./pdfs/`, so the files travel with the library — but the
   stored paths don't, and moving the library directory breaks every one of them
   silently. Nothing revalidates them.
-- `cite` covers APA and MLA only, and doesn't recase titles, handle 21+ author
-  APA truncation, or do ordinals. That's the documented ceiling: a third style
-  or real edge-case correctness means adopting `hayagriva`, not extending
-  `cite.rs`.
+- BibTeX export writes legacy BibTeX unless `--biblatex` is passed. That's a
+  real fork, not a quality setting: BibLaTeX keeps `@online`/`@dataset` and
+  writes `date`/`journaltitle`, which legacy BibTeX styles don't read. Tags
+  round-trip through `keywords`; collections don't round-trip at all.
 - `fetch` only reads `best_oa_location.url_for_pdf`. Plenty of genuinely open
   papers are linked only as landing pages, so "open access" and "fetchable PDF"
   are reported as separate facts. Scanning the other `oa_locations` was tried
@@ -131,7 +133,7 @@ rather than fixable in our mapping:
 - Tags/collections
 - File attachments + extracted full text (the AI-native payoff)
 - DOI lookup: metadata autofill + open-access full-text fetch
-- Citation formatting (APA, MLA) — last, purely cosmetic
+- Citation formatting (APA, MLA) — last, purely cosmetic *(later removed; BibTeX export supersedes it)*
 
 Each phase below is independently shippable and testable before starting the next.
 
@@ -306,7 +308,16 @@ Email for the Unpaywall polite pool: a `--email` flag or a one-time config value
 
 ---
 
-## Phase 9 — Citation formatting
+## Phase 9 — Citation formatting *(removed)*
+
+**Removed after Phase 12.** `cite` was always the most cosmetic thing here, and
+the BibTeX export makes it redundant: `ferref export` → biblatex → LaTeX is the
+natural pipeline, and biblatex does the job better, because it disambiguates
+`2020a`/`2020b` across the whole bibliography while `cite` only ever saw one
+entry at a time. Deleting it removed 260 lines and one subcommand, and closed a
+direction — arbitrary citation styles — that was already an explicit non-goal.
+What it looked like:
+
 
 New `src/cite.rs`: `format_apa(&Entry) -> String`, `format_mla(&Entry) -> String` — plain string templates over the fields already on `Entry`. Purely cosmetic, last on purpose — doesn't feed the AI-native use case at all.
 
@@ -459,7 +470,7 @@ Which phases get farmed out to a `coder` subagent, and which get an
 | 6 — Attachments | no | no | Store a path, spawn `xdg-open`. Tiny. |
 | 7 — Full text | yes | **yes** | Shells out to `pdftotext` with untrusted PDFs and arbitrary paths. Trust boundary. |
 | 8 — DOI fetch | yes | **yes** | Network, remote JSON we don't control, a config file, partial-failure paths. Riskiest phase in the plan. |
-| 9 — Citations | no | no | String templates over fields that already exist. Trivially testable. |
+| 9 — Citations | no | no | *(removed after Phase 12 — see the phase section.)* |
 | 10 — Collections | yes | no | Schema + subcommands, like tags. One real trap (cycles), specified in the brief and tested. |
 | 11 — TUI | yes | **yes** | New dep, terminal state that must be restored on panic, and a render loop that must not hang on malformed data. |
 | 12 — TUI writes | yes | **yes** | Big mechanical grind (modes, key table, picker, sort/filter view), and the first phase where a keypress mutates the database. |
