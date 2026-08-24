@@ -59,7 +59,17 @@ All twelve phases are complete.
   only applied when passed, and there's no "unset" sentinel. Workaround is `rm` +
   `add`. Worth revisiting when something actually needs to retract a field.
 - `edit` has no `--type`, so `entry_type` is fixed at creation.
-- `cite_key` is not renameable; `update_entry` looks entries up by it.
+- `cite_key` is not renameable; `update_entry` looks entries up by it. This is
+  also why a second Zhou 2020 becomes `zhou2020b` and never `zhou2020a` — the
+  unsuffixed key is already taken by the first, and it can't be rewritten. APA's
+  own `2020a`/`2020b` convention needs *both* suffixed, so real disambiguation
+  belongs at cite time, computed from the colliding set, not in the key.
+- Two entries can't hold the same DOI (`reject_duplicate_doi`, checked on insert
+  and update). Enforced in code rather than as a UNIQUE index on purpose: the
+  database is hand-editable by design, and an index would refuse to build on an
+  existing library that already contains duplicates, turning one stale row into
+  a library where every command fails at open. Nothing detects the same paper
+  entered twice under two different DOIs, or under none.
 - Tag names are lowercased on the way in, so a tag can't carry display casing
   (`NLP` is stored and shown as `nlp`).
 - Nothing lists all known tags, and a tag row orphaned by its last `untag` is

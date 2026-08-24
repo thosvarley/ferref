@@ -406,6 +406,9 @@ identifiers — key your own tools against those.
 ## Limitations worth knowing
 
 - The database is always `./ferref.db`, relative to the current directory.
+- Two entries can't share a DOI, but nothing stops the same paper being added
+  twice under two DOIs (a preprint and its published version, say), or with no
+  DOI at all.
 - `edit` can't clear a field back to null, and there's no `detach`.
 - Attachment paths are absolute and stored once. The files live in `pdfs/`, but
   the paths don't move with the library — relocating the directory breaks every

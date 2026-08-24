@@ -86,7 +86,7 @@ fn main() {
                     entry.id = Some(id);
                     output_entry(&entry, json);
                 }
-                Err(e) => die(&format!("failed to add entry: {e}")),
+                Err(e) => die(&db_error("add entry", e)),
             }
         }
 
@@ -179,7 +179,7 @@ fn main() {
             }
 
             if let Err(e) = db::update_entry(&conn, &entry) {
-                die(&format!("failed to update entry: {e}"));
+                die(&db_error("update entry", e));
             }
 
             // Refetch so the printed entry reflects what update_entry actually
@@ -505,9 +505,9 @@ fn main() {
                     Ok(_) => imported.push(entry.cite_key.clone()),
                     Err(e) => {
                         let msg = e.to_string();
-                        // SQLite's UNIQUE constraint on cite_key is the only
-                        // expected failure mode; anything else is bad data.
-                        if msg.contains("UNIQUE constraint") {
+                        // Already-held rows are the only expected failure
+                        // mode; anything else is bad data.
+                        if is_duplicate(&msg) {
                             skipped.push(entry.cite_key.clone());
                         } else {
                             rejected.push((entry.cite_key.clone(), msg));
@@ -536,7 +536,7 @@ fn main() {
                 emit(&serde_json::to_string_pretty(&out).unwrap());
             } else {
                 emit(&format!(
-                    "imported {}, skipped {} (duplicate cite_key), rejected {} (bad data)",
+                    "imported {}, skipped {} (already in the library), rejected {} (bad data)",
                     imported.len(),
                     skipped.len(),
                     rejected.len()
@@ -1127,6 +1127,14 @@ fn entry_error(cite_key: &str, action: &str, e: rusqlite::Error) -> String {
         }
         e => format!("failed to {action}: {e}"),
     }
+}
+
+// "You already have this paper", by either name: the same cite_key (SQLite's
+// own UNIQUE constraint) or the same DOI (db::insert_entry's guard). Import
+// counts both as a skip rather than a failure, so re-importing a .bib you
+// already hold stays a successful no-op even when its keys have drifted.
+fn is_duplicate(msg: &str) -> bool {
+    msg.contains("UNIQUE constraint") || msg.contains("is already on entry")
 }
 
 // Collection functions (create_collection, move_collection, delete_collection)

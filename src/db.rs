@@ -174,8 +174,60 @@ fn insert_authors(conn: &Connection, entry_id: i64, authors: &[Author]) -> Resul
 // with `unchecked_transaction` rather than `Connection::transaction`, which
 // requires &mut self. Still a real transaction — entry + authors commit or
 // roll back together.
+// Returns the cite_key of the entry already carrying `doi`, if there is one.
+//
+// A DOI names one specific paper, so two entries holding the same DOI are the
+// same paper stored twice. That is easy to do by accident: `add --doi` derives
+// a cite_key, and the collision handling politely finds a *free* name for what
+// is really a re-add, so you end up with zhou2020b and zhou2020c pointing at
+// one article.
+//
+// An absent or empty DOI is exempt -- plenty of entries legitimately have none,
+// and those are not duplicates of each other. Matching is case-insensitive
+// because DOIs are (the ISO standard says so; Crossref lowercases, humans
+// don't always).
+//
+// `exclude_id` is the row being written, so an update doesn't collide with
+// itself. `id IS NOT ?2` is null-safe: passing NULL matches every row, since
+// no row has a NULL id.
+fn doi_holder(conn: &Connection, doi: &str, exclude_id: Option<i64>) -> Result<Option<String>> {
+    let doi = doi.trim();
+    if doi.is_empty() {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT cite_key FROM entries WHERE lower(doi) = lower(?1) AND id IS NOT ?2",
+        rusqlite::params![doi, exclude_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+// The guard every write goes through. Deliberately here rather than as a UNIQUE
+// index: this database is hand-editable by design, and an index would refuse to
+// build on an existing library that already holds duplicates -- turning one
+// stale row into a library where every command fails at open.
+//
+// Ceiling: the check and the insert are in the same deferred transaction, so
+// two ferref processes adding one DOI simultaneously can still both pass. That
+// costs a duplicate row, not data, and BEGIN IMMEDIATE would close it if it
+// ever matters.
+fn reject_duplicate_doi(conn: &Connection, entry: &Entry, exclude_id: Option<i64>) -> Result<()> {
+    let Some(doi) = entry.doi.as_deref() else {
+        return Ok(());
+    };
+    match doi_holder(conn, doi, exclude_id)? {
+        Some(holder) => Err(rusqlite::Error::InvalidParameterName(format!(
+            "DOI {} is already on entry '{holder}'",
+            doi.trim()
+        ))),
+        None => Ok(()),
+    }
+}
+
 pub fn insert_entry(conn: &Connection, entry: &Entry) -> Result<i64> {
     let tx = conn.unchecked_transaction()?;
+    reject_duplicate_doi(&tx, entry, None)?;
 
     tx.execute(
         r#"
@@ -868,6 +920,8 @@ pub fn update_entry(conn: &Connection, entry: &Entry) -> Result<()> {
         |row| row.get(0),
     )?;
 
+    reject_duplicate_doi(&tx, entry, Some(entry_id))?;
+
     tx.execute(
         r#"
         UPDATE entries SET
@@ -945,6 +999,47 @@ mod tests {
     // Covers the three functions main.rs doesn't call, plus the two behaviors
     // the code comments assert but nothing verified: that delete cascades to
     // authors, and that update stamps date_modified itself.
+    // A DOI names one paper, so a second entry carrying it is that paper
+    // twice. The cases that matter are the exemptions: entries with no DOI
+    // are not duplicates of each other, and an update must not collide with
+    // the row it is updating.
+    #[test]
+    fn duplicate_dois_are_refused_but_absent_ones_are_not() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        let mut first = Entry::new("article".into(), "zhou2020".into(), "First".into());
+        first.doi = Some("10.1186/s12859-020-3494-x".into());
+        insert_entry(&conn, &first).unwrap();
+
+        // Same DOI under a different key is the same paper again.
+        let mut again = Entry::new("article".into(), "zhou2020b".into(), "Second".into());
+        again.doi = Some("10.1186/s12859-020-3494-x".into());
+        let err = insert_entry(&conn, &again).unwrap_err().to_string();
+        assert!(err.contains("zhou2020"), "message should name the holder: {err}");
+
+        // DOIs are case-insensitive, so a shouted one is still the same paper.
+        again.doi = Some("10.1186/S12859-020-3494-X".into());
+        assert!(insert_entry(&conn, &again).is_err());
+
+        // Absent and empty DOIs are exempt -- two undoi'd entries are fine.
+        let none_a = Entry::new("misc".into(), "a".into(), "No DOI".into());
+        let mut none_b = Entry::new("misc".into(), "b".into(), "Also no DOI".into());
+        none_b.doi = Some("   ".into());
+        insert_entry(&conn, &none_a).unwrap();
+        insert_entry(&conn, &none_b).unwrap();
+
+        // Updating an entry without changing its DOI must not trip on itself.
+        let mut same = get_entry(&conn, "zhou2020").unwrap().unwrap();
+        same.title = "First, retitled".into();
+        update_entry(&conn, &same).unwrap();
+
+        // Updating one onto a DOI another entry holds is still refused.
+        let mut steal = get_entry(&conn, "a").unwrap().unwrap();
+        steal.doi = Some("10.1186/s12859-020-3494-x".into());
+        assert!(update_entry(&conn, &steal).is_err());
+    }
+
     #[test]
     fn update_and_delete() {
         let conn = Connection::open_in_memory().unwrap();
