@@ -17,7 +17,15 @@ use models::{Author, Entry};
 fn main() {
     let cli = Cli::parse();
 
-    let conn = match db::init_db(Path::new("ferref.db")) {
+    let root = match config::library_root() {
+        Ok(r) => r,
+        Err(e) => die(&e),
+    };
+    if let Err(e) = std::fs::create_dir_all(&root) {
+        die(&format!("failed to create '{}': {e}", root.display()));
+    }
+
+    let conn = match db::init_db(&root.join("ferref.db")) {
         Ok(c) => c,
         Err(e) => die(&format!("failed to open database: {e}")),
     };
@@ -1015,11 +1023,12 @@ fn land_downloaded_pdf(
     pdf_url: &str,
 ) -> Result<(String, i64, bool), String> {
     let filename = doi::sanitize_filename(cite_key)?;
-    let dir = Path::new("pdfs");
-    std::fs::create_dir_all(dir)
+    let root = config::library_root()?;
+    let dir = root.join("pdfs");
+    std::fs::create_dir_all(&dir)
         .map_err(|e| format!("failed to create '{}': {e}", dir.display()))?;
 
-    let (target, already_present) = pdf_target(conn, cite_key, dir, &filename, "pdf", None)?;
+    let (target, already_present) = pdf_target(conn, cite_key, &dir, &filename, "pdf", None)?;
 
     if !already_present {
         let bytes =
@@ -1169,8 +1178,9 @@ fn copy_into_library(
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_else(|| "pdf".to_string());
 
-    let dir = Path::new("pdfs");
-    std::fs::create_dir_all(dir)
+    let root = config::library_root()?;
+    let dir = root.join("pdfs");
+    std::fs::create_dir_all(&dir)
         .map_err(|e| format!("failed to create '{}': {e}", dir.display()))?;
 
     // Choosing the name and writing it has to be one indivisible step.
@@ -1181,7 +1191,7 @@ fn copy_into_library(
     // taken and moves to the next one instead of overwriting.
     for _ in 0..8 {
         let (target, already_there) =
-            pdf_target(conn, cite_key, dir, &base, &ext, Some(source))?;
+            pdf_target(conn, cite_key, &dir, &base, &ext, Some(source))?;
         if already_there {
             return stored_path(&target, false);
         }

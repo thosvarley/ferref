@@ -39,7 +39,7 @@ Essential features that should be present at the end:
 
 ## Current state (2026-08-24)
 
-All thirteen phases are complete.
+All fourteen phases are complete.
 
 - `src/models.rs` — `Entry`/`Author` + `now()`. `Serialize` derived; `abstract_text` serializes as `"abstract"` (Rust reserves `abstract`), locked by a test.
 - `src/db.rs` — schema + `insert_entry`/`get_entry`/`list_entries`/`update_entry`/`delete_entry`, all free functions over `&Connection`. `update_entry` stamps `date_modified` itself so callers can't forget. `list_entries` takes a `Filter`; an all-`None` filter matches everything, so `list` and `search` are one query. `add_tag`/`remove_tag` are idempotent and report whether anything changed; `normalize_tag` (trim + lowercase) is the single point both writes and the `tag` filter go through. `attach` copies the file into `./pdfs/` under the same `<cite_key>.<ext>` scheme `fetch` uses, and stores the copy's path, so a library is one directory of papers. The name is claimed with `O_EXCL`, not by checking whether it exists first — two concurrent attaches to one cite_key otherwise lose a file 23% of the time, each reporting success.
@@ -113,10 +113,13 @@ All thirteen phases are complete.
 - The TUI's tree counts are **recursive**; `collection ls` counts **directly**.
   They differ on purpose: selecting a tree row filters recursively, so a direct
   count beside it made the pane disagree with itself.
-- The DB is always `./ferref.db`, relative to the current directory. A library is
-  a folder you `cd` into, like a git repo, and that has held up — but it means two
-  libraries can't be worked with from one shell. `config.rs` exists and reads one
-  key, so a `database` key is the obvious home if that ever bites.
+- **Superseded (Phase 14):** the DB and `pdfs/` used to live at `./ferref.db` and
+  `./pdfs/`, relative to the current directory — a library was a folder you `cd`
+  into, like a git repo. That meant `ferref` behaved differently depending on
+  where it was invoked from, and every project got its own accidental library.
+  `config::library_root()` now resolves one fixed location (`FERREF_HOME` env
+  var, else `~/.ferref`), so `ferref` is a single library reachable from any
+  directory — unlike a git repo, there's nothing to `cd` into.
 
 BibTeX round trips (Phase 3) lose two things, both inherent to the target format
 rather than fixable in our mapping:
@@ -508,6 +511,41 @@ somewhere else, and that is the case this phase exists to serve.
 
 ---
 
+## Phase 14 — Fixed library location + `install.sh`
+
+Before this phase, `ferref` opened `./ferref.db` and wrote `./pdfs/` relative to
+the current directory (see the superseded note in **Current state** above). That
+made ferref behave like a git repo — one library per folder you `cd` into — which
+was fine for development but wrong for daily use: the point of a reference
+manager is one library reachable from every project, not a fresh accidental
+database wherever the command happens to run.
+
+`config::library_root()` resolves a single fixed directory:
+
+- `FERREF_HOME` env var if set and non-empty, else `~/.ferref`.
+- `main()` creates it (`create_dir_all`) before opening the DB; `ferref.db` and
+  `pdfs/` both live directly under it.
+- No new dependency, no config-file key — this is the same env-var-then-`$HOME`
+  precedence `config.rs` already uses for the Unpaywall email, one function over.
+
+`install.sh` (repo root, not part of the crate) does the one-time setup:
+
+- `cargo build --release`.
+- Asks where the library should live (default `~/.ferref`); if the user picks
+  somewhere else, writes `export FERREF_HOME=<path>` into their shell rc.
+- Symlinks the built binary into `~/.local/bin` (creating it if needed) and adds
+  that directory to `PATH` in the shell rc if it isn't already there — the
+  standard place for a user-local binary on a Linux desktop, so `ferref` works
+  without `sudo` or touching `/usr/local`.
+- Re-running it is safe: it overwrites the symlink and only appends a `PATH`/
+  `FERREF_HOME` line if grep doesn't already find one.
+
+Not delegated — see the delegation table. Not reviewed — the only trust boundary
+touched is "where does this process read `$HOME` from," which was already true
+of `config.rs`.
+
+---
+
 ## Explicit non-goals for v1
 
 - Doing the AI work ourselves — no embeddings, no bibliometric analysis, no LLM calls inside ferref. ferref's job stops at handing clean, structured, scriptable data to whatever does that work.
@@ -518,7 +556,7 @@ somewhere else, and that is the case this phase exists to serve.
 
 ## Order of work
 
-Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
+Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
 
 ---
 
@@ -542,6 +580,7 @@ Which phases get farmed out to a `coder` subagent, and which get an
 | 11 — TUI | yes | **yes** | New dep, terminal state that must be restored on panic, and a render loop that must not hang on malformed data. |
 | 12 — TUI writes | yes | **yes** | Big mechanical grind (modes, key table, picker, sort/filter view), and the first phase where a keypress mutates the database. |
 | 13 — `add --from-url` | no | **yes** | Specifying it *was* the work — the design question (why meta tags and not translators) is the whole phase. Review earns its keep: it's a new network path taking untrusted HTML. |
+| 14 — Fixed library location + `install.sh` | no | no | Small, mechanical, same env-var-then-`$HOME` pattern `config.rs` already has. `install.sh` is an install script, not a trust boundary in the running program. |
 
 The table is a default, not a rule. The reasoning behind it, which outlives the
 table if the phases change:

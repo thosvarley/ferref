@@ -18,20 +18,23 @@ limitations.
 SQLite is bundled via `rusqlite`; you don't need to install it.
 
 ```sh
-cargo build --release
-./target/release/ferref --help
+./install.sh
 ```
 
-The database is `./ferref.db` in whatever directory you run from. 
-Currently, running ferref somewhere else gives you a different, empty library - this will eventually change to a standardized library stored in a dedicated director in ~/.ferref 
+Builds the release binary, installs it to `~/.local/bin`, and creates the
+library directory. Re-run it any time to pick up a new build.
+
+The library lives in one fixed place — `~/.ferref` by default, or wherever you
+told `install.sh` to put it — no matter which directory you run `ferref` from.
+Override it per-invocation with the `FERREF_HOME` environment variable.
+
+(For local hacking without installing: `cargo build --release &&
+./target/release/ferref --help` works the same way, still reading `~/.ferref`.)
 
 ## Tutorial
 
-Everything below is a real session. Make a directory and work in it.
-
-```sh
-mkdir ~/papers && cd ~/papers
-```
+Everything below is a real session. `ferref` works from anywhere once
+installed — no need to `cd` into a project directory first.
 
 ### 1. Add a paper by DOI
 
@@ -144,19 +147,19 @@ No matches prints nothing and exits 0 — it's a query, not a test.
 
 ### 6. Attach a PDF you already have
 
-ferref copies the file into `./pdfs/`, named after the cite_key — the same
-scheme `fetch` uses — and stores that copy's absolute path. Your original is
-left where it is. The point is that every paper in a library sits in one
+ferref copies the file into `~/.ferref/pdfs/`, named after the cite_key — the
+same scheme `fetch` uses — and stores that copy's absolute path. Your original
+is left where it is. The point is that every paper in a library sits in one
 directory, whether it arrived by hand or over the network, so backing the whole
-thing up is `pdfs/` plus one `.db` file.
+thing up is `~/.ferref/pdfs/` plus one `.db` file.
 
 Say you've already downloaded a paper and added its entry (`ferref add --doi
 10.1186/s12859-020-3494-x`, which the next step covers):
 
 ```console
 $ ferref attach zhou2020 ~/Downloads/zhou2020.pdf --extract
-Attached '/home/you/papers/pdfs/zhou2020.pdf' to 'zhou2020'
-Extracted 35163 characters from '/home/you/papers/pdfs/zhou2020.pdf'
+Attached '/home/you/.ferref/pdfs/zhou2020.pdf' to 'zhou2020'
+Extracted 35163 characters from '/home/you/.ferref/pdfs/zhou2020.pdf'
 ```
 
 (The character count is whatever's in your PDF.)
@@ -172,7 +175,7 @@ attachments in your default viewer.
 ### 7. Fetch an open-access PDF automatically
 
 `fetch` asks Unpaywall whether a legal open-access copy exists, and if one does,
-downloads it to `./pdfs/`, attaches it, and extracts the text.
+downloads it to `~/.ferref/pdfs/`, attaches it, and extracts the text.
 
 This needs a contact email — Unpaywall's polite-pool policy. Set it once:
 
@@ -455,8 +458,8 @@ not `abstract_text`, and there's a test pinning that.
 It's just SQLite. Go read it:
 
 ```sh
-sqlite3 ferref.db '.schema'
-sqlite3 ferref.db "SELECT cite_key, title FROM entries WHERE year > 2015;"
+sqlite3 ~/.ferref/ferref.db '.schema'
+sqlite3 ~/.ferref/ferref.db "SELECT cite_key, title FROM entries WHERE year > 2015;"
 ```
 
 Tables: `entries`, `authors`, `tags`, `entry_tags`, `attachments`, `collections`,
@@ -467,14 +470,15 @@ identifiers — key your own tools against those.
 
 ## Limitations worth knowing
 
-- The database is always `./ferref.db`, relative to the current directory.
+- The library is one fixed location (`FERREF_HOME`, else `~/.ferref`) — there's
+  no support for multiple libraries from one install.
 - Two entries can't share a DOI, but nothing stops the same paper being added
   twice under two DOIs (a preprint and its published version, say), or with no
   DOI at all.
 - `edit` can't clear a field back to null, and there's no `detach`.
-- Attachment paths are absolute and stored once. The files live in `pdfs/`, but
-  the paths don't move with the library — relocating the directory breaks every
-  link silently.
+- Attachment paths are absolute and stored once. The files live in
+  `~/.ferref/pdfs/`, but the paths don't move with the library — relocating the
+  directory breaks every link silently.
 - BibTeX export writes legacy BibTeX by default; `@online` and `@dataset` need
   `--biblatex`, which legacy BibTeX styles can't read. Collections don't survive
   a round trip (tags do, via `keywords`).
@@ -492,7 +496,7 @@ identifiers — key your own tools against those.
 ## Development
 
 ```sh
-cargo test        # 72 tests, no network access required
+cargo test        # 79 tests, no network access required
 cargo build
 ```
 

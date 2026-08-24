@@ -63,6 +63,25 @@ fn read_config_email() -> Option<String> {
     parse_email(&contents)
 }
 
+// Where the library lives: `ferref.db` and `pdfs/` both sit directly under
+// this directory. Precedence: FERREF_HOME env var > ~/.ferref -- never the
+// current directory, so `ferref` behaves the same no matter which project
+// you run it from. install.sh sets FERREF_HOME when the user picks a
+// non-default location; otherwise this falls through to the standard one.
+pub fn library_root() -> Result<PathBuf, String> {
+    if let Ok(dir) = std::env::var("FERREF_HOME") {
+        if !dir.is_empty() {
+            return Ok(PathBuf::from(dir));
+        }
+    }
+    std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(".ferref"))
+        .ok_or_else(|| {
+            "cannot determine the library location: $HOME is not set and FERREF_HOME is not set"
+                .to_string()
+        })
+}
+
 pub fn resolve_email(cli_email: Option<String>) -> Result<String, String> {
     if let Some(email) = cli_email {
         return Ok(email);
