@@ -159,6 +159,11 @@ pub enum Command {
         /// guard the flag reads the whole library's text and prints none of it.
         #[arg(long = "full-text", requires = "json")]
         full_text: bool,
+        /// Search attachments' extracted text for a substring and show
+        /// matching snippets. Unlike --full-text, results are capped, so
+        /// this works in plain-text output too.
+        #[arg(long = "text")]
+        text: Option<String>,
         #[arg(long)]
         json: bool,
     },

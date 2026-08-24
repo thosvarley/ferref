@@ -39,7 +39,7 @@ Essential features that should be present at the end:
 
 ## Current state (2026-08-24)
 
-All fourteen phases are complete.
+All fifteen phases are complete.
 
 - `src/models.rs` — `Entry`/`Author` + `now()`. `Serialize` derived; `abstract_text` serializes as `"abstract"` (Rust reserves `abstract`), locked by a test.
 - `src/db.rs` — schema + `insert_entry`/`get_entry`/`list_entries`/`update_entry`/`delete_entry`, all free functions over `&Connection`. `update_entry` stamps `date_modified` itself so callers can't forget. `list_entries` takes a `Filter`; an all-`None` filter matches everything, so `list` and `search` are one query. `add_tag`/`remove_tag` are idempotent and report whether anything changed; `normalize_tag` (trim + lowercase) is the single point both writes and the `tag` filter go through. `attach` copies the file into `./pdfs/` under the same `<cite_key>.<ext>` scheme `fetch` uses, and stores the copy's path, so a library is one directory of papers. The name is claimed with `O_EXCL`, not by checking whether it exists first — two concurrent attaches to one cite_key otherwise lose a file 23% of the time, each reporting success.
@@ -451,6 +451,18 @@ Still not in the TUI: editing entry fields, deleting entries or collections,
 tagging, renaming. Those stay CLI-only. The line is that the TUI can file and
 find papers, but cannot destroy data.
 
+**Fixed by the Phase 15-era audit pass**: `load_entries` was calling
+`attachment_text_lengths` (one query per entry) in a loop — the exact N+1
+shape `list_entries`'s own bulk queries exist to avoid, reintroduced here
+and run on every pane load *and* every `j`/`k` in the collections pane.
+Replaced with `all_attachment_text_lengths`, one query for every entry's
+attachment lengths at once, grouped in Rust. While there: `AttachmentLengths`
+was storing a path string per attachment that nothing ever read (`details_text`
+already gets the path from `Entry.attachments`, indexing the lengths list
+positionally) — simplified from `HashMap<i64, Vec<(String, Option<i64>)>>`
+to `HashMap<i64, Vec<Option<i64>>>`. Verified with a real `tmux` TUI session,
+not just the type-checker.
+
 ---
 
 ## Phase 13 — `add --from-url`
@@ -509,6 +521,18 @@ from**, not the one that was typed — `fetch_guarded` returns its final URL for
 exactly this. A DOI resolver, a `www` redirect, or an SSO proxy all land
 somewhere else, and that is the case this phase exists to serve.
 
+**Fixed by the Phase 15-era audit pass**: `resolve_location`'s relative-path
+branch resolved against the host root, not the base URL's actual directory —
+a `citation_pdf_url` of `12345.pdf` on a landing page at
+`.../articles/9` became `.../12345.pdf` instead of the RFC 3986 §5.3-correct
+`.../articles/12345.pdf`. Silent failure mode: a publisher emitting a
+genuinely relative PDF URL (rather than absolute, which is more common but
+not universal) would 404 and the entry would land with no attachment, no
+error. The two existing tests baked the wrong behavior in as the expected
+result, so nothing caught it. Fixed to merge against the base path's
+directory instead of the authority root; both tests updated, plus a new
+case for a base URL with no path at all.
+
 ---
 
 ## Phase 14 — Fixed library location + `install.sh`
@@ -547,11 +571,33 @@ Not delegated — see the delegation table. Not reviewed — the only trust boun
 touched is "where does this process read `$HOME` from," which was already true
 of `config.rs`.
 
+**Fixed by the Phase 15-era audit pass**, since `install.sh` doesn't get its
+own `cargo test`: it was cwd-dependent (`cargo build`/`cp` are relative
+paths, so `bash ~/Code/ferref/install.sh` from another directory built
+whatever crate happened to be under `$PWD`), and didn't expand `~` in a
+custom library path (`read` doesn't do that — answering the prompt with
+`~/refs` wrote a literal, unexpanded `export FERREF_HOME="~/refs"` into the
+shell rc, so every future `ferref` invocation would treat `~/refs` as a
+path relative to wherever it happened to run — precisely the per-directory
+accidental library this phase exists to abolish). Both fixed and verified
+in a fake-`$HOME` sandbox: running from an unrelated directory, and
+answering the prompt with a literal `~/...` path and confirming the rc file
+holds the real expanded path.
+
 ---
 
-## Phase 15 — `search --text`: full-text content search with snippets
+## Phase 15 — `search --text`: FTS5-trigram content search with snippets
 
-**Scoped, not yet built.**
+**Built and shipped**, after a genuine false start that's worth recording
+because the mistake is easy to repeat: the trigram index existing and being
+*correct* was verified early and thoroughly (schema, triggers, mid-word
+substring matching, sub-trigram fallback — all confirmed empirically before
+shipping). What wasn't verified until an adversarial review forced it was
+whether the *actual query shape* — the clause as it's embedded in
+`list_entries`'s per-row filter architecture, not the mechanism in isolation
+— ever reached the index at all. It didn't. See "What actually shipped"
+below for the real design; the rest of this section is preserved as the
+original (wrong) plan, because the gap between them is the lesson.
 
 Today `--full-text` (on both `list` and `search`) is a projection flag, not a
 filter — it decides whether extracted PDF text rides along in the `--json`
@@ -561,21 +607,62 @@ never touches `attachments.full_text` except to project it. This phase adds
 that missing filter, plus enough of a result shape to make it useful without
 dumping a whole PDF's text at you.
 
-**Filtering.** A new `Filter.text: Option<String>` field, wired into
-`list_entries` as one more `EXISTS` clause, following the exact pattern the
-`tag` and `author` clauses already use:
+A plain `LIKE '%…%'` clause was the first draft, and works, but doesn't
+scale: a leading wildcard can't use a B-tree index, so it's a full scan of
+every extracted PDF's text, every query, cost growing with total corpus size
+rather than match count. Verified against the actual vendored SQLite
+(`libsqlite3-sys` 0.30.1 bundles SQLite 3.46.0): the `bundled` feature we
+already depend on compiles with `-DSQLITE_ENABLE_FTS5` unconditionally
+(`build.rs`), and that amalgamation includes the **trigram tokenizer**
+(`fts5TriCreate`/`fts5TriTokenize` in `sqlite3.c`), which indexes every
+3-character sequence — an inverted index that still matches arbitrary
+mid-word substrings, the same thing `LIKE '%…%'` gives you, just indexed. No
+new dependency, no new Cargo feature: it's already compiled into the binary
+we already ship.
+
+**Schema.** An FTS5 external-content table mirroring `attachments.full_text`,
+so the text itself isn't stored twice — only the trigram index structures
+are new, and they still live inside `ferref.db`, so the "one file" property
+(`DESIGN.md`'s database principles) holds:
 
 ```sql
-EXISTS (SELECT 1 FROM attachments att WHERE att.entry_id = entries.id
-        AND att.full_text LIKE ? ESCAPE '\')
+CREATE VIRTUAL TABLE IF NOT EXISTS attachments_fts USING fts5(
+    full_text, content='attachments', content_rowid='id', tokenize='trigram'
+);
 ```
 
-Same `like_pattern` escaping, same case-insensitive-for-ASCII substring
-semantics as every other `search` filter, and it ANDs with `--author`,
-`--title`, `--tag`, `--collection`, etc. exactly like those already do.
-Exposed as `--text <QUERY>` on `search` only (not `list` — substring filters
-already live on `search`, not `list`, and `--text` would collide with the
-existing boolean `--full-text` if named too close to it).
+Kept in sync with triggers on `attachments` (the standard external-content
+pattern — insert/delete/update all go through `attachments_fts`'s special
+`('delete', rowid, content)` protocol on the old row before any insert of the
+new one). Migration follows the existing `full_text` column migration's shape
+(`db.rs:85-95`): guarded by checking whether `attachments_fts` already exists
+before creating it, plus a one-time backfill —
+`INSERT INTO attachments_fts(rowid, full_text) SELECT id, full_text FROM
+attachments WHERE full_text IS NOT NULL` — for libraries that extracted text
+before this phase shipped.
+
+**Querying.** Verified in `sqlite3.c`: FTS5's `xBestIndex` recognizes a
+`LIKE`/`GLOB` constraint applied directly to an FTS5 table's column, and
+when the tokenizer reports `ePattern == FTS5_PATTERN_LIKE` (trigram's
+default, case-insensitive), it serves that constraint from the trigram
+index — so the query is still a `LIKE` on a table, not `MATCH` query syntax
+to learn or escape. The `Filter.text` clause ends up close to the shape
+every other clause already has, just querying the FTS5 table instead of
+`attachments` directly:
+
+```sql
+EXISTS (SELECT 1 FROM attachments att, attachments_fts fts
+        WHERE fts.rowid = att.id AND att.entry_id = entries.id
+        AND fts.full_text LIKE ? ESCAPE '\')
+```
+
+Same `like_pattern` escaping already used everywhere else; ANDs with
+`--author`, `--title`, `--tag`, `--collection`, etc. like every other
+`search` filter. Exposed as `--text <QUERY>` on `search` only. One thing the
+implementation has to nail down empirically, not assumed from reading the
+source: whether a pattern whose fixed substring is under 3 characters (too
+short to form a trigram) still returns correct — if unindexed — results, or
+errors. Either is fine; which one it is needs a test, not a guess.
 
 **Snippets.** SQL only tells you an entry matched, not where. Once
 `list_entries` returns the (now much smaller) matching set, a second pass
@@ -602,23 +689,160 @@ per attachment) — not the shared `Entry` type, so `list`/`show`/export are
 untouched and this doesn't force a full unbounded-text dump the way reusing
 `Entry` with `with_full_text` would.
 
-**Known ceiling, not fixed here.** `LIKE '%…%'` over a `TEXT` column is a full
-scan of every attachment's extracted text — no index, so cost scales with
-total corpus size, not match count. SQLite FTS5 would fix that, but it's a
-virtual table plus triggers to keep it in sync with `attachments`, a real
-schema migration, and a dependency decision (rusqlite's `bundled` feature may
-not compile FTS5 in without an explicit feature flag — needs checking, not
-assumed). Out of scope for v1: a personal library's PDF corpus is small
-enough that a full scan is milliseconds, not seconds. Upgrade path if that
-stops being true.
+**Why not the flat-files-plus-`grep`/`ripgrep` alternative.** Considered and
+rejected. `pdftotext`-extracted text today lives in exactly one place — the
+`attachments.full_text` column, never written to disk as `.txt` — and
+DESIGN.md's whole premise for the database is "it's just one file, `sqlite3
+ferref.db` gets you everything." Shelling out to `ripgrep` over flat files
+would genuinely be fast, but means text exists in two places, and loses the
+ability to combine a text query with SQL filters (`--tag`, `--collection`,
+`--year`) in one query. FTS5-trigram gets `grep`-speed search without either
+cost — it's still one table inside `ferref.db`.
 
-No new dependency either way — string search and the SQL `LIKE` SQLite
-already has.
+**Stress test, before calling this done.** Generate a synthetic library (N
+entries, realistic-sized full_text each — zhou2020's real 35,163 chars is the
+reference point) at a few sizes (500 / 5,000 / 50,000 "papers") and time
+`search --text` before vs. after the index exists, to confirm the scaling
+claim rather than assume it from reading tokenizer source.
 
-Delegation: **no / no**. Same shape as Phase 4 (search/filter) — extends one
-already-tested clause-building function with one more clause of the same
-kind, plus one small pure function with its own test. Writing the brief
-would be most of the work.
+Delegation: **yes / yes**. Bigger than Phase 4's shape now — a real schema
+migration (virtual table, triggers, backfill) with a genuine silent-failure
+trap (a trigger that doesn't fire, or a backfill that misses rows, means
+`search --text` quietly stops finding things that are actually there, not a
+loud error) — same class of risk the delegation table already flags trigger-
+sync and migration correctness for elsewhere. Review earns its keep here.
+
+**What actually shipped, after review caught the plan above being wrong.**
+
+Everything above this point — schema, triggers, backfill guard, snippet
+extraction, output shape, delegation call — was built by the `coder`
+subagent as scoped and is unchanged; all of it independently re-verified
+(89 tests, clean build, real CLI smoke tests including trigger sync via raw
+`sqlite3` UPDATEs and via entry deletion cascades). What was wrong was the
+`Filter.text` clause's query shape, and it was wrong in a way that plain
+correctness testing — including a genuine mid-word-substring test and a
+sub-3-character test, both passing — could not have caught, because those
+tests only check *what* rows come back, never *how fast* or *by what plan*.
+
+The adversarial review's key finding, independently reproduced against the
+real schema via `EXPLAIN QUERY PLAN`: the clause above is a **correlated**
+subquery (`... AND att.entry_id = entries.id ...`, evaluated once per row of
+the outer `entries` scan — the same shape every other `Filter` clause uses,
+by design, so they all AND together correctly). FTS5's `xBestIndex` only
+recognizes a `LIKE` constraint when it can scan `attachments_fts` as the
+*driving* table of a query. Under correlation, it never gets that chance —
+SQLite instead re-scans the whole FTS5 structure, unindexed, once per outer
+row. Measured: **5x slower than the original plain-`LIKE`-on-`attachments`
+draft this phase set out to replace.** The index wasn't just unused, it was
+actively worse than not having it.
+
+A second, independent finding, also verified directly: adding
+`ESCAPE '\'` to that `LIKE` — required for correctness, since every other
+substring filter in this codebase needs it to treat a user's literal `%`/`_`
+as literal — **silently disables the trigram fast path entirely**, confirmed
+via `EXPLAIN QUERY PLAN` losing its index annotation the moment `ESCAPE` is
+added, even outside the correlation problem. So `LIKE` was never going to
+work here, correlated or not, once real user input needed real escaping.
+
+The fix, verified via `EXPLAIN QUERY PLAN` against the real schema and via
+direct SQL benchmarking before being written into `db.rs`:
+
+```sql
+entries.id IN (
+    SELECT att.entry_id FROM attachments att, attachments_fts fts
+    WHERE fts.rowid = att.id AND fts.full_text MATCH ?
+)
+```
+
+Non-correlated (`IN` against a subquery with no reference to the outer
+`entries` row), so SQLite evaluates it exactly once and — verified — plans
+it as `LIST SUBQUERY` with `SCAN fts VIRTUAL TABLE INDEX 0:M0`, the genuine
+trigram-accelerated match path. `MATCH` instead of `LIKE`, with the query
+string quoted as an FTS5 phrase (`fts5_phrase`: wrap in `"`, double any
+literal `"`) rather than `like_pattern`-escaped — `MATCH` has no `%`/`_`/`\`
+special characters to escape in the first place, and phrase (adjacency)
+matching against a trigram-tokenized column is exactly substring matching.
+
+`MATCH` has its own gap `LIKE` didn't: verified directly that a phrase under
+3 characters (too short to form one trigram) matches **nothing**, even when
+the substring is genuinely present — not an error, not a graceful unindexed
+fallback, just silently wrong. So the sub-3-character case (still a real
+case — "AI", "ML" are plausible searches) falls back to a plain, correlated
+`LIKE ... ESCAPE '\'` against `attachments.full_text` directly, skipping
+`attachments_fts` entirely since it can't help there regardless of query
+shape. That path was already correct in the original draft; it just needed
+to stop being the *only* path.
+
+Real numbers, 20,000 synthetic attachments (~700MB total text, 35KB each —
+zhou2020's real extraction as the sizing reference), realistic vocabulary
+(the system dictionary, ~75,000 words, not a small repeated word list —
+which matters, see the process note below): a genuinely rare search term
+went from ~160ms (plain scan) to ~0.1ms (fixed query) — **~1,500x**. A term
+built from common English fragments still saw **~18x**. The corrected
+query's plan was independently confirmed against the actual compiled
+binary's schema, not just a scratch reproduction.
+
+**Second-order finding, worth keeping for next time this kind of question
+comes up:** the first attempt to measure this (before the correlation bug
+was even known) used a synthetic corpus built from a 31-word repeated
+vocabulary and measured **zero speedup** — which looked like it disproved
+the whole premise. It didn't; that corpus had artificially low trigram
+diversity (a 31-word vocabulary repeats the same few hundred trigrams
+constantly, so posting lists for any of them are enormous and unselective).
+Switching to a genuine ~75,000-word dictionary reproduced the expected
+speedup immediately. Two false readings in one phase, in opposite
+directions — one test too unrealistic to show a real effect, one query
+shape too naive to get a real effect — is the actual reason this section is
+being kept this detailed: "we benchmarked it and it was fast" is not a
+claim that survives contact with either a bad synthetic corpus or an
+untested query shape. Only a benchmark against the literal shipped query,
+on realistic data, counts.
+
+Two regression tests added beyond the original ten: a literal `"` in the
+search text (proves `fts5_phrase`'s escaping, and exercises the `MATCH`
+path specifically), and a three-entry scoping test (proves the
+non-correlated rewrite still scopes each match to its own entry, not just
+"some entry"). Also fixed in the same pass: `search --text ""` previously
+returned nothing with no error (SQL's `LIKE '%%'` matches everything, but
+`find_snippets` on an empty query always returns zero matches, so every
+entry was silently dropped by the "0 Rust-side matches" defensive skip) —
+now rejected up front with a clear error instead of a silent empty result.
+
+**A second audit pass, after all of the above shipped, found one more real
+bug and a genuine efficiency regression, both fixed here too.**
+
+The backfill's `INSERT ... SELECT ... WHERE full_text IS NOT NULL` — meant
+to index attachments that predate `attachments_fts` — silently excluded
+every attachment that had never been `--extract`ed (the default state for
+a newly attached PDF), while the sync triggers assume every row is indexed,
+NULL included. On a pre-existing library, the first `extract` or `rm`
+touching one of those un-backfilled rows issued an FTS5 `'delete'` command
+for a rowid the index never actually held. Reproduced directly against the
+project's real bundled SQLite (3.46.0): `rm` returned `database disk image
+is malformed`, not a hypothetical. Worse, the two existing tests that
+should have caught this couldn't have: both used `COUNT(*) FROM
+attachments_fts` as a proxy for "is it indexed," and `COUNT(*)` on an
+external-content FTS5 table reads the *content* table's row count
+regardless of whether the index was ever populated — confirmed directly, a
+completely empty index still reports the same count as a fully populated
+one. Fixed by replacing the manual backfill with FTS5's own `'rebuild'`
+command, which re-scans every content row unconditionally rather than a
+hand-picked subset, and rewriting both tests to use a real `MATCH` query
+and `PRAGMA integrity_check` instead of `COUNT(*)`. One more regression
+test added specifically for the migration path (a pre-existing library,
+built by hand rather than through `create_schema`, upgrading through it) —
+none of the other fts tests could exercise this scenario, since they all
+start from a fresh schema where every row goes through the AFTER INSERT
+trigger from birth.
+
+Separately: `search --text` was bulk-loading every matching entry's full
+text into one `Vec<Entry>` up front (`list_entries(..., with_full_text:
+true)`) before cutting a single snippet — on a large library, hundreds of
+MB resident before any output, the same unbounded-memory shape
+`--full-text` already needed a `--json` guard for, reintroduced here
+without one. Fixed by loading one entry's attachments at a time
+(`db::attachments_for_entry`, already existed, just needed to be made
+`pub`) inside `text_search_results` instead.
 
 ---
 
@@ -634,6 +858,20 @@ one yet.
   or one DOI and one manual entry). Nontrivial: attachment filenames collide
   on the target's cite_key and need re-landing under it, not just a DB row
   move.
+- **Semantic search via embeddings** — "papers related to multivariate
+  information decomposition" instead of a literal substring. Embed each
+  entry (title/abstract, or full text) and rank by vector similarity instead
+  of matching characters. Flagged here specifically so it doesn't get lost,
+  *and* because it directly contradicts the current explicit non-goal below
+  ("no embeddings... ferref's job stops at handing clean, structured data to
+  whatever does that work") — picking this up later means revisiting that
+  line deliberately, not just building around it. Real open questions before
+  it's even scoped: embed locally (which model, how big a dependency) vs.
+  call out to something external (which reintroduces the "ferref talks to a
+  third party" question Phase 8/13 were careful about); whether it's a new
+  command (`ferref similar <cite_key>`) or a `search` mode; and whether
+  storing vectors still fits "it's just one SQLite file" or needs its own
+  store. Big lift, correctly not for now.
 - **`ferref doctor`** — scan attachment paths against the filesystem and
   report ones that no longer resolve. Motivated by the existing limitation
   that attachment paths are absolute and don't move with the library.
@@ -675,7 +913,7 @@ Which phases get farmed out to a `coder` subagent, and which get an
 | 12 — TUI writes | yes | **yes** | Big mechanical grind (modes, key table, picker, sort/filter view), and the first phase where a keypress mutates the database. |
 | 13 — `add --from-url` | no | **yes** | Specifying it *was* the work — the design question (why meta tags and not translators) is the whole phase. Review earns its keep: it's a new network path taking untrusted HTML. |
 | 14 — Fixed library location + `install.sh` | no | no | Small, mechanical, same env-var-then-`$HOME` pattern `config.rs` already has. `install.sh` is an install script, not a trust boundary in the running program. |
-| 15 — `search --text` | no | no | Extends one already-tested clause-building function with one more clause of the same kind, plus one small pure function. Same shape as Phase 4. |
+| 15 — `search --text` (FTS5-trigram) | **yes** | **yes** | Real schema migration (virtual table, sync triggers, backfill), not a one-clause extension. A trigger that silently fails to fire is exactly the "review earns its keep on silent failures" case. |
 
 The table is a default, not a rule. The reasoning behind it, which outlives the
 table if the phases change:

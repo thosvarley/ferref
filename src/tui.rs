@@ -410,7 +410,10 @@ struct TreeRow {
     entry_count: i64,
 }
 
-type AttachmentLengths = HashMap<i64, Vec<(String, Option<i64>)>>;
+// Positionally aligned with entry.attachments (both ORDER BY id): index i
+// here is the length for e.attachments[i]. No path stored -- that's already
+// on the Attachment itself, and nothing here ever read a second copy of it.
+type AttachmentLengths = HashMap<i64, Vec<Option<i64>>>;
 
 struct App {
     rows: Vec<TreeRow>,
@@ -783,14 +786,7 @@ fn load_entries(
         },
     };
     let entries = db::list_entries(conn, &filter, false).map_err(|e| e.to_string())?;
-
-    let mut lengths = HashMap::new();
-    for e in &entries {
-        if let Some(id) = e.id {
-            let v = db::attachment_text_lengths(conn, id).map_err(|e| e.to_string())?;
-            lengths.insert(id, v);
-        }
-    }
+    let lengths = db::all_attachment_text_lengths(conn).map_err(|e| e.to_string())?;
     Ok((entries, lengths))
 }
 
@@ -1092,7 +1088,7 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-fn details_text(e: &Entry, lengths: Option<&Vec<(String, Option<i64>)>>) -> String {
+fn details_text(e: &Entry, lengths: Option<&Vec<Option<i64>>>) -> String {
     let mut lines = vec![e.title.clone()];
 
     if !e.authors.is_empty() {
@@ -1141,8 +1137,8 @@ fn details_text(e: &Entry, lengths: Option<&Vec<(String, Option<i64>)>>) -> Stri
 
     for (i, a) in e.attachments.iter().enumerate() {
         let status = match lengths.and_then(|l| l.get(i)) {
-            Some((_, Some(n))) => format!("text: {n} chars"),
-            Some((_, None)) => "text: not extracted".to_string(),
+            Some(Some(n)) => format!("text: {n} chars"),
+            Some(None) => "text: not extracted".to_string(),
             None => "text: unknown".to_string(),
         };
         lines.push(format!("{} ({status})", a.path));

@@ -79,6 +79,33 @@ CREATE TABLE IF NOT EXISTS collection_entries (
     PRIMARY KEY (collection_id, entry_id)
 );
 CREATE INDEX IF NOT EXISTS idx_collections_parent ON collections(parent_id);
+
+-- External-content FTS5 index over attachments.full_text, trigram-tokenized
+-- so substring (not just whole-word) queries can use the index instead of a
+-- full scan. 'content='attachments'' means the text itself isn't duplicated
+-- here -- only the trigram index structures live in this table. Kept in sync
+-- by the triggers below, the standard FTS5 external-content pattern.
+CREATE VIRTUAL TABLE IF NOT EXISTS attachments_fts USING fts5(
+    full_text, content='attachments', content_rowid='id', tokenize='trigram'
+);
+
+-- These three triggers must fire unconditionally, NULL full_text included --
+-- no `WHEN new.full_text IS NOT NULL` guard. FTS5 treats NULL as empty
+-- content, which is fine. What is NOT fine is the AFTER UPDATE trigger's
+-- 'delete' command not matching exactly what AFTER INSERT actually indexed;
+-- guarding one but not the other breaks that invariant silently.
+CREATE TRIGGER IF NOT EXISTS attachments_fts_ai AFTER INSERT ON attachments BEGIN
+  INSERT INTO attachments_fts(rowid, full_text) VALUES (new.id, new.full_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS attachments_fts_ad AFTER DELETE ON attachments BEGIN
+  INSERT INTO attachments_fts(attachments_fts, rowid, full_text) VALUES('delete', old.id, old.full_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS attachments_fts_au AFTER UPDATE ON attachments BEGIN
+  INSERT INTO attachments_fts(attachments_fts, rowid, full_text) VALUES('delete', old.id, old.full_text);
+  INSERT INTO attachments_fts(rowid, full_text) VALUES (new.id, new.full_text);
+END;
 "#;
 
 // CREATE TABLE IF NOT EXISTS does not add a column to a table that already
@@ -86,6 +113,15 @@ CREATE INDEX IF NOT EXISTS idx_collections_parent ON collections(parent_id);
 // created before this phase needs the column added explicitly -- this is
 // the project's first migration.
 fn create_schema(conn: &Connection) -> Result<()> {
+    // attachments_fts is new in this phase; a library that already extracted
+    // text has rows in attachments.full_text that predate the sync triggers
+    // and need a one-time backfill, done only the first time this table is
+    // created (not on every process start -- re-running the backfill on an
+    // already-populated table would try to re-insert existing rowids).
+    let fts_existed = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'attachments_fts'")?
+        .exists([])?;
+
     conn.execute_batch(SCHEMA_SQL)?;
 
     let has_full_text = conn
@@ -93,6 +129,25 @@ fn create_schema(conn: &Connection) -> Result<()> {
         .exists([])?;
     if !has_full_text {
         conn.execute("ALTER TABLE attachments ADD COLUMN full_text TEXT", [])?;
+    }
+
+    if !fts_existed {
+        // NOT a manual `INSERT ... SELECT ... WHERE full_text IS NOT NULL`.
+        // The AFTER INSERT trigger indexes every row unconditionally, NULL
+        // full_text included (see the trigger's own comment on why that
+        // invariant matters) -- a backfill that skips NULL rows leaves them
+        // absent from the index while every later trigger assumes they're
+        // present. On a pre-existing library (any attachment predating this
+        // migration, e.g. one never `--extract`ed), the first UPDATE or
+        // DELETE trigger firing on one of those rows issued a 'delete'
+        // command for a rowid the index never actually held -- reproduced
+        // against the real bundled SQLite (3.46.0) as an outright
+        // "database disk image is malformed" error, not a graceful no-op.
+        // FTS5's own 'rebuild' command is the documented, correct way to
+        // populate/repair an external-content table: it re-scans every row
+        // of the content table itself, NULLs included, so it can't disagree
+        // with what the triggers already assume.
+        conn.execute("INSERT INTO attachments_fts(attachments_fts) VALUES('rebuild')", [])?;
     }
 
     Ok(())
@@ -296,7 +351,7 @@ fn tags_for_entry(conn: &Connection, entry_id: i64) -> Result<Vec<String>> {
 // path. list/search project it off by default -- otherwise printing a table
 // of entries would pull every byte of every extracted PDF in the library
 // into memory just to render four columns.
-fn attachments_for_entry(
+pub fn attachments_for_entry(
     conn: &Connection,
     entry_id: i64,
     with_full_text: bool,
@@ -387,11 +442,25 @@ pub fn attachments_for_cite_key(conn: &Connection, cite_key: &str) -> Result<Vec
 // 41013 chars" without ever pulling full_text into memory (see
 // attachments_for_entry's with_full_text comment -- this is the same
 // concern one level more targeted).
-pub fn attachment_text_lengths(conn: &Connection, entry_id: i64) -> Result<Vec<(String, Option<i64>)>> {
+// full_text is never loaded here, only its character length, via SQLite's
+// length() -- every entry's in one query rather than one query per entry.
+// The TUI's load_entries used to call a per-entry version of this in a
+// loop, measured the same N+1 shape list_entries's own bulk queries exist
+// to avoid (see list_entries's comment on the 9.4x measurement). Ordered
+// the same way attachments_for_entry orders Entry.attachments (by id), so
+// callers can zip the two positionally without storing the path twice.
+pub fn all_attachment_text_lengths(conn: &Connection) -> Result<HashMap<i64, Vec<Option<i64>>>> {
     let mut stmt = conn
-        .prepare("SELECT path, length(full_text) FROM attachments WHERE entry_id = ?1 ORDER BY id")?;
-    stmt.query_map([entry_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<Vec<(String, Option<i64>)>>>()
+        .prepare("SELECT entry_id, length(full_text) FROM attachments ORDER BY entry_id, id")?;
+    let mut out: HashMap<i64, Vec<Option<i64>>> = HashMap::new();
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+    })?;
+    for row in rows {
+        let (entry_id, len) = row?;
+        out.entry(entry_id).or_default().push(len);
+    }
+    Ok(out)
 }
 
 // Single place tag names are normalized, so writes (add_tag/remove_tag) and
@@ -849,6 +918,7 @@ pub struct Filter {
     pub tag: Option<String>,
     pub collection_id: Option<i64>,
     pub recursive: bool,
+    pub text: Option<String>,
 }
 
 // Wraps a user substring for LIKE, escaping the wildcards so searching for
@@ -860,6 +930,17 @@ fn like_pattern(s: &str) -> String {
         .replace('%', "\\%")
         .replace('_', "\\_");
     format!("%{escaped}%")
+}
+
+// Quotes a literal substring as an FTS5 MATCH phrase: wrapped in double
+// quotes, with any literal double quote in the text doubled to escape it --
+// FTS5's phrase-quoting rule, not the LIKE-escaping `like_pattern` does.
+// Against a trigram-tokenized column, phrase (adjacency) matching on the
+// query's own trigrams is exactly substring matching: nothing about `%`,
+// `_`, or `\` is special to MATCH, so none of like_pattern's escaping
+// applies here.
+fn fts5_phrase(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
 }
 
 // with_full_text is a projection, not a filter, so it lives as a parameter
@@ -934,6 +1015,53 @@ pub fn list_entries(conn: &Connection, filter: &Filter, with_full_text: bool) ->
              AND ce.collection_id IN ({placeholders}))"
         ));
         params.extend(ids.into_iter().map(Value::Integer));
+    }
+
+    if let Some(text) = &filter.text {
+        // Two real traps here, both found by measuring the actual query
+        // shape rather than trusting the tokenizer's documented behavior in
+        // isolation (see DESIGN.md Phase 15's "false start" note):
+        //
+        // 1. A LIKE constraint only gets served from the trigram index when
+        //    SQLite scans attachments_fts as the *driving* table of the
+        //    query -- i.e. non-correlated. Written as a per-row correlated
+        //    EXISTS (the shape every other clause here uses), the LIKE
+        //    constraint isn't pushed at all: SQLite re-scans the whole FTS5
+        //    table from scratch for every row of `entries`, measured 5x
+        //    *slower* than not having the index. `entries.id IN (subquery)`
+        //    with no correlation to the outer query lets SQLite evaluate the
+        //    inner scan exactly once as a genuine indexed lookup.
+        // 2. Also measured: adding `ESCAPE '\'` to that LIKE -- needed for
+        //    correctness on every OTHER substring filter here -- silently
+        //    disables the trigram index entirely (confirmed via EXPLAIN
+        //    QUERY PLAN: the constraint stops being recognized at all). So
+        //    this can't reuse like_pattern/LIKE the way every other clause
+        //    does; it has to use MATCH with FTS5's own phrase-quoting
+        //    (fts5_phrase), which needs no `%`/`_`/`\` escaping in the
+        //    first place, and does get served from the index.
+        //
+        // MATCH has its own gap LIKE didn't: a phrase shorter than one
+        // trigram (under 3 characters) matches nothing at all, even when
+        // the substring is genuinely present -- confirmed directly, not
+        // assumed. Below that length there's nothing to index against
+        // regardless, so it falls back to a plain, correlated LIKE scan
+        // against attachments.full_text directly (skipping attachments_fts
+        // entirely -- it can't help here either way).
+        if text.chars().count() >= 3 {
+            clauses.push(
+                "entries.id IN (SELECT att.entry_id FROM attachments att, attachments_fts fts \
+                 WHERE fts.rowid = att.id AND fts.full_text MATCH ?)"
+                    .to_string(),
+            );
+            params.push(Value::Text(fts5_phrase(text)));
+        } else {
+            clauses.push(
+                "EXISTS (SELECT 1 FROM attachments att \
+                 WHERE att.entry_id = entries.id AND att.full_text LIKE ? ESCAPE '\\')"
+                    .to_string(),
+            );
+            params.push(Value::Text(like_pattern(text)));
+        }
     }
 
     let where_clause = clauses.join(" AND ");
@@ -1772,22 +1900,261 @@ mod tests {
     }
 
     // full_text is never loaded here (unlike attachments_for_entry(...,
-    // true)); only its character length is, via SQLite's length().
+    // true)); only its character length is, via SQLite's length(). Also
+    // covers two entries in one call, since the whole point of this
+    // function over a per-entry version is doing that in one query.
     #[test]
-    fn attachment_text_lengths_reports_length_without_loading_text() {
+    fn all_attachment_text_lengths_reports_length_without_loading_text() {
         let conn = Connection::open_in_memory().unwrap();
         create_schema(&conn).unwrap();
-        let mut entry = Entry::new("article".into(), "k".into(), "T".into());
-        let id = insert_entry(&conn, &entry).unwrap();
-        entry.id = Some(id);
+        seed(&conn, "k", "T", 2020, "Doe", "Jane");
+        seed(&conn, "other", "Other", 2021, "Roe", "Jan");
 
         let (att_id, _) = attach(&conn, "k", "/tmp/a.pdf").unwrap();
         attach(&conn, "k", "/tmp/b.pdf").unwrap();
         set_full_text(&conn, att_id, "hello").unwrap();
+        attach(&conn, "other", "/tmp/c.pdf").unwrap();
 
-        let lens = attachment_text_lengths(&conn, id).unwrap();
-        assert_eq!(lens.len(), 2);
-        assert_eq!(lens[0], ("/tmp/a.pdf".to_string(), Some(5)));
-        assert_eq!(lens[1], ("/tmp/b.pdf".to_string(), None));
+        let id: i64 = conn
+            .query_row("SELECT id FROM entries WHERE cite_key = 'k'", [], |r| r.get(0))
+            .unwrap();
+        let other_id: i64 = conn
+            .query_row("SELECT id FROM entries WHERE cite_key = 'other'", [], |r| r.get(0))
+            .unwrap();
+
+        let all = all_attachment_text_lengths(&conn).unwrap();
+        assert_eq!(all[&id], vec![Some(5), None]);
+        assert_eq!(all[&other_id], vec![None]);
+    }
+
+    // The realistic regression for the backfill guard: nothing today stops a
+    // future caller from calling create_schema twice on one connection (it
+    // already runs once per process via init_db). The backfill INSERT must
+    // not be the thing that breaks a second call, by trying to re-insert a
+    // rowid attachments_fts already indexes.
+    #[test]
+    fn create_schema_is_idempotent_when_called_twice() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        seed(&conn, "a", "Paper", 2020, "Smith", "John");
+        let (att_id, _) = attach(&conn, "a", "/tmp/a.pdf").unwrap();
+        set_full_text(&conn, att_id, "some extracted text").unwrap();
+
+        create_schema(&conn).unwrap();
+
+        // COUNT(*) on an external-content FTS5 table reads the *content*
+        // table's row count regardless of whether the index itself was ever
+        // populated -- confirmed empty-index still returns a nonzero count.
+        // A real MATCH query is the only thing that actually exercises the
+        // index, which is the whole point of this test.
+        let matched: Option<i64> = conn
+            .query_row(
+                "SELECT rowid FROM attachments_fts WHERE full_text MATCH '\"extracted\"'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(
+            matched,
+            Some(att_id),
+            "a second create_schema call must not duplicate or break the fts index"
+        );
+    }
+
+    // The test that actually catches a broken trigger: insert (with NULL
+    // text, since a fresh attachment always starts that way) -> set_full_text
+    // resyncs the fts row to the new text (AFTER UPDATE) -> delete the entry,
+    // cascading to attachments (AFTER DELETE). Guarding any one of these
+    // triggers on `full_text IS NOT NULL` would break this invariant.
+    //
+    // Deliberately does NOT use COUNT(*) FROM attachments_fts as a proxy for
+    // "is it indexed": on an external-content table that reads the content
+    // table's row count regardless of whether the index was ever actually
+    // populated -- confirmed directly, an attachments_fts with zero index
+    // rows still reports the same COUNT(*) as one fully populated. The only
+    // things that actually exercise the index are a real MATCH query and a
+    // full integrity_check, both used below.
+    #[test]
+    fn attachments_fts_stays_in_sync_with_inserts_updates_and_deletes() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        seed(&conn, "zhou2020", "Paper", 2020, "Zhou", "Yi");
+        let (att_id, _) = attach(&conn, "zhou2020", "/tmp/zhou.pdf").unwrap();
+
+        set_full_text(&conn, att_id, "quantum entanglement across noisy channels").unwrap();
+        let matched: Option<i64> = conn
+            .query_row(
+                "SELECT rowid FROM attachments_fts WHERE full_text MATCH '\"entanglement\"'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(matched, Some(att_id), "AFTER UPDATE must resync the row to the new text");
+
+        delete_entry(&conn, "zhou2020").unwrap(); // cascades to attachments -> AFTER DELETE
+
+        let integrity: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            integrity, "ok",
+            "a stale or missing fts 'delete' command must not leave the index inconsistent"
+        );
+    }
+
+    // The whole point of choosing the trigram tokenizer over the default:
+    // "raph" is a strict mid-word substring of "paragraph" -- not a token
+    // boundary match, which a unicode61-tokenized FTS5 table would require.
+    #[test]
+    fn text_filter_matches_a_mid_word_substring() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        seed(&conn, "a", "Paper", 2020, "Smith", "John");
+        let (att_id, _) = attach(&conn, "a", "/tmp/a.pdf").unwrap();
+        set_full_text(&conn, att_id, "This is a paragraph about entropy.").unwrap();
+
+        let filter = Filter { text: Some("raph".into()), ..Default::default() };
+        assert_eq!(keys(&conn, &filter), ["a"], "trigram index must match a mid-word substring");
+    }
+
+    // Empirical, not assumed: a 2-character query is too short to form one
+    // trigram. Observed behavior on the vendored SQLite (3.46.0): the LIKE
+    // constraint still returns the correct row -- FTS5 falls back to
+    // scanning full_text directly rather than erroring or returning nothing.
+    // Either a correct-but-unindexed result or an error would have been an
+    // acceptable outcome per the phase design; a silently wrong (empty)
+    // result would not have been, so this pins down which one it actually is.
+    #[test]
+    fn text_filter_with_a_query_shorter_than_one_trigram_still_matches_correctly() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        seed(&conn, "a", "Paper", 2020, "Smith", "John");
+        let (att_id, _) = attach(&conn, "a", "/tmp/a.pdf").unwrap();
+        set_full_text(&conn, att_id, "This is a paragraph about entropy.").unwrap();
+
+        let filter = Filter { text: Some("ra".into()), ..Default::default() };
+        assert_eq!(
+            keys(&conn, &filter),
+            ["a"],
+            "a sub-trigram query must still return correct matches, not silently empty ones"
+        );
+    }
+
+    // A literal `"` in the search text must survive FTS5's phrase-quoting
+    // (doubled to escape, per fts5_phrase) rather than breaking the MATCH
+    // syntax or being silently dropped. Also exercises the MATCH path (>=3
+    // chars) specifically, since this is what replaced the first draft's
+    // LIKE-on-attachments_fts approach.
+    #[test]
+    fn text_filter_handles_a_literal_double_quote_in_the_query() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        seed(&conn, "a", "Paper", 2020, "Smith", "John");
+        let (att_id, _) = attach(&conn, "a", "/tmp/a.pdf").unwrap();
+        set_full_text(&conn, att_id, "She said \"hello world\" to everyone.").unwrap();
+
+        let filter = Filter { text: Some("said \"hello".into()), ..Default::default() };
+        assert_eq!(keys(&conn, &filter), ["a"]);
+    }
+
+    // The bug the first draft shipped with: a per-row correlated EXISTS
+    // against attachments_fts doesn't just fail to use the trigram index,
+    // it can (in principle) evaluate incorrectly under join reordering.
+    // Pins down that the non-correlated `entries.id IN (...)` rewrite keeps
+    // each entry scoped to its own attachments only, across multiple
+    // entries where only one actually matches.
+    #[test]
+    fn text_filter_scopes_matches_to_the_right_entry_among_several() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        seed(&conn, "a", "Paper A", 2020, "Smith", "John");
+        seed(&conn, "b", "Paper B", 2021, "Doe", "Jane");
+        seed(&conn, "c", "Paper C", 2022, "Lee", "Kim");
+        let (att_a, _) = attach(&conn, "a", "/tmp/a.pdf").unwrap();
+        let (att_b, _) = attach(&conn, "b", "/tmp/b.pdf").unwrap();
+        let (att_c, _) = attach(&conn, "c", "/tmp/c.pdf").unwrap();
+        set_full_text(&conn, att_a, "nothing relevant here").unwrap();
+        set_full_text(&conn, att_b, "quantum entanglement across channels").unwrap();
+        set_full_text(&conn, att_c, "also nothing relevant").unwrap();
+
+        let filter = Filter { text: Some("entanglement".into()), ..Default::default() };
+        assert_eq!(keys(&conn, &filter), ["b"], "only the entry whose own attachment matches");
+    }
+
+    // A pre-existing library (attachments predating attachments_fts, some
+    // never `--extract`ed) upgrading through create_schema's migration path
+    // -- not a fresh schema, where every row already goes through the AFTER
+    // INSERT trigger from birth, so this is the one scenario none of the
+    // other fts tests can exercise. Manually builds the pre-Phase-15 shape
+    // by hand (not create_schema) so the later create_schema call is a real
+    // migration, not schema creation from scratch.
+    //
+    // This used to fail: the original backfill was a manual
+    // `INSERT ... SELECT ... WHERE full_text IS NOT NULL`, silently
+    // excluding the NULL row from the index while the AFTER UPDATE/DELETE
+    // triggers assumed every row was present -- the first trigger firing on
+    // that row corrupted the database outright ("database disk image is
+    // malformed", reproduced against the real bundled SQLite 3.46.0).
+    // Fixed by using FTS5's own 'rebuild' command for the backfill, which
+    // re-scans every content row unconditionally, matching what the
+    // triggers already assume.
+    #[test]
+    fn create_schema_migration_backfills_pre_existing_attachments_including_unextracted_ones() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE entries (id INTEGER PRIMARY KEY AUTOINCREMENT, entry_type TEXT NOT NULL,
+                 cite_key TEXT UNIQUE NOT NULL, title TEXT NOT NULL, year INTEGER, journal TEXT,
+                 volume TEXT, pages TEXT, doi TEXT, url TEXT, abstract TEXT,
+                 date_added INTEGER NOT NULL, date_modified INTEGER NOT NULL);
+             CREATE TABLE attachments (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+                 path TEXT NOT NULL, date_added INTEGER NOT NULL, full_text TEXT,
+                 UNIQUE (entry_id, path));",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entries (entry_type, cite_key, title, date_added, date_modified) \
+             VALUES ('article', 'a', 'Paper A', 0, 0)",
+            [],
+        )
+        .unwrap();
+        // One attachment never extracted (full_text NULL), one already extracted --
+        // exactly the audit's "two attachments, one extracted one not" case.
+        conn.execute(
+            "INSERT INTO attachments (entry_id, path, date_added, full_text) \
+             VALUES (1, '/tmp/never-extracted.pdf', 0, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO attachments (entry_id, path, date_added, full_text) \
+             VALUES (1, '/tmp/already-extracted.pdf', 0, 'some text')",
+            [],
+        )
+        .unwrap();
+
+        // This is the actual migration path a real upgrade goes through.
+        create_schema(&conn).unwrap();
+
+        // "ferref extract" on the never-extracted attachment.
+        let never_extracted_id: i64 = conn
+            .query_row(
+                "SELECT id FROM attachments WHERE path = '/tmp/never-extracted.pdf'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let extract_result = set_full_text(&conn, never_extracted_id, "newly extracted text");
+        assert!(extract_result.is_ok(), "extract after migration: {extract_result:?}");
+
+        // "ferref rm" on the entry (cascades to both attachments).
+        let rm_result = delete_entry(&conn, "a");
+        assert!(rm_result.is_ok(), "rm after migration: {rm_result:?}");
+
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok", "database must not be left malformed");
     }
 }

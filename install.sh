@@ -5,6 +5,11 @@
 # shell rc if one isn't already there.
 set -euo pipefail
 
+# cargo build and cp below are relative paths -- without this, running the
+# script as `bash ~/Code/ferref/install.sh` from some other directory builds
+# whatever crate happens to be under $PWD (or just errors) instead of ferref.
+cd "$(dirname "$(readlink -f "$0")")"
+
 DEFAULT_HOME="$HOME/.ferref"
 BIN_DIR="$HOME/.local/bin"
 
@@ -14,6 +19,13 @@ else
     FERREF_HOME_INPUT=""
 fi
 LIBRARY_DIR="${FERREF_HOME_INPUT:-$DEFAULT_HOME}"
+# `read` does not expand ~: answering the prompt with e.g. "~/refs" would
+# otherwise be taken as a literal directory named "~", created under the
+# repo (mkdir -p "~/refs"), and written into the rc file quoted -- where it
+# never expands either, so every future invocation of ferref would treat
+# the literal string "~/refs" as a path relative to wherever it's run from,
+# exactly the per-directory accidental library Phase 14 exists to abolish.
+LIBRARY_DIR="${LIBRARY_DIR/#\~/$HOME}"
 
 echo "Building ferref (release)..."
 cargo build --release --quiet

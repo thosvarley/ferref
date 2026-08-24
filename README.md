@@ -496,7 +496,7 @@ identifiers — key your own tools against those.
 ## Development
 
 ```sh
-cargo test        # 79 tests, no network access required
+cargo test        # 92 tests, no network access required
 cargo build
 ```
 

@@ -582,7 +582,18 @@ fn resolve_location(base: &Uri, location: &str) -> Result<String, String> {
     if location.starts_with('/') {
         Ok(format!("{scheme}://{authority}{location}"))
     } else {
-        Ok(format!("{scheme}://{authority}/{location}"))
+        // RFC 3986 §5.3 (merge): a relative reference resolves against the
+        // base URI's directory -- everything up to and including the last
+        // '/' in its path -- not against the host root. "12345.pdf" on a
+        // base of ".../articles/9" must become ".../articles/12345.pdf",
+        // not ".../12345.pdf". A base with no path at all (bare host) has
+        // Uri::path() return "/", so rfind normally finds at least that
+        // one '/'; the "/" fallback only guards a Uri that somehow doesn't
+        // (map_or(1, ...) here would slice out of bounds on a truly empty
+        // base_path, which .unwrap_or("/") avoids).
+        let base_path = base.path();
+        let dir = base_path.rfind('/').map(|i| &base_path[..=i]).unwrap_or("/");
+        Ok(format!("{scheme}://{authority}{dir}{location}"))
     }
 }
 
@@ -1049,9 +1060,12 @@ mod tests {
             resolve_location(&base, "/rooted").unwrap(),
             "https://good.example/rooted"
         );
+        // RFC 3986 §5.3 merge: resolves against the base's directory
+        // ("/a/"), not the host root -- base is ".../a/b", so "relative"
+        // becomes ".../a/relative", not ".../relative".
         assert_eq!(
             resolve_location(&base, "relative").unwrap(),
-            "https://good.example/relative"
+            "https://good.example/a/relative"
         );
     }
 
@@ -1163,8 +1177,20 @@ mod tests {
             resolve_location(&base, "/root").unwrap(),
             "https://host.example/root"
         );
+        // RFC 3986 §5.3 merge, not root-append -- this is the case a real
+        // publisher's relative citation_pdf_url hits: base is ".../a/b",
+        // so "rel" resolves against the base's directory ".../a/", not the
+        // host root.
         assert_eq!(
             resolve_location(&base, "rel").unwrap(),
+            "https://host.example/a/rel"
+        );
+
+        // A base with no path segment beyond the root still merges sanely
+        // (the "/" fallback for a base path that resolves to just "/").
+        let root_base: Uri = "https://host.example".parse().unwrap();
+        assert_eq!(
+            resolve_location(&root_base, "rel").unwrap(),
             "https://host.example/rel"
         );
     }

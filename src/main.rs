@@ -358,8 +358,19 @@ fn main() {
             collection,
             recursive,
             full_text,
+            text,
             json,
         } => {
+            // An empty --text matches every attachment at the SQL level
+            // (like_pattern("") is "%%"), but find_snippets on an empty
+            // query always returns zero matches -- so every entry would be
+            // silently dropped by text_search_results's "0 rust matches"
+            // skip, printing nothing with no indication why. Reject it here
+            // instead of leaving that skip to paper over the mismatch.
+            if text.as_deref() == Some("") {
+                die("--text cannot be empty");
+            }
+
             // --year is shorthand for a single-year range, so the filter only
             // has to understand min/max.
             let filter = db::Filter {
@@ -370,11 +381,30 @@ fn main() {
                 tag,
                 collection_id: resolve_collection_filter(&conn, collection),
                 recursive,
+                text: text.clone(),
             };
 
             match db::list_entries(&conn, &filter, full_text) {
                 Ok(entries) => {
-                    if json {
+                    if let Some(query) = &text {
+                        // Deliberately NOT with_full_text=true on the query
+                        // above: that would bulk-load every matching entry's
+                        // full text into one Vec<Entry> at once -- on a large
+                        // library that's hundreds of MB resident before a
+                        // single snippet is cut, the same unbounded-memory
+                        // shape --full-text needed a --json guard for.
+                        // text_search_results instead loads one entry's
+                        // attachments at a time, so peak memory is bounded by
+                        // one attachment's text, not the whole matching set.
+                        let results = text_search_results(&conn, &entries, query);
+                        if json {
+                            emit_json(&results);
+                        } else {
+                            for result in &results {
+                                emit(&format_text_search_result(result));
+                            }
+                        }
+                    } else if json {
                         emit_json(&entries);
                     } else {
                         for entry in &entries {
@@ -1375,6 +1405,184 @@ fn format_list_line(entry: &Entry) -> String {
     )
 }
 
+// `search --text`'s result shape. Deliberately not `Entry`: this is a
+// bounded result (capped snippets + a true count), not another path that
+// can dump a whole library's extracted text -- see the module note on
+// `--full-text` for why that distinction matters.
+#[derive(Debug, Clone, serde::Serialize)]
+struct AttachmentMatch {
+    path: String,
+    snippets: Vec<String>,
+    total_matches: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct TextSearchResult {
+    cite_key: String,
+    title: String,
+    year: Option<i32>,
+    matches: Vec<AttachmentMatch>,
+}
+
+// Not exposed as CLI flags -- see find_snippets's doc comment on why a
+// fixed cap is the point, not a limitation.
+const SNIPPET_CONTEXT_BYTES: usize = 50;
+const SNIPPET_MAX_MATCHES: usize = 3;
+
+// Rounds a byte index down/up to the nearest valid UTF-8 char boundary.
+// Widens a snippet window outward rather than shrinking it, so slicing at
+// `idx` never lands mid-character (which panics). str::is_char_boundary is
+// stable; no need for the nightly-only floor/ceil_char_boundary.
+fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
+// PDF extraction leaves ugly line-wrapping; collapses any run of whitespace
+// (including newlines) in a snippet down to a single space.
+fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+// Finds up to `max_matches` non-overlapping, ASCII-case-insensitive
+// occurrences of `query` in `text`, each surrounded by up to
+// `context_bytes` bytes of context (rounded outward to a char boundary --
+// hence "bytes", not "chars", in the name). Returns the capped snippets
+// plus the *true* total occurrence count, so a caller can report "+N more"
+// beyond what's shown. ASCII-only case folding matches what the SQL LIKE
+// filter upstream already applied, so results stay consistent with it.
+//
+// `to_ascii_lowercase` only maps 'A'-'Z' and never changes a string's byte
+// length or the position of any other byte, so offsets found in the
+// lowercased copy are valid offsets into the original `text` -- this is
+// what makes slicing `text` (not the lowercased copy) at those offsets
+// correct, snippets keep the source's original casing.
+fn find_snippets(
+    text: &str,
+    query: &str,
+    context_bytes: usize,
+    max_matches: usize,
+) -> (Vec<String>, usize) {
+    let lower_text = text.to_ascii_lowercase();
+    let lower_query = query.to_ascii_lowercase();
+    if lower_query.is_empty() {
+        return (Vec::new(), 0);
+    }
+
+    let mut snippets = Vec::new();
+    let mut count = 0;
+    let mut cursor = 0;
+    while let Some(offset) = lower_text[cursor..].find(&lower_query) {
+        let match_start = cursor + offset;
+        let match_end = match_start + lower_query.len();
+        count += 1;
+
+        if snippets.len() < max_matches {
+            let start = floor_char_boundary(text, match_start.saturating_sub(context_bytes));
+            let end = ceil_char_boundary(text, (match_end + context_bytes).min(text.len()));
+            let mut snippet = collapse_whitespace(&text[start..end]);
+            if start > 0 {
+                snippet = format!("…{snippet}");
+            }
+            if end < text.len() {
+                snippet = format!("{snippet}…");
+            }
+            snippets.push(snippet);
+        }
+
+        cursor = match_end; // non-overlapping: advance past this match
+    }
+
+    (snippets, count)
+}
+
+// Builds the bounded result set for `search --text` from entries
+// list_entries already SQL-filtered to "at least one attachment matches".
+// Loads each entry's attachment text one entry at a time (db::
+// attachments_for_entry), rather than the caller bulk-loading the whole
+// matching set up front -- on a large library that bulk load is hundreds of
+// MB resident before a single snippet is cut, the same unbounded-memory
+// shape --full-text already needed a --json guard for. Peak here is one
+// entry's attachments at a time.
+//
+// Re-checks per attachment here (not just per entry): a multi-attachment
+// entry can have one matching file and one that doesn't, and only the
+// matching one belongs in the output. An entry whose SQL match doesn't
+// reproduce in Rust (shouldn't happen, but ASCII vs. LIKE case-folding
+// could in principle disagree), or whose attachment lookup itself fails
+// (shouldn't happen either -- the entry came from this same connection a
+// moment ago), is skipped rather than shown empty or panicking.
+fn text_search_results(conn: &rusqlite::Connection, entries: &[Entry], query: &str) -> Vec<TextSearchResult> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let attachments = db::attachments_for_entry(conn, entry.id?, true).ok()?;
+            let matches: Vec<AttachmentMatch> = attachments
+                .iter()
+                .filter_map(|att| {
+                    let full_text = att.full_text.as_deref()?;
+                    let (snippets, total_matches) =
+                        find_snippets(full_text, query, SNIPPET_CONTEXT_BYTES, SNIPPET_MAX_MATCHES);
+                    if total_matches == 0 {
+                        return None;
+                    }
+                    Some(AttachmentMatch {
+                        path: att.path.clone(),
+                        snippets,
+                        total_matches,
+                    })
+                })
+                .collect();
+
+            if matches.is_empty() {
+                return None;
+            }
+
+            Some(TextSearchResult {
+                cite_key: entry.cite_key.clone(),
+                title: entry.title.clone(),
+                year: entry.year,
+                matches,
+            })
+        })
+        .collect()
+}
+
+fn format_text_search_result(result: &TextSearchResult) -> String {
+    let year = result
+        .year
+        .map(|y| y.to_string())
+        .unwrap_or_else(|| "----".to_string());
+    let mut out = format!("{:<15}{} ({year})\n", result.cite_key, result.title);
+    for m in &result.matches {
+        for snippet in &m.snippets {
+            out.push_str(&format!("  {snippet}\n"));
+        }
+        let shown = m.snippets.len();
+        if m.total_matches > shown {
+            let file_name = Path::new(&m.path)
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| m.path.clone());
+            out.push_str(&format!(
+                "  (+{} more matches in {file_name})\n",
+                m.total_matches - shown
+            ));
+        }
+    }
+    out.pop(); // emit() adds the trailing newline
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1419,5 +1627,59 @@ mod tests {
         assert!(!present);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn find_snippets_truncates_with_ellipses_only_where_the_window_was_cut() {
+        // Long enough on both sides that a 5-byte context window is
+        // truncated by the fixed window, not by hitting the text's edge.
+        let text = "0123456789needle0123456789";
+        let (snippets, count) = find_snippets(text, "needle", 5, 3);
+        assert_eq!(count, 1);
+        assert_eq!(snippets, vec!["…56789needle01234…".to_string()]);
+    }
+
+    #[test]
+    fn find_snippets_no_leading_ellipsis_when_match_is_at_the_very_start() {
+        let text = "needle0123456789";
+        let (snippets, count) = find_snippets(text, "needle", 5, 3);
+        assert_eq!(count, 1);
+        assert_eq!(snippets, vec!["needle01234…".to_string()]);
+    }
+
+    #[test]
+    fn find_snippets_no_trailing_ellipsis_when_match_is_at_the_very_end() {
+        let text = "0123456789needle";
+        let (snippets, count) = find_snippets(text, "needle", 5, 3);
+        assert_eq!(count, 1);
+        assert_eq!(snippets, vec!["…56789needle".to_string()]);
+    }
+
+    #[test]
+    fn find_snippets_caps_returned_snippets_but_counts_every_occurrence() {
+        let text = "needle needle needle needle needle";
+        let (snippets, count) = find_snippets(text, "needle", 3, 2);
+        assert_eq!(count, 5, "every non-overlapping occurrence must be counted");
+        assert_eq!(snippets.len(), 2, "only max_matches snippets are actually built");
+    }
+
+    #[test]
+    fn find_snippets_returns_nothing_and_does_not_panic_when_absent() {
+        let (snippets, count) = find_snippets("no match in here", "xyz", 10, 3);
+        assert!(snippets.is_empty());
+        assert_eq!(count, 0);
+    }
+
+    // 'é' (2-byte UTF-8) sits adjacent to the match on both sides, with no
+    // ASCII byte between it and "match". A 1-byte context window would,
+    // without boundary rounding, try to slice inside 'é' on both ends and
+    // panic; rounding must widen the window to include the whole character
+    // instead.
+    #[test]
+    fn find_snippets_rounds_the_window_outward_at_a_multibyte_boundary() {
+        let text = "aématchéb";
+        let (snippets, count) = find_snippets(text, "match", 1, 3);
+        assert_eq!(count, 1);
+        assert_eq!(snippets, vec!["…ématché…".to_string()]);
     }
 }
