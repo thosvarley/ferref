@@ -16,16 +16,16 @@ pub enum Command {
     /// Add a new entry. Either give --type/--key/--title directly, or give
     /// --doi and let Crossref fill them in.
     Add {
-        /// Required unless --doi is given, which fetches it from Crossref.
-        #[arg(long = "type", required_unless_present = "doi")]
+        /// Required unless --doi or --from-url is given, which fetch it.
+        #[arg(long = "type", required_unless_present_any = ["doi", "from_url"])]
         entry_type: Option<String>,
-        /// Required unless --doi is given, which derives one (first
-        /// author's last name + year, e.g. "kucsko2013"). An explicit --key
-        /// always wins over a derived one.
-        #[arg(long = "key", required_unless_present = "doi")]
+        /// Required unless --doi or --from-url is given, which derive one
+        /// (first author's last name + year, e.g. "kucsko2013"). An explicit
+        /// --key always wins over a derived one.
+        #[arg(long = "key", required_unless_present_any = ["doi", "from_url"])]
         cite_key: Option<String>,
-        /// Required unless --doi is given, which fetches it from Crossref.
-        #[arg(long, required_unless_present = "doi")]
+        /// Required unless --doi or --from-url is given, which fetch it.
+        #[arg(long, required_unless_present_any = ["doi", "from_url"])]
         title: Option<String>,
         /// Repeatable, each as "Last, First"
         #[arg(long = "author")]
@@ -40,6 +40,14 @@ pub enum Command {
         pages: Option<String>,
         #[arg(long)]
         doi: Option<String>,
+        /// Add from a publisher's landing page instead of a DOI: reads the
+        /// page's citation_* meta tags, prefers Crossref when the page names a
+        /// DOI, and downloads the PDF the page advertises. The download uses
+        /// this machine's network position, so on an institutional VPN or
+        /// proxy it gets what your browser would get -- and off it, usually a
+        /// login page, which is rejected rather than saved.
+        #[arg(long = "from-url", conflicts_with = "doi")]
+        from_url: Option<String>,
         #[arg(long)]
         url: Option<String>,
         #[arg(long = "abstract")]

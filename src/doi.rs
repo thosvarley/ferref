@@ -30,7 +30,14 @@ const JSON_TIMEOUT: Duration = Duration::from_secs(30);
 const PDF_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_JSON_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_PDF_BYTES: u64 = 100 * 1024 * 1024;
-const MAX_REDIRECTS: usize = 5;
+// Landing pages are documents, not payloads; 5MB is already a very fat one.
+const MAX_HTML_BYTES: u64 = 5 * 1024 * 1024;
+// 10, not 5: an institutional SSO chain (publisher -> IdP -> proxy -> PDF) can
+// legitimately be several hops, and 5 turned a paywalled Nature article into
+// "too many redirects" rather than a useful answer. Every hop is revalidated
+// (scheme + resolved IP), so the extra hops cost reach, not safety. Browsers
+// allow ~20.
+const MAX_REDIRECTS: usize = 10;
 
 /// Fetches Crossref metadata for `doi` and maps it onto an `Entry`. The
 /// returned entry has an empty `cite_key` -- deriving/choosing one is the
@@ -129,6 +136,211 @@ pub fn sanitize_filename(cite_key: &str) -> Result<String, String> {
 // checking it
 // ourselves either way is the point: a raw status dump is not an
 // actionable error message.
+/// Fetches a publisher landing page and reads its Highwire Press `citation_*`
+/// meta tags. Same guarded fetch as everything else here, so redirects are
+/// revalidated per hop and internal addresses are refused.
+///
+/// The request carries whatever network position the process has -- including
+/// an `HTTPS_PROXY`, which `ureq` picks up from the environment. That is what
+/// makes this useful on an institutional VPN and useless off it: nothing here
+/// bypasses an access control, it just makes an ordinary request and reads what
+/// comes back.
+pub fn fetch_page_metadata(url: &str) -> Result<PageMetadata, String> {
+    let bytes = fetch_guarded(url, JSON_TIMEOUT, MAX_HTML_BYTES, "landing page")?;
+    // Lossy, not strict: a publisher page is a document to skim for six
+    // attributes, not a protocol payload. Mis-declared encodings are common and
+    // shouldn't cost the whole fetch.
+    let html = String::from_utf8_lossy(&bytes);
+    let base = validate_url(url)?;
+    Ok(parse_citation_meta(&html, &base))
+}
+
+/// What a landing page told us about itself. Every field is optional: pages
+/// vary, and a page that advertises only a DOI is still completely useful,
+/// since the DOI is the good path.
+#[derive(Debug, Default, PartialEq)]
+pub struct PageMetadata {
+    pub doi: Option<String>,
+    pub pdf_url: Option<String>,
+    pub title: Option<String>,
+    pub authors: Vec<String>,
+    pub journal: Option<String>,
+    pub year: Option<i32>,
+}
+
+// Scans raw HTML for <meta name="citation_*" content="..."> without parsing
+// the document. Crude on purpose, in the same spirit as strip_jats_tags: an
+// HTML parser is a dependency bought to read six attributes off a
+// well-established convention. The convention is Highwire Press's, which
+// Google Scholar indexing depends on, so publishers emit it reliably and in a
+// narrow range of shapes.
+//
+// What this deliberately does NOT handle: tags inside comments or <script>
+// strings, and any per-publisher DOM structure. A page that doesn't emit the
+// tags is unsupported, not worked around.
+fn parse_citation_meta(html: &str, base: &Uri) -> PageMetadata {
+    let mut meta = PageMetadata::default();
+
+    for tag in meta_tags(html) {
+        let Some(name) = tag_attr(&tag, "name").or_else(|| tag_attr(&tag, "property")) else {
+            continue;
+        };
+        let Some(content) = tag_attr(&tag, "content") else {
+            continue;
+        };
+        let content = unescape_html(&content);
+        if content.trim().is_empty() {
+            continue;
+        }
+
+        // First tag of each kind wins: pages sometimes repeat a field, and the
+        // first is the head-of-document one. citation_author is the exception --
+        // it repeats *by design*, one per author, in order.
+        match name.trim().to_ascii_lowercase().as_str() {
+            "citation_doi" => set_once(&mut meta.doi, content),
+            "citation_pdf_url" => set_once(&mut meta.pdf_url, content),
+            "citation_title" => set_once(&mut meta.title, content),
+            "citation_journal_title" => set_once(&mut meta.journal, content),
+            "citation_author" => meta.authors.push(content),
+            // Dates come as "2020", "2020/07/16", "2020-07-16". Only the year
+            // is stored, so take the leading four digits and ignore the rest.
+            "citation_publication_date" | "citation_date" | "citation_year" => {
+                if meta.year.is_none() {
+                    meta.year = content
+                        .trim()
+                        .get(..4)
+                        .and_then(|y| y.parse::<i32>().ok())
+                        .filter(|y| (1000..=9999).contains(y));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // citation_pdf_url is usually absolute but the spec doesn't require it.
+    if let Some(pdf) = meta.pdf_url.take() {
+        meta.pdf_url = resolve_location(base, &pdf).ok();
+    }
+    meta
+}
+
+fn set_once(slot: &mut Option<String>, value: String) {
+    if slot.is_none() {
+        *slot = Some(value);
+    }
+}
+
+// Yields the inner text of each <meta ...> tag. Bounded by the closing '>',
+// which is safe here because an unquoted attribute value containing '>' is
+// invalid HTML and a quoted one is handled by tag_attr's own quote tracking
+// only insofar as the tag is truncated -- worst case a tag is skipped, never
+// misread as another tag's value.
+fn meta_tags(html: &str) -> Vec<String> {
+    let lower = html.to_ascii_lowercase();
+    let mut tags = Vec::new();
+    let mut from = 0;
+
+    while let Some(start) = lower[from..].find("<meta") {
+        let start = from + start;
+        // Must be followed by whitespace or '/' -- otherwise "<metadata" hits.
+        let after = lower[start + 5..].chars().next();
+        let end = match html[start..].find('>') {
+            Some(e) => start + e,
+            None => break,
+        };
+        if matches!(after, Some(c) if c.is_whitespace() || c == '/') {
+            tags.push(html[start + 5..end].to_string());
+        }
+        from = end + 1;
+    }
+    tags
+}
+
+// Pulls one attribute's value out of a tag body. Handles double quotes, single
+// quotes, and unquoted values, and requires the name to be a whole attribute
+// (so `content` doesn't match inside `data-content`).
+fn tag_attr(tag: &str, attr: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let mut from = 0;
+
+    while let Some(found) = lower[from..].find(attr) {
+        let at = from + found;
+        from = at + attr.len();
+
+        let before_ok = at == 0
+            || lower[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_whitespace() || c == '/');
+        if !before_ok {
+            continue;
+        }
+
+        let rest = tag[at + attr.len()..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+
+        return match rest.chars().next() {
+            Some(q @ ('"' | '\'')) => rest[1..].find(q).map(|e| rest[1..1 + e].to_string()),
+            Some(_) => Some(
+                rest.split(|c: char| c.is_whitespace())
+                    .next()
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+            None => None,
+        };
+    }
+    None
+}
+
+// The five predefined XML entities plus numeric escapes, which is what actually
+// turns up in a content attribute. Anything else is left as written -- a stray
+// "&copy;" in a title is cosmetic, and a full entity table is a dependency.
+fn unescape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let Some(end) = rest.find(';').filter(|&e| e <= 10) else {
+            out.push('&');
+            rest = &rest[1..];
+            continue;
+        };
+        let entity = &rest[1..end];
+        let replacement = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" | "#39" => Some('\''),
+            _ => entity
+                .strip_prefix('#')
+                .and_then(|n| match n.strip_prefix(['x', 'X']) {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                    None => n.parse::<u32>().ok(),
+                })
+                .and_then(char::from_u32),
+        };
+        match replacement {
+            Some(c) => {
+                out.push(c);
+                rest = &rest[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn get_json(url: &str, service: &str) -> Result<String, String> {
     let bytes = fetch_guarded(url, JSON_TIMEOUT, MAX_JSON_BYTES, service)?;
     String::from_utf8(bytes).map_err(|_| format!("{service} returned invalid UTF-8"))
@@ -659,6 +871,58 @@ mod tests {
         { "best_oa_location": { "url_for_pdf": null, "host_type": "repository" } }
         "#;
         assert_eq!(parse_unpaywall(json).unwrap().pdf_url, None);
+    }
+
+    fn meta_of(html: &str) -> PageMetadata {
+        let base: Uri = "https://example.org/articles/1".parse().unwrap();
+        parse_citation_meta(html, &base)
+    }
+
+    // The tag shapes publishers actually emit: attribute order varies, quoting
+    // varies, citation_author repeats, and content is HTML-escaped.
+    #[test]
+    fn citation_meta_survives_real_world_tag_shapes() {
+        let html = r#"
+            <html><head>
+            <meta name="citation_title" content="Entropy &amp; Information">
+            <meta content='Zhou, Yi' name='citation_author'>
+            <meta name=citation_author content="Smith, John">
+            <meta name="citation_journal_title" content="Physical Review">
+            <meta name="citation_publication_date" content="1957/05/15">
+            <meta name="citation_doi" content="10.1103/PhysRev.106.620">
+            <meta property="citation_pdf_url" content="/pdf/106-620.pdf" />
+            <meta name="viewport" content="width=device-width">
+            <metadata name="citation_title" content="NOT A META TAG">
+            </head></html>"#;
+
+        let m = meta_of(html);
+        assert_eq!(m.title.as_deref(), Some("Entropy & Information"));
+        assert_eq!(m.authors, vec!["Zhou, Yi", "Smith, John"]);
+        assert_eq!(m.journal.as_deref(), Some("Physical Review"));
+        assert_eq!(m.year, Some(1957));
+        assert_eq!(m.doi.as_deref(), Some("10.1103/PhysRev.106.620"));
+        // Relative citation_pdf_url is resolved against the page.
+        assert_eq!(m.pdf_url.as_deref(), Some("https://example.org/pdf/106-620.pdf"));
+    }
+
+    // A page with none of the tags must come back empty rather than
+    // half-populated with garbage -- that's what makes the caller's "this page
+    // isn't supported" message correct.
+    #[test]
+    fn a_page_without_citation_tags_yields_nothing() {
+        assert_eq!(meta_of("<html><body>no meta here</body></html>"), PageMetadata::default());
+        // `data-content` must not be read as `content`.
+        let m = meta_of(r#"<meta name="citation_title" data-content="wrong" content="right">"#);
+        assert_eq!(m.title.as_deref(), Some("right"));
+    }
+
+    #[test]
+    fn html_entities_in_content_are_unescaped() {
+        assert_eq!(unescape_html("a &amp; b"), "a & b");
+        assert_eq!(unescape_html("&lt;i&gt;x&lt;/i&gt;"), "<i>x</i>");
+        assert_eq!(unescape_html("Don&#39;t &#x2014; stop"), "Don't \u{2014} stop");
+        // Unknown and malformed entities are left exactly as written.
+        assert_eq!(unescape_html("100&nbsp;% &amp"), "100&nbsp;% &amp");
     }
 
     #[test]

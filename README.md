@@ -215,6 +215,55 @@ direct PDF link for it -- only landing pages
 ferref will not work around a paywall. If Unpaywall says there's no legal open
 copy, that's the end of it.
 
+### 7b. Add from a page you're looking at
+
+`fetch` asks Unpaywall about a paper's *licence*. That's the wrong question for
+a paper your institution subscribes to: Unpaywall correctly says "not open"
+while your browser, on the campus VPN, downloads it without complaint.
+
+`--from-url` asks a different question — it just requests the page, reads the
+`citation_*` meta tags publishers emit for Google Scholar, and downloads the PDF
+the page advertises:
+
+```console
+$ ferref add --from-url https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-020-3494-x
+MEPHAS: an interactive graphical user interface... [zhou2020]
+  ...
+Attached '/home/you/papers/pdfs/zhou2020.pdf'
+```
+
+The download uses **this machine's network position**. On an institutional VPN
+or through `HTTPS_PROXY`, you get what your browser would get. This isn't a
+paywall bypass — ferref makes an ordinary request and keeps whatever the server
+chooses to return. Off the VPN you get the metadata and an honest refusal:
+
+```console
+$ ferref add --from-url https://www.nature.com/articles/nature14539
+Deep learning [lecun2015]
+  ...
+Warning: failed to download PDF: downloaded content is not a PDF (missing %PDF
+magic bytes) -- this is usually an HTML interstitial, not the paper
+```
+
+The entry is kept either way — a failed download shouldn't cost you the
+metadata. When the page names a DOI, metadata comes from Crossref rather than
+the page, since publishers abbreviate and Crossref is authoritative.
+
+Measured coverage, from outside any VPN:
+
+| Publisher | Metadata | PDF |
+| --- | --- | --- |
+| arXiv | yes | yes |
+| PLOS | yes | yes |
+| BioMed Central | yes | yes |
+| Nature (paywalled) | yes | no — paywall interstitial, as expected |
+| Wiley | no — 403s the page to non-browser clients | — |
+| science.org | no — emits no `citation_*` tags | — |
+
+Worth knowing: `--from-url` also succeeds on some open-access papers `fetch`
+can't get, because Unpaywall lists only a landing page for them. PLOS above is
+exactly that case.
+
 ### 8. Get the text back out
 
 This is the point of the whole thing. `show --json` carries the extracted text:
@@ -326,6 +375,7 @@ CLI-only, so a mis-keypress can misfile a paper but can't destroy data. Press
 | `extract <key>` | (Re)extract text for all of an entry's attachments |
 | `open <key>` | Open attachments in the system viewer |
 | `fetch <key>` | Find and download an open-access PDF for the entry's DOI |
+| `add --from-url <url>` | Add from a publisher's landing page, downloading the PDF it advertises using this machine's network access |
 | `collection new <path>` | Create a collection, `mkdir -p` style |
 | `collection ls` | The whole tree, with entry counts |
 | `collection add` / `rm` | Add or remove an entry's membership. Idempotent |

@@ -39,7 +39,7 @@ Essential features that should be present at the end:
 
 ## Current state (2026-08-24)
 
-All twelve phases are complete.
+All thirteen phases are complete.
 
 - `src/models.rs` — `Entry`/`Author` + `now()`. `Serialize` derived; `abstract_text` serializes as `"abstract"` (Rust reserves `abstract`), locked by a test.
 - `src/db.rs` — schema + `insert_entry`/`get_entry`/`list_entries`/`update_entry`/`delete_entry`, all free functions over `&Connection`. `update_entry` stamps `date_modified` itself so callers can't forget. `list_entries` takes a `Filter`; an all-`None` filter matches everything, so `list` and `search` are one query. `add_tag`/`remove_tag` are idempotent and report whether anything changed; `normalize_tag` (trim + lowercase) is the single point both writes and the `tag` filter go through. `attach` copies the file into `./pdfs/` under the same `<cite_key>.<ext>` scheme `fetch` uses, and stores the copy's path, so a library is one directory of papers. The name is claimed with `O_EXCL`, not by checking whether it exists first — two concurrent attaches to one cite_key otherwise lose a file 23% of the time, each reporting success.
@@ -450,6 +450,50 @@ find papers, but cannot destroy data.
 
 ---
 
+## Phase 13 — `add --from-url`
+
+`fetch` asks Unpaywall, which answers a question about a paper's *licence*.
+That is the right question for open-access work and the wrong one for a paper
+your institution subscribes to: Unpaywall says "not open" and it is correct,
+while your browser on the campus VPN downloads it without complaint. The gap
+isn't legal, it's architectural — ferref asks a third party about the paper,
+where Zotero's browser connector is already inside an authenticated session
+looking at the page.
+
+`ferref add --from-url <landing page URL>` closes it, as a peer of `--doi`:
+
+- Fetches the page through the existing `fetch_guarded`, so it inherits the
+  redirect revalidation and internal-address refusal, and (via `ureq`) honours
+  `HTTPS_PROXY`/`ALL_PROXY` — which is what makes an institutional proxy work.
+- Reads the **Highwire Press `citation_*` meta tags**. This is the one piece of
+  publisher-agnostic structure worth relying on: Google Scholar indexing depends
+  on them, so essentially every journal emits them. It is emphatically *not* the
+  translator-per-publisher approach — there is one parser, and a site that
+  doesn't emit the tags simply isn't supported.
+- If the page advertises `citation_doi`, metadata comes from **Crossref**, reusing
+  the whole `--doi` path. Publisher pages lie and abbreviate; Crossref is
+  authoritative. The page tags are the fallback, not the preference.
+- If the page advertises `citation_pdf_url`, the PDF is downloaded **from the same
+  network position** and attached and extracted. That is the entire point: the
+  bytes arrive because the requesting IP is entitled to them, exactly as they do
+  in a browser.
+
+This is not paywall circumvention and the non-goal below is unchanged. ferref
+still never bypasses an access control — it makes an ordinary request and takes
+what the server chooses to return. Off the VPN the same command yields metadata
+and, usually, a login page, which `download_pdf`'s `%PDF` magic-byte check
+already rejects rather than saving.
+
+Landing the PDF (claim a name under `./pdfs/`, write, attach, clean up on
+failure) is shared with `fetch` rather than written twice — `fetch`'s copy also
+had the exists-then-write race that `attach` was fixed for.
+
+No new dependencies. Meta-tag scanning is ~60 lines over the raw HTML, in the
+same spirit as `strip_jats_tags`: crude, documented as crude, and tested. An
+HTML parser would be a dependency bought to read six attributes.
+
+---
+
 ## Explicit non-goals for v1
 
 - Doing the AI work ourselves — no embeddings, no bibliometric analysis, no LLM calls inside ferref. ferref's job stops at handing clean, structured, scriptable data to whatever does that work.
@@ -460,7 +504,7 @@ find papers, but cannot destroy data.
 
 ## Order of work
 
-Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
+Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
 
 ---
 
@@ -483,6 +527,7 @@ Which phases get farmed out to a `coder` subagent, and which get an
 | 10 — Collections | yes | no | Schema + subcommands, like tags. One real trap (cycles), specified in the brief and tested. |
 | 11 — TUI | yes | **yes** | New dep, terminal state that must be restored on panic, and a render loop that must not hang on malformed data. |
 | 12 — TUI writes | yes | **yes** | Big mechanical grind (modes, key table, picker, sort/filter view), and the first phase where a keypress mutates the database. |
+| 13 — `add --from-url` | no | **yes** | Specifying it *was* the work — the design question (why meta tags and not translators) is the whole phase. Review earns its keep: it's a new network path taking untrusted HTML. |
 
 The table is a default, not a rule. The reasoning behind it, which outlives the
 table if the phases change:

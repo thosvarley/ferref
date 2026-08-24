@@ -33,10 +33,37 @@ fn main() {
             volume,
             pages,
             doi,
+            from_url,
             url,
             abstract_text,
             json,
         } => {
+            // --from-url is the third way in, alongside --doi and the manual
+            // flags. It reads a landing page's citation_* meta tags; if the
+            // page names a DOI it hands off to the Crossref path below, since
+            // publisher pages abbreviate and Crossref is authoritative.
+            let mut pending_pdf: Option<String> = None;
+            let mut doi = doi;
+            let mut page: Option<doi::PageMetadata> = None;
+
+            if let Some(page_url) = &from_url {
+                let found = match doi::fetch_page_metadata(page_url) {
+                    Ok(m) => m,
+                    Err(e) => die(&format!("failed to read '{page_url}': {e}")),
+                };
+                if found.doi.is_none() && found.title.is_none() {
+                    die(&format!(
+                        "'{page_url}' has no citation_doi or citation_title meta tag -- \
+                         ferref reads the Highwire Press tags publishers emit for Google \
+                         Scholar, and this page doesn't carry them. Add it by hand, or \
+                         with --doi if you know it."
+                    ));
+                }
+                pending_pdf = found.pdf_url.clone();
+                doi = found.doi.clone();
+                page = Some(found);
+            }
+
             // --doi fetches metadata from Crossref instead of taking it from
             // flags -- see Command::Add's docs. Everything else (--type,
             // --title, --author, --year, ...) is ignored in this mode; only
@@ -57,9 +84,38 @@ fn main() {
                     },
                 };
                 entry
+            } else if let Some(found) = page {
+                // A page with no DOI: fall back to what it told us directly.
+                // Weaker than Crossref, but it's the difference between working
+                // on a preprint server and refusing to.
+                let mut entry = Entry::new(
+                    "article".to_string(),
+                    String::new(),
+                    found.title.clone().unwrap_or_default(),
+                );
+                for raw in &found.authors {
+                    // citation_author is "Last, First" by convention; parse_author
+                    // treats a comma-less name as all surname, which degrades
+                    // sensibly for the publishers that ignore that.
+                    match cli::parse_author(raw) {
+                        Ok(author) => entry.add_author(author),
+                        Err(_) => continue,
+                    }
+                }
+                entry.year = found.year;
+                entry.journal = found.journal.clone();
+                entry.url = from_url.clone();
+                entry.cite_key = match cite_key {
+                    Some(key) => key,
+                    None => match derive_cite_key(&conn, &entry) {
+                        Ok(key) => key,
+                        Err(e) => die(&e),
+                    },
+                };
+                entry
             } else {
-                // clap's required_unless_present="doi" guarantees these are
-                // Some when --doi wasn't passed.
+                // clap's required_unless_present_any guarantees these are Some
+                // when neither --doi nor --from-url was passed.
                 let mut entry = Entry::new(
                     entry_type.expect("--type required by clap without --doi"),
                     cite_key.expect("--key required by clap without --doi"),
@@ -81,11 +137,25 @@ fn main() {
             };
 
             match db::insert_entry(&conn, &entry) {
-                Ok(id) => {
-                    entry.id = Some(id);
-                    output_entry(&entry, json);
-                }
+                Ok(id) => entry.id = Some(id),
                 Err(e) => die(&db_error("add entry", e)),
+            }
+
+            // The entry is committed before the PDF is attempted: a download
+            // that fails (off the VPN, say) must not cost you the metadata you
+            // just fetched. Same partial-failure rule as `attach --extract`.
+            let pdf = pending_pdf.map(|url| add_pdf_from_page(&conn, &entry.cite_key, &url));
+
+            output_entry(&entry, json);
+            if !json {
+                match &pdf {
+                    Some(Ok(path)) => emit(&format!("Attached '{path}'")),
+                    Some(Err(e)) => eprintln!("Warning: {e}"),
+                    None => {}
+                }
+            }
+            if matches!(pdf, Some(Err(_))) {
+                std::process::exit(1);
             }
         }
 
@@ -609,53 +679,12 @@ fn cmd_fetch(
             return;
         };
 
-        let filename = match doi::sanitize_filename(&cite_key) {
-            Ok(f) => f,
-            Err(e) => die(&e),
-        };
-        let pdf_dir = Path::new("pdfs");
-        if let Err(e) = std::fs::create_dir_all(pdf_dir) {
-            die(&format!("failed to create '{}': {e}", pdf_dir.display()));
-        }
-        let (target, already_present) =
-            match pdf_target(conn, &cite_key, pdf_dir, &filename, "pdf", None) {
-                Ok(t) => t,
+        let (path_str, attachment_id, already_present) =
+            match land_downloaded_pdf(conn, &cite_key, &pdf_url) {
+                Ok(landed) => landed,
                 Err(e) => die(&e),
             };
-
-        if !already_present {
-            let bytes = match doi::download_pdf(&pdf_url) {
-                Ok(b) => b,
-                Err(e) => die(&format!("failed to download PDF: {e}")),
-            };
-            if let Err(e) = std::fs::write(&target, &bytes) {
-                die(&format!("failed to save PDF to '{}': {e}", target.display()));
-            }
-        }
-
-        let abs_path = match target.canonicalize() {
-            Ok(p) => p,
-            Err(e) => die(&format!(
-                "failed to resolve saved PDF path '{}': {e}",
-                target.display()
-            )),
-        };
-        let path_str = match abs_path.to_str() {
-            Some(s) => s.to_string(),
-            None => die(&format!("path {} is not valid UTF-8", abs_path.display())),
-        };
-
-        let (attachment_id, _changed) = match db::attach(conn, &cite_key, &path_str) {
-            Ok(pair) => pair,
-            Err(e) => {
-                // Don't leave a PDF on disk that nothing in the library
-                // points at. Only remove what this run downloaded.
-                if !already_present {
-                    let _ = std::fs::remove_file(&target);
-                }
-                die(&entry_error(&cite_key, "attach downloaded PDF", e))
-            }
-        };
+        let abs_path = PathBuf::from(&path_str);
 
         // Partial failure: the attachment persists even if extraction
         // fails -- same rule as `attach --extract` (Phase 7).
@@ -947,6 +976,88 @@ fn open_path(path: &str) -> Result<(), String> {
         Ok(status) => Err(format!("{opener} failed on '{path}' ({status})")),
         Err(e) => Err(format!("could not run {opener}: {e}")),
     }
+}
+
+// The PDF half of `add --from-url`: download what the page advertised, attach
+// it, extract its text. Errors are returned rather than fatal -- see the call
+// site for why the entry survives a failed download.
+fn add_pdf_from_page(
+    conn: &rusqlite::Connection,
+    cite_key: &str,
+    pdf_url: &str,
+) -> Result<String, String> {
+    let (path, attachment_id, _) = land_downloaded_pdf(conn, cite_key, pdf_url)?;
+    let extracted = text::extract_text(Path::new(&path))
+        .and_then(|text| save_extracted(conn, attachment_id, &text));
+    match extracted {
+        Ok(_) => Ok(path),
+        // The attachment stands; only the text is missing.
+        Err(e) => Err(format!("attached '{path}' but extraction failed: {e}")),
+    }
+}
+
+// Downloads a PDF and lands it in ./pdfs/ under the entry's cite_key, then
+// attaches it. Shared by `fetch` (URL from Unpaywall) and `add --from-url` (URL
+// from a landing page's citation_pdf_url) -- the two differ only in where the
+// URL came from, and writing it twice is how two copies drift apart.
+//
+// Returns (stored path, attachment id, whether the file was already there).
+fn land_downloaded_pdf(
+    conn: &rusqlite::Connection,
+    cite_key: &str,
+    pdf_url: &str,
+) -> Result<(String, i64, bool), String> {
+    let filename = doi::sanitize_filename(cite_key)?;
+    let dir = Path::new("pdfs");
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("failed to create '{}': {e}", dir.display()))?;
+
+    let (target, already_present) = pdf_target(conn, cite_key, dir, &filename, "pdf", None)?;
+
+    if !already_present {
+        let bytes =
+            doi::download_pdf(pdf_url).map_err(|e| format!("failed to download PDF: {e}"))?;
+        // create_new claims the name atomically, the same rule copy_into_library
+        // follows: two downloads racing on one cite_key both saw a free name,
+        // and one silently overwrote the other.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(format!(
+                    "'{}' appeared while downloading; run the command again",
+                    target.display()
+                ));
+            }
+            Err(e) => return Err(format!("failed to create '{}': {e}", target.display())),
+        }
+        if let Err(e) = std::fs::write(&target, &bytes) {
+            let _ = std::fs::remove_file(&target);
+            return Err(format!("failed to save PDF to '{}': {e}", target.display()));
+        }
+    }
+
+    let abs = target
+        .canonicalize()
+        .map_err(|e| format!("failed to resolve saved PDF path '{}': {e}", target.display()))?;
+    let path_str = abs
+        .to_str()
+        .ok_or_else(|| format!("path {} is not valid UTF-8", abs.display()))?
+        .to_string();
+
+    let (attachment_id, _changed) = db::attach(conn, cite_key, &path_str).map_err(|e| {
+        // Don't leave a PDF on disk that nothing in the library points at.
+        // Only remove what this run downloaded.
+        if !already_present {
+            let _ = std::fs::remove_file(&target);
+        }
+        entry_error(cite_key, "attach downloaded PDF", e)
+    })?;
+
+    Ok((path_str, attachment_id, already_present))
 }
 
 // Picks where a PDF goes under ./pdfs/, and says whether the file is already
