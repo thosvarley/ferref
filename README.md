@@ -1,14 +1,9 @@
 # ferref
 
-A command-line reference manager that keeps your library in a plain SQLite file
-and gets out of the way.
+A command-line/TUI reference manager 
 
-The premise: the main consumer of a reference library increasingly isn't a
-person reading it — it's a script, a model, an embedding pipeline. So ferref
-stores everything in a file anyone can open with `sqlite3`, prints `--json` from
-every command that emits data, and pulls full text out of PDFs into a queryable
-column. It does not do the AI work itself. It hands over clean structured data
-and stops.
+The premise: a reference manager that can be useful for an AI agent as well as a human being - for a local RAG system in air-gapped systems, fine-tuning on pre-selected scientific literature, or compiling bibliographies. 
+There is no GUI, instead everything is done in the command line for easy script-based interfacing. There is a TUI for human users that aims to mimic the experience of Zotero, but using keystrokes inspired by Vim-motions for everything. 
 
 See `DESIGN.md` for the reasoning, the phase plan, and a frank list of known
 limitations.
@@ -27,9 +22,8 @@ cargo build --release
 ./target/release/ferref --help
 ```
 
-The database is `./ferref.db` in whatever directory you run from. That's
-deliberate — a library is a folder you `cd` into, like a git repo. It also means
-running ferref somewhere else gives you a different, empty library.
+The database is `./ferref.db` in whatever directory you run from. 
+Currently, running ferref somewhere else gives you a different, empty library - this will eventually change to a standardized library stored in a dedicated director in ~/.ferref 
 
 ## Tutorial
 
