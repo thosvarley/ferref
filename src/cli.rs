@@ -150,8 +150,9 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Record a file path against an entry. The file is not copied or moved;
-    /// only its path is stored.
+    /// Attach a file to an entry. The file is copied into ./pdfs/ under the
+    /// same <cite_key>.pdf naming scheme `fetch` uses, and that copy's path is
+    /// what gets stored; the original is left where it is.
     Attach {
         cite_key: String,
         path: PathBuf,
@@ -216,9 +217,10 @@ pub enum Command {
         command: CollectionCommand,
     },
     /// Browse the library in a three-pane terminal UI (collections, entries,
-    /// details). Read-only -- there is no --json here because it isn't a
-    /// data-printing command, it's an interactive screen; the CLI remains
-    /// the only way to change a library.
+    /// details). Sorts, searches, creates collections and files papers into
+    /// them; editing, deleting and tagging stay CLI-only. There is no --json
+    /// here because it isn't a data-printing command, it's an interactive
+    /// screen.
     Tui,
 }
 

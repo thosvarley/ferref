@@ -37,19 +37,19 @@ Essential features that should be present at the end:
 - Some kind of intuitive directory structure where PDFs are stored. 
 - A field to link authors to ORCID IDs if available. 
 
-## Current state (2026-08-21)
+## Current state (2026-08-24)
 
-All eleven phases are complete.
+All twelve phases are complete.
 
 - `src/models.rs` — `Entry`/`Author` + `now()`. `Serialize` derived; `abstract_text` serializes as `"abstract"` (Rust reserves `abstract`), locked by a test.
-- `src/db.rs` — schema + `insert_entry`/`get_entry`/`list_entries`/`update_entry`/`delete_entry`, all free functions over `&Connection`. `update_entry` stamps `date_modified` itself so callers can't forget. `list_entries` takes a `Filter`; an all-`None` filter matches everything, so `list` and `search` are one query. `add_tag`/`remove_tag` are idempotent and report whether anything changed; `normalize_tag` (trim + lowercase) is the single point both writes and the `tag` filter go through. `attach` stores a path, never a copy of the file.
+- `src/db.rs` — schema + `insert_entry`/`get_entry`/`list_entries`/`update_entry`/`delete_entry`, all free functions over `&Connection`. `update_entry` stamps `date_modified` itself so callers can't forget. `list_entries` takes a `Filter`; an all-`None` filter matches everything, so `list` and `search` are one query. `add_tag`/`remove_tag` are idempotent and report whether anything changed; `normalize_tag` (trim + lowercase) is the single point both writes and the `tag` filter go through. `attach` copies the file into `./pdfs/` under the same `<cite_key>.<ext>` scheme `fetch` uses, and stores the copy's path, so a library is one directory of papers. The name is claimed with `O_EXCL`, not by checking whether it exists first — two concurrent attaches to one cite_key otherwise lose a file 23% of the time, each reporting success.
 - `src/bibtex.rs` — `import`/`export` over the `biblatex` crate, plus the `biblatex::Entry` ↔ `models::Entry` mapping.
 - `src/text.rs` — `extract_text` over `pdftotext`. The project's trust boundary: bounded memory (the drain keeps the first 10MB and discards the rest rather than buffering it all), a 30s deadline covering *both* the child wait and the pipe drain, and a process-group kill so a wrapper script's descendants can't outlive us.
 - `src/doi.rs` — Crossref metadata + Unpaywall OA lookup over `ureq`. The network trust boundary: every request goes through `fetch_guarded`, which follows redirects by hand so each hop's scheme and resolved IP are revalidated, with capped reads and a `%PDF` magic-byte check before anything is written.
 - `src/config.rs` — reads one key (`email`) from `~/.config/ferref/config.toml`. Deliberately a line reader, not TOML, and not a settings system.
 - `src/cite.rs` — APA and MLA as string templates. Not a CSL engine, on purpose.
 - Collections (Phase 10) nest; tags (Phase 5) don't. A tag describes a paper, a collection is where it lives. `collection_tree` is the single traversal, and it terminates on a cyclic `parent_id` graph because the DB is hand-editable by design.
-- `src/tui.rs` — read-only three-pane TUI over ratatui. Blocking `event::read()`, DB queried only on state change, and `Filter` addressed by collection **id** rather than path.
+- `src/tui.rs` — three-pane TUI over ratatui. Blocking `event::read()`, DB queried only on state change, and `Filter` addressed by collection **id** rather than path. Sorts, filters, creates collections and files papers into them (Phase 12); everything else is still CLI-only.
 - `src/cli.rs` — clap derive types for `add`/`list`/`show`/`edit`/`rm`/`search`/`import`/`export`, plus `parse_author`.
 - `src/main.rs` — thin dispatcher. All stdout goes through `emit()`, which exits 0 on a closed pipe instead of panicking. Failures exit non-zero with the message on stderr.
 
@@ -68,8 +68,10 @@ All eleven phases are complete.
 - There is no `detach`, and no way to edit an attachment's path. Since `attach`
   rejects a path that doesn't resolve, the usual cause (a typo) is caught up
   front; a moved file still needs `rm` + re-add.
-- Attachment paths are absolute and stored at attach time. Moving the file, or
-  the library, breaks them silently — nothing revalidates them.
+- Attachment paths are absolute and stored at attach time. `attach` and `fetch`
+  both copy into `./pdfs/`, so the files travel with the library — but the
+  stored paths don't, and moving the library directory breaks every one of them
+  silently. Nothing revalidates them.
 - `cite` covers APA and MLA only, and doesn't recase titles, handle 21+ author
   APA truncation, or do ordinals. That's the documented ceiling: a third style
   or real edge-case correctness means adopting `hayagriva`, not extending
@@ -369,6 +371,52 @@ the standard choice with crossterm as its backend. No async runtime.
 
 Read-only in this phase: no editing, no deletion. The CLI remains the way to
 change anything, so the TUI can't corrupt a library through a mis-keypress.
+(Phase 12 opens exactly two of those doors — filing papers and creating
+collections — and no others.)
+
+---
+
+## Phase 12 — TUI: sorting, search, and collection editing
+
+Phase 11's TUI reads. This one lets it write, in the three places a reference
+manager is actually used: finding a paper, ordering a list, and filing papers
+into collections. Everything else stays CLI-only.
+
+- **Sorting** — `s` cycles the sort column (title / first author / year /
+  journal), `S` reverses. In memory over the already-loaded entries; the sort
+  is not persisted, and no SQL changes.
+- **Search box** — `/` opens a one-line input; typing filters the entry table
+  live on a case-insensitive substring across title, authors, journal, year,
+  cite_key, and tags. `Esc` clears it. In memory again — the collection's
+  entries are already loaded, and an instant filter beats a round trip.
+- **New collections** — `n` in the collections pane prompts for a name and
+  creates a child of the selected collection; with "All Papers" selected that
+  means a new root collection. One key covers "New Collection" and "New
+  Subcollection" because the selection already says which is meant.
+- **Assigning papers** — `c` in the entry table opens a collection picker over
+  the same tree; `Enter` toggles the selected paper's membership, showing
+  `[x]`/`[ ]` per collection. Toggle, not add-only: unfiling is the same
+  gesture as filing.
+- **Vim keys** — `j`/`k` move, `g`/`G` jump to top/bottom, `Ctrl-d`/`Ctrl-u`
+  half-page, `h`/`l` fold and unfold in the tree and move between panes
+  elsewhere. Arrows and `Tab` keep working.
+- **`o`** opens the selected paper's attachments through the same system opener
+  `ferref open` uses, with the child's output discarded so it can't scribble
+  over the screen.
+
+Sorting and filtering mean the table's row index is no longer an index into
+`entries`. A `view: Vec<usize>` of indices into `entries` is the whole change:
+filter, then sort, then index through it.
+
+Writes go through the existing `db` functions, and by **id** rather than path —
+the tree already holds ids, and a collection whose name contains `/` has no
+addressable path (a known limitation from Phase 10). The path-based
+`add_to_collection`/`create_collection` grow id-based cores that the existing
+path-based functions then call, so there's one implementation of each write.
+
+Still not in the TUI: editing entry fields, deleting entries or collections,
+tagging, renaming. Those stay CLI-only. The line is that the TUI can file and
+find papers, but cannot destroy data.
 
 ---
 
@@ -382,7 +430,7 @@ change anything, so the TUI can't corrupt a library through a mis-keypress.
 
 ## Order of work
 
-Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
+Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
 
 ---
 
@@ -404,6 +452,7 @@ Which phases get farmed out to a `coder` subagent, and which get an
 | 9 — Citations | no | no | String templates over fields that already exist. Trivially testable. |
 | 10 — Collections | yes | no | Schema + subcommands, like tags. One real trap (cycles), specified in the brief and tested. |
 | 11 — TUI | yes | **yes** | New dep, terminal state that must be restored on panic, and a render loop that must not hang on malformed data. |
+| 12 — TUI writes | yes | **yes** | Big mechanical grind (modes, key table, picker, sort/filter view), and the first phase where a keypress mutates the database. |
 
 The table is a default, not a rule. The reasoning behind it, which outlives the
 table if the phases change:

@@ -460,35 +460,45 @@ pub fn collection_by_path(conn: &Connection, path: &str) -> Result<Option<i64>> 
     Ok(current)
 }
 
+// One segment of create_collection's mkdir -p loop, and the core the TUI
+// calls directly with a parent id (never a rebuilt path -- see the module
+// comment on why a slash-named collection has none). Looks the name up
+// case-insensitively among siblings of `parent` before inserting, which is
+// what makes sibling names unique without relying on a DB constraint (see
+// the schema comment on `collections`).
+pub fn create_collection_under(conn: &Connection, parent: Option<i64>, name: &str) -> Result<i64> {
+    let seg = validate_collection_name(name).map_err(rusqlite::Error::InvalidParameterName)?;
+
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM collections WHERE lower(name) = lower(?1) AND parent_id IS ?2",
+            rusqlite::params![seg, parent],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match existing {
+        Some(id) => Ok(id),
+        None => {
+            conn.execute(
+                "INSERT INTO collections (name, parent_id) VALUES (?1, ?2)",
+                rusqlite::params![seg, parent],
+            )?;
+            Ok(conn.last_insert_rowid())
+        }
+    }
+}
+
 // Creates intermediate collections as needed (mkdir -p semantics) and
 // returns the leaf id. Re-running with the same path is a no-op that returns
-// the existing leaf rather than duplicating it -- each segment is looked up
-// case-insensitively among its siblings before an insert is attempted, which
-// is also what makes sibling names unique without relying on a DB
-// constraint (see the schema comment on `collections`).
+// the existing leaf rather than duplicating it -- each segment goes through
+// create_collection_under, which handles the case-insensitive sibling lookup.
 pub fn create_collection(conn: &Connection, path: &str) -> Result<i64> {
     let segments = split_path(path).map_err(rusqlite::Error::InvalidParameterName)?;
 
     let mut id = 0i64;
     let mut parent: Option<i64> = None;
     for seg in &segments {
-        let existing: Option<i64> = conn
-            .query_row(
-                "SELECT id FROM collections WHERE lower(name) = lower(?1) AND parent_id IS ?2",
-                rusqlite::params![seg, parent],
-                |row| row.get(0),
-            )
-            .optional()?;
-        id = match existing {
-            Some(existing_id) => existing_id,
-            None => {
-                conn.execute(
-                    "INSERT INTO collections (name, parent_id) VALUES (?1, ?2)",
-                    rusqlite::params![seg, parent],
-                )?;
-                conn.last_insert_rowid()
-            }
-        };
+        id = create_collection_under(conn, parent, seg)?;
         parent = Some(id);
     }
     Ok(id)
@@ -515,10 +525,30 @@ pub fn all_collections(conn: &Connection) -> Result<Vec<Collection>> {
     .collect::<Result<Vec<Collection>>>()
 }
 
-// Idempotent, same shape as add_tag: returns whether membership actually
-// changed. Unknown cite_key -> Err(QueryReturnedNoRows), same as add_tag.
-// Unknown collection path -> Err(InvalidParameterName) with a message
-// naming the path, so it isn't confused with the cite_key error upstream.
+// Idempotent: returns whether membership actually changed. The id-based
+// core the TUI calls directly (it already holds the collection id from the
+// tree, never a path).
+pub fn add_entry_to_collection(conn: &Connection, collection_id: i64, entry_id: i64) -> Result<bool> {
+    conn.execute(
+        "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id) VALUES (?1, ?2)",
+        rusqlite::params![collection_id, entry_id],
+    )?;
+    Ok(conn.changes() > 0)
+}
+
+// Idempotent: Ok(false) if the entry wasn't in the collection.
+pub fn remove_entry_from_collection(conn: &Connection, collection_id: i64, entry_id: i64) -> Result<bool> {
+    conn.execute(
+        "DELETE FROM collection_entries WHERE collection_id = ?1 AND entry_id = ?2",
+        rusqlite::params![collection_id, entry_id],
+    )?;
+    Ok(conn.changes() > 0)
+}
+
+// Same shape as add_tag: returns whether membership actually changed.
+// Unknown cite_key -> Err(QueryReturnedNoRows), same as add_tag. Unknown
+// collection path -> Err(InvalidParameterName) with a message naming the
+// path, so it isn't confused with the cite_key error upstream.
 pub fn add_to_collection(conn: &Connection, path: &str, cite_key: &str) -> Result<bool> {
     let entry_id: i64 = conn.query_row(
         "SELECT id FROM entries WHERE cite_key = ?1",
@@ -528,16 +558,10 @@ pub fn add_to_collection(conn: &Connection, path: &str, cite_key: &str) -> Resul
     let collection_id = collection_by_path(conn, path)?.ok_or_else(|| {
         rusqlite::Error::InvalidParameterName(format!("no collection found at path '{path}'"))
     })?;
-
-    conn.execute(
-        "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id) VALUES (?1, ?2)",
-        rusqlite::params![collection_id, entry_id],
-    )?;
-    Ok(conn.changes() > 0)
+    add_entry_to_collection(conn, collection_id, entry_id)
 }
 
-// Idempotent: Ok(false) if the entry wasn't in the collection. Same error
-// shape as add_to_collection.
+// Same error shape as add_to_collection.
 pub fn remove_from_collection(conn: &Connection, path: &str, cite_key: &str) -> Result<bool> {
     let entry_id: i64 = conn.query_row(
         "SELECT id FROM entries WHERE cite_key = ?1",
@@ -547,12 +571,16 @@ pub fn remove_from_collection(conn: &Connection, path: &str, cite_key: &str) -> 
     let collection_id = collection_by_path(conn, path)?.ok_or_else(|| {
         rusqlite::Error::InvalidParameterName(format!("no collection found at path '{path}'"))
     })?;
+    remove_entry_from_collection(conn, collection_id, entry_id)
+}
 
-    conn.execute(
-        "DELETE FROM collection_entries WHERE collection_id = ?1 AND entry_id = ?2",
-        rusqlite::params![collection_id, entry_id],
-    )?;
-    Ok(conn.changes() > 0)
+// Ids of every collection an entry is directly filed into (not recursive --
+// membership is a direct row, not inherited from a parent collection).
+pub fn collections_for_entry(conn: &Connection, entry_id: i64) -> Result<Vec<i64>> {
+    let mut stmt =
+        conn.prepare("SELECT collection_id FROM collection_entries WHERE entry_id = ?1")?;
+    stmt.query_map([entry_id], |row| row.get(0))?
+        .collect::<Result<Vec<i64>>>()
 }
 
 // Reparents a collection. Refuses to create a cycle: walks up from the
@@ -1244,6 +1272,38 @@ mod tests {
         let child = create_collection(&conn, "Physics/Entropy").unwrap();
         let child_again = create_collection(&conn, "physics/ENTROPY").unwrap();
         assert_eq!(child, child_again);
+    }
+
+    // The id-based cores the TUI uses directly: child creation under a
+    // parent id is idempotent and case-insensitive (same as the path-based
+    // wrapper), a slash in the name is rejected, and add/remove/lookup
+    // round-trip through collection_entries.
+    #[test]
+    fn id_based_collection_cores_round_trip() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        let parent = create_collection_under(&conn, None, "Physics").unwrap();
+        let child = create_collection_under(&conn, Some(parent), "Entropy").unwrap();
+        let child_again = create_collection_under(&conn, Some(parent), "entropy").unwrap();
+        assert_eq!(child, child_again, "case-insensitive re-creation must reuse the row");
+
+        assert!(create_collection_under(&conn, Some(parent), "Has/Slash").is_err());
+
+        let entry = Entry::new(
+            "article".to_string(),
+            "round2024".to_string(),
+            "Round Trip".to_string(),
+        );
+        let entry_id = insert_entry(&conn, &entry).unwrap();
+
+        assert!(add_entry_to_collection(&conn, child, entry_id).unwrap());
+        assert!(!add_entry_to_collection(&conn, child, entry_id).unwrap(), "already a member");
+        assert_eq!(collections_for_entry(&conn, entry_id).unwrap(), vec![child]);
+
+        assert!(remove_entry_from_collection(&conn, child, entry_id).unwrap());
+        assert!(!remove_entry_from_collection(&conn, child, entry_id).unwrap(), "already removed");
+        assert!(collections_for_entry(&conn, entry_id).unwrap().is_empty());
     }
 
     #[test]

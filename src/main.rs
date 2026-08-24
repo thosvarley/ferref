@@ -308,13 +308,26 @@ fn main() {
             extract,
             json,
         } => {
-            let resolved = match cli::resolve_attachment_path(&path) {
+            let source = match cli::resolve_attachment_path(&path) {
                 Ok(p) => p,
                 Err(e) => die(&e),
             };
+            let (resolved, copied) =
+                match copy_into_library(&conn, &cite_key, Path::new(&source)) {
+                    Ok(pair) => pair,
+                    Err(e) => die(&e),
+                };
             let (attachment_id, changed) = match db::attach(&conn, &cite_key, &resolved) {
                 Ok(pair) => pair,
-                Err(e) => die(&entry_error(&cite_key, "attach file", e)),
+                Err(e) => {
+                    // Same rule as `fetch`: don't leave a copy in pdfs/ that
+                    // nothing in the library points at. Only remove what this
+                    // run wrote.
+                    if copied {
+                        let _ = std::fs::remove_file(&resolved);
+                    }
+                    die(&entry_error(&cite_key, "attach file", e))
+                }
             };
 
             // Extraction is independent of the attach: the path resolved (it
@@ -333,6 +346,7 @@ fn main() {
                 let mut out = serde_json::json!({
                     "cite_key": cite_key,
                     "path": resolved,
+                    "source": source,
                     "changed": changed,
                 });
                 if let Some(result) = &extraction {
@@ -608,7 +622,7 @@ fn main() {
                 die(&format!("failed to create '{}': {e}", pdf_dir.display()));
             }
             let (target, already_present) =
-                match pdf_target(&conn, &cite_key, pdf_dir, &filename) {
+                match pdf_target(&conn, &cite_key, pdf_dir, &filename, "pdf", None) {
                     Ok(t) => t,
                     Err(e) => die(&e),
                 };
@@ -894,14 +908,31 @@ fn open_path(path: &str) -> Result<(), String> {
         "xdg-open"
     };
 
-    match std::process::Command::new(opener).arg(path).status() {
+    // Detach all three streams from ours. stdout/stderr because xdg-open et
+    // al. chatter on a headless system and inherited stdio scribbles over
+    // the caller's terminal (the TUI screen, in particular).
+    //
+    // stdin because this blocks on the child: an opener that finds no
+    // handler and drops to a prompt would otherwise sit reading the real
+    // terminal, swallowing every keystroke meant for the TUI -- including
+    // Ctrl-C, which raw mode delivers as a byte rather than a signal. That
+    // is an unrecoverable freeze from inside the session. With stdin at
+    // /dev/null the prompt reads EOF and the child gives up immediately.
+    match std::process::Command::new(opener)
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => Err(format!("{opener} failed on '{path}' ({status})")),
         Err(e) => Err(format!("could not run {opener}: {e}")),
     }
 }
 
-// Picks where a fetched PDF goes, and says whether the file is already there.
+// Picks where a PDF goes under ./pdfs/, and says whether the file is already
+// there.
 //
 // `doi::sanitize_filename` is many-to-one -- "a/b" and a literal "a_b" both
 // become "a_b" -- and on a case-insensitive filesystem "Smith2020" and
@@ -914,18 +945,37 @@ fn pdf_target(
     cite_key: &str,
     dir: &Path,
     base: &str,
+    ext: &str,
+    source: Option<&Path>,
 ) -> Result<(std::path::PathBuf, bool), String> {
     let mine: Vec<String> = db::attachments_for_cite_key(conn, cite_key)
-        .map_err(|e| format!("failed to list attachments for '{cite_key}': {e}"))?
+        // An unknown cite_key surfaces here first, before anything is written
+        // to disk, so it has to read as "no such entry" and not as a lookup
+        // failure.
+        .map_err(|e| entry_error(cite_key, &format!("list attachments for '{cite_key}'"), e))?
         .into_iter()
         .map(|(_, path)| path)
         .collect();
+    pick_target(dir, base, ext, &mine, source)
+}
 
+// The filename choice on its own, so it can be tested without a database.
+// `source` is the file about to be copied in, if any: `fetch` re-downloads one
+// fixed URL per entry, so any file of this entry's already sitting at the name
+// is that same PDF, but `attach` can be handed a second, different file for
+// the same entry -- reusing the name there would silently drop it.
+fn pick_target(
+    dir: &Path,
+    base: &str,
+    ext: &str,
+    mine: &[String],
+    source: Option<&Path>,
+) -> Result<(std::path::PathBuf, bool), String> {
     for n in 1..=50 {
         let candidate = if n == 1 {
-            dir.join(format!("{base}.pdf"))
+            dir.join(format!("{base}.{ext}"))
         } else {
-            dir.join(format!("{base}-{n}.pdf"))
+            dir.join(format!("{base}-{n}.{ext}"))
         };
 
         if !candidate.exists() {
@@ -936,7 +986,7 @@ fn pdf_target(
             .ok()
             .and_then(|abs| abs.to_str().map(str::to_string))
             .is_some_and(|abs| mine.contains(&abs));
-        if is_mine {
+        if is_mine && source.is_none_or(|src| same_contents(src, &candidate)) {
             return Ok((candidate, true));
         }
     }
@@ -945,6 +995,95 @@ fn pdf_target(
         "could not find a free filename for '{base}' in {}",
         dir.display()
     ))
+}
+
+// Length first, so the common "different paper" case never reads either file.
+// Unreadable either side counts as different, which costs at worst a redundant
+// copy under a new name.
+fn same_contents(a: &Path, b: &Path) -> bool {
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(ma), Ok(mb)) if ma.len() == mb.len() => {
+            matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
+        }
+        _ => false,
+    }
+}
+
+// `attach` copies the file into ./pdfs/ under the same <cite_key>.<ext> scheme
+// `fetch` uses, so a library is one directory of papers rather than a set of
+// pointers into wherever each file happened to be downloaded. The original is
+// left where it is -- this is a copy, not a move. Returns the stored path and
+// whether a new file was actually written.
+fn copy_into_library(
+    conn: &rusqlite::Connection,
+    cite_key: &str,
+    source: &Path,
+) -> Result<(String, bool), String> {
+    let base = doi::sanitize_filename(cite_key)?;
+    // Anything unusual becomes "pdf": the extension lands in a filename, and a
+    // library of papers is overwhelmingly PDFs anyway.
+    let ext = source
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()))
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_else(|| "pdf".to_string());
+
+    let dir = Path::new("pdfs");
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("failed to create '{}': {e}", dir.display()))?;
+
+    // Choosing the name and writing it has to be one indivisible step.
+    // `pick_target` decides a name is free by looking, and two attaches racing
+    // on the same cite_key both look before either writes: measured at 14 of 60
+    // concurrent pairs losing a file outright, each process reporting success.
+    // O_EXCL (create_new) makes the claim atomic, so a loser sees the name
+    // taken and moves to the next one instead of overwriting.
+    for _ in 0..8 {
+        let (target, already_there) =
+            pdf_target(conn, cite_key, dir, &base, &ext, Some(source))?;
+        if already_there {
+            return stored_path(&target, false);
+        }
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+        {
+            Ok(_) => {
+                if let Err(e) = std::fs::copy(source, &target) {
+                    // Don't let a failed copy leave an empty file squatting
+                    // on the name forever.
+                    let _ = std::fs::remove_file(&target);
+                    return Err(format!(
+                        "failed to copy '{}' to '{}': {e}",
+                        source.display(),
+                        target.display()
+                    ));
+                }
+                return stored_path(&target, true);
+            }
+            // Someone claimed it between the look and the open: go round again
+            // and pick the next free name.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("failed to create '{}': {e}", target.display())),
+        }
+    }
+
+    Err(format!(
+        "gave up claiming a filename for '{cite_key}' in {} -- too many attaches at once",
+        dir.display()
+    ))
+}
+
+fn stored_path(target: &Path, copied: bool) -> Result<(String, bool), String> {
+    let abs = target
+        .canonicalize()
+        .map_err(|e| format!("failed to resolve '{}': {e}", target.display()))?;
+    abs.to_str()
+        .map(str::to_string)
+        .map(|s| (s, copied))
+        .ok_or_else(|| format!("path {} is not valid UTF-8", abs.display()))
 }
 
 // --collection takes a path; Filter takes a resolved id. An unresolvable path
@@ -1076,4 +1215,51 @@ fn format_list_line(entry: &Entry) -> String {
         entry.title,
         format_authors(&entry.authors)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The reuse rule: a name is only "already there" when the file at it
+    // belongs to this entry AND matches what's being copied in. Getting this
+    // wrong drops the second file a user attaches to one entry.
+    #[test]
+    fn pick_target_only_reuses_an_identical_file_of_ours() {
+        let dir = std::env::temp_dir().join("ferref-pick-target-test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let paper = dir.join("paper.pdf");
+        std::fs::write(&paper, b"paper bytes").unwrap();
+
+        // Nothing at the name yet: take it, nothing is present.
+        let (target, present) = pick_target(&dir, "smith2024", "pdf", &[], Some(&paper)).unwrap();
+        assert_eq!(target, dir.join("smith2024.pdf"));
+        assert!(!present);
+
+        std::fs::copy(&paper, &target).unwrap();
+        let mine = vec![target.canonicalize().unwrap().to_str().unwrap().to_string()];
+
+        // Same file again: reuse the copy already in place.
+        let (again, present) =
+            pick_target(&dir, "smith2024", "pdf", &mine, Some(&paper)).unwrap();
+        assert_eq!(again, target);
+        assert!(present);
+
+        // A different file for the same entry must not land on that name.
+        let supplement = dir.join("supplement.pdf");
+        std::fs::write(&supplement, b"supplement bytes").unwrap();
+        let (next, present) =
+            pick_target(&dir, "smith2024", "pdf", &mine, Some(&supplement)).unwrap();
+        assert_eq!(next, dir.join("smith2024-2.pdf"));
+        assert!(!present);
+
+        // Someone else's file at our name is skipped, source or not.
+        let (skipped, present) = pick_target(&dir, "smith2024", "pdf", &[], None).unwrap();
+        assert_eq!(skipped, dir.join("smith2024-2.pdf"));
+        assert!(!present);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

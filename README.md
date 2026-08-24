@@ -150,16 +150,23 @@ No matches prints nothing and exits 0 — it's a query, not a test.
 
 ### 6. Attach a PDF you already have
 
-ferref records the **path**, and never copies or moves your file. The path is
-resolved to an absolute one, so it survives you `cd`-ing elsewhere.
+ferref copies the file into `./pdfs/`, named after the cite_key — the same
+scheme `fetch` uses — and stores that copy's absolute path. Your original is
+left where it is. The point is that every paper in a library sits in one
+directory, whether it arrived by hand or over the network, so backing the whole
+thing up is `pdfs/` plus one `.db` file.
 
 ```console
 $ ferref attach shannon1948 ~/Downloads/shannon1948.pdf --extract
-Attached '/home/you/Downloads/shannon1948.pdf' to 'shannon1948'
-Extracted 148204 characters from '/home/you/Downloads/shannon1948.pdf'
+Attached '/home/you/papers/pdfs/shannon1948.pdf' to 'shannon1948'
+Extracted 148204 characters from '/home/you/papers/pdfs/shannon1948.pdf'
 ```
 
 (The character count is whatever's in your PDF.)
+
+Attaching the same file twice is a no-op. Attaching a *second*, different file
+to the same entry — a paper and its supplement — gets `shannon1948-2.pdf`
+rather than overwriting the first.
 
 `--extract` runs `pdftotext` and stores the result. Without it, use
 `ferref extract shannon1948` later. `ferref open shannon1948` opens the
@@ -247,28 +254,40 @@ ferref import someone-elses.bib      # duplicate cite keys are skipped, not fata
 middle, details for the highlighted entry on the right.
 
 ```
-┌─────────────┬────────────────────────────────┬──────────────┐
+┌─────────────┬─ENTRIES [year ↓]───────────────┬──────────────┐
 │ COLLECTIONS │ Title        Authors  Year Jrnl │ DETAILS      │
 │ ▾ All (12)  │ Array progr… Harris  2020 Natu │ Jaynes, E.T. │
 │   ▾ Physics │ Information… Jaynes  1957 Phys │ Phys Rev 106 │
 │     Entropy │ A Mathemati… Shannon 1948 Bell │ #entropy     │
 └─────────────┴────────────────────────────────┴──────────────┘
- Tab pane · ↑↓ move · ←→ fold · r reload · q quit
+ Tab pane · jk move · / search · s sort · n new · c file · o open · q quit
 ```
+
+It navigates like vim, and like arrows — both work everywhere.
 
 | Key | Does |
 | --- | --- |
 | `Tab` / `Shift-Tab` | Cycle focus between panes |
-| `↑` `↓` or `k` `j` | Move the selection |
-| `←` `→` or `h` `l` | Collapse / expand a collection |
-| `PgUp` `PgDn` `Home` `End` | Page through the entry table |
+| `j` `k` or `↑` `↓` | Move the selection |
+| `g` / `G` | Jump to top / bottom |
+| `Ctrl-d` / `Ctrl-u` | Half a page down / up |
+| `h` `l` or `←` `→` | Collapse / expand a collection; elsewhere, move a pane left or right |
+| `s` / `S` | Cycle the sort column (title → author → year → journal) / reverse it |
+| `/` | Search — filters the table live as you type, over titles, authors, journal, year, cite_key and tags |
+| `n` | New collection, as a child of the highlighted one (or at the root, under "All Papers") |
+| `c` | File the highlighted paper into a collection — `Enter` toggles, so it unfiles too |
+| `o` | Open the highlighted paper's attachments in your viewer |
 | `r` | Reload from the database |
-| `q`, `Esc`, `Ctrl-C` | Quit |
+| `q`, `Esc`, `Ctrl-C` | Quit — `Esc` clears an active search first |
 
 Selecting a collection filters the middle pane recursively, so a parent shows
-everything beneath it. **The TUI is read-only** — the CLI remains the only way
-to change a library, so a mis-keypress can't damage one. Press `r` to pick up
-changes made from another shell.
+everything beneath it. Sorting and searching happen in memory over what's
+already loaded, so they're instant and they don't touch the database.
+
+**What the TUI can change:** it files papers into collections and creates
+collections. That's it. Editing entries, deleting anything, and tagging stay
+CLI-only, so a mis-keypress can misfile a paper but can't destroy data. Press
+`r` to pick up changes made from another shell.
 
 ## Command reference
 
@@ -281,7 +300,7 @@ changes made from another shell.
 | `rm <key>` | Delete an entry (cascades to authors, tags, attachments) |
 | `search` | `--author --title --year --from --to --tag --collection --recursive --full-text` |
 | `tag` / `untag <key> <tag>` | Add/remove a tag (flat, describes a paper). Idempotent |
-| `attach <key> <path>` | Record a file path. `--extract` to pull text immediately |
+| `attach <key> <path>` | Copy a file into `pdfs/` and attach it. `--extract` to pull text immediately |
 | `extract <key>` | (Re)extract text for all of an entry's attachments |
 | `open <key>` | Open attachments in the system viewer |
 | `fetch <key>` | Find and download an open-access PDF for the entry's DOI |
@@ -291,7 +310,7 @@ changes made from another shell.
 | `collection add` / `rm` | Add or remove an entry's membership. Idempotent |
 | `collection mv <path>` | Reparent a subtree: `--parent <path>` or `--root` |
 | `collection delete <path>` | Delete a subtree; entries are never deleted |
-| `tui` | Three-pane terminal browser (read-only) |
+| `tui` | Three-pane terminal browser: sort, search, file papers into collections |
 | `import <path>` | Read a `.bib` file |
 | `export` | Write BibTeX to stdout, or `--out file.bib` |
 
@@ -385,8 +404,9 @@ identifiers — key your own tools against those.
 
 - The database is always `./ferref.db`, relative to the current directory.
 - `edit` can't clear a field back to null, and there's no `detach`.
-- Attachment paths are absolute and stored once; moving a file breaks the link
-  silently.
+- Attachment paths are absolute and stored once. The files live in `pdfs/`, but
+  the paths don't move with the library — relocating the directory breaks every
+  link silently.
 - BibTeX export collapses non-legacy entry types (`@online`, `@dataset`) to
   `@misc`, and tags don't survive a round trip.
 - `cite` covers APA and MLA only, and doesn't recase titles or handle APA's
@@ -395,8 +415,10 @@ identifiers — key your own tools against those.
 - A collection whose *name* contains `/` can't be addressed by the CLI's path
   syntax. The CLI won't create one; only hand-editing the database can. The TUI
   reaches collections by id and handles them fine.
-- The TUI is read-only, and doesn't sort or filter beyond the collection tree —
-  use the CLI, then press `r`.
+- The TUI files papers and creates collections, but can't edit or delete
+  anything, rename a collection, or tag — use the CLI, then press `r`.
+- The TUI doesn't watch the database. Changes from another shell appear on `r`,
+  not on their own.
 
 `DESIGN.md` has the full list with the reasoning behind each.
 

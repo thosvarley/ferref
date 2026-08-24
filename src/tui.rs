@@ -1,10 +1,15 @@
-// Read-only terminal UI over the same SQLite file the CLI writes. No
-// editing, deletion, or tagging happens here -- the CLI stays the only way
-// to change a library, so a mis-keypress in the TUI can't corrupt one.
+// Terminal UI over the same SQLite file the CLI writes. It can file papers
+// into collections and create new collections; it cannot edit or delete an
+// entry, delete a collection, rename anything, or tag -- those stay
+// CLI-only, so a mis-keypress here can misfile a paper but can't destroy
+// data.
 //
 // Data is fetched only when state changes (on load, on a collection
-// selection change, or on manual reload) and cached in `App`; the render
-// function (`draw`) never touches the `Connection`.
+// selection change, on a sort/filter edit, or on manual reload) and cached
+// in `App`; the render function (`draw`) never touches the `Connection`.
+// Sorting and filtering happen in memory over the already-loaded entries --
+// `view` holds the indices into `entries` after filter then sort, so
+// neither needs a round trip to SQLite.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -13,7 +18,9 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers
 use ratatui::crossterm::tty::IsTty;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
+};
 use ratatui::Frame;
 use rusqlite::Connection;
 
@@ -61,7 +68,7 @@ fn event_loop(
                 {
                     return Ok(());
                 }
-                handle_key(app, conn, key.code);
+                handle_key(app, conn, key.code, key.modifiers);
                 if app.should_quit {
                     return Ok(());
                 }
@@ -73,15 +80,42 @@ fn event_loop(
     }
 }
 
-fn handle_key(app: &mut App, conn: &Connection, code: KeyCode) {
+// Dispatches on mode FIRST, before any key is interpreted as a command --
+// the one rule that keeps a search query like "query" from also quitting at
+// 'q' or reloading at 'r' along the way.
+fn handle_key(app: &mut App, conn: &Connection, code: KeyCode, modifiers: KeyModifiers) {
+    // An error is shown for exactly one frame: whatever key dismisses it
+    // also clears it, so it can't linger over unrelated activity.
+    app.error = None;
+
+    match app.mode {
+        Mode::Normal => handle_normal_key(app, conn, code, modifiers),
+        Mode::Input(..) => handle_input_key(app, conn, code),
+        Mode::Picker { .. } => handle_picker_key(app, conn, code),
+    }
+}
+
+fn handle_normal_key(app: &mut App, conn: &Connection, code: KeyCode, modifiers: KeyModifiers) {
     match code {
-        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Char('q') => app.should_quit = true,
+        // Esc clears an active filter rather than quitting, so backing out
+        // of a search doesn't also close the app.
+        KeyCode::Esc => {
+            if app.filter.is_empty() {
+                app.should_quit = true;
+            } else {
+                app.filter.clear();
+                app.rebuild_view();
+            }
+        }
         KeyCode::Tab => app.focus = app.focus.next(),
         KeyCode::BackTab => app.focus = app.focus.prev(),
         KeyCode::Char('r') => {
             // A failed reload leaves the previous state in place rather
             // than crashing the session over a transient DB error.
-            let _ = app.reload(conn);
+            if let Err(e) = app.reload(conn) {
+                app.error = Some(e);
+            }
         }
         KeyCode::Up | KeyCode::Char('k') => match app.focus {
             Focus::Collections => app.move_tree(conn, -1),
@@ -93,16 +127,179 @@ fn handle_key(app: &mut App, conn: &Connection, code: KeyCode) {
             Focus::Entries => app.move_table(1),
             Focus::Details => {}
         },
+        KeyCode::Char('d')
+            if modifiers.contains(KeyModifiers::CONTROL) && app.focus == Focus::Entries =>
+        {
+            app.move_table(10);
+        }
+        KeyCode::Char('u')
+            if modifiers.contains(KeyModifiers::CONTROL) && app.focus == Focus::Entries =>
+        {
+            app.move_table(-10);
+        }
+        KeyCode::Char('g') => match app.focus {
+            Focus::Collections => app.tree_top(conn),
+            Focus::Entries => app.table_home(),
+            Focus::Details => {}
+        },
+        KeyCode::Char('G') => match app.focus {
+            Focus::Collections => app.tree_bottom(conn),
+            Focus::Entries => app.table_end(),
+            Focus::Details => {}
+        },
         KeyCode::Left | KeyCode::Char('h') if app.focus == Focus::Collections => {
             app.collapse_or_to_parent(conn)
         }
         KeyCode::Right | KeyCode::Char('l') if app.focus == Focus::Collections => app.expand(),
+        KeyCode::Char('h') if matches!(app.focus, Focus::Entries | Focus::Details) => {
+            app.focus = app.focus.left();
+        }
+        KeyCode::Char('l') if matches!(app.focus, Focus::Entries | Focus::Details) => {
+            app.focus = app.focus.right();
+        }
         KeyCode::PageUp if app.focus == Focus::Entries => app.move_table(-10),
         KeyCode::PageDown if app.focus == Focus::Entries => app.move_table(10),
         KeyCode::Home if app.focus == Focus::Entries => app.table_home(),
         KeyCode::End if app.focus == Focus::Entries => app.table_end(),
+        KeyCode::Char('s') => {
+            app.sort_key = app.sort_key.next();
+            app.rebuild_view();
+        }
+        KeyCode::Char('S') => {
+            app.sort_desc = !app.sort_desc;
+            app.rebuild_view();
+        }
+        KeyCode::Char('/') => {
+            app.mode = Mode::Input(
+                InputKind::Search {
+                    previous: app.filter.clone(),
+                },
+                app.filter.clone(),
+            );
+        }
+        KeyCode::Char('n') if app.focus == Focus::Collections => {
+            app.mode = Mode::Input(InputKind::NewCollection, String::new());
+        }
+        KeyCode::Char('c') if app.focus == Focus::Entries => app.open_picker(conn),
+        KeyCode::Char('o') if matches!(app.focus, Focus::Entries | Focus::Details) => {
+            app.open_selected();
+        }
         _ => {}
     }
+}
+
+// Owns the buffer for the duration of the key: mem::replace pulls it out of
+// `app.mode` so the match arms below can freely call back into `app`
+// (reload, rebuild_view) without fighting the borrow checker over a field
+// that's simultaneously borrowed and being written back to.
+fn handle_input_key(app: &mut App, conn: &Connection, code: KeyCode) {
+    let mode = std::mem::replace(&mut app.mode, Mode::Normal);
+    let (kind, mut buffer) = match mode {
+        Mode::Input(kind, buffer) => (kind, buffer),
+        other => {
+            app.mode = other;
+            return;
+        }
+    };
+
+    match code {
+        KeyCode::Char(c) => {
+            buffer.push(c);
+            if matches!(kind, InputKind::Search { .. }) {
+                app.filter = buffer.clone();
+                app.rebuild_view();
+            }
+            app.mode = Mode::Input(kind, buffer);
+        }
+        KeyCode::Backspace => {
+            buffer.pop();
+            if matches!(kind, InputKind::Search { .. }) {
+                app.filter = buffer.clone();
+                app.rebuild_view();
+            }
+            app.mode = Mode::Input(kind, buffer);
+        }
+        KeyCode::Enter => {
+            if let InputKind::NewCollection = kind {
+                let name = buffer.trim().to_string();
+                if !name.is_empty() {
+                    let parent = app.rows[app.selected_row].id;
+                    app.create_collection(conn, parent, &name);
+                }
+            }
+            // Search: the filter was already applied live as it was typed.
+            app.mode = Mode::Normal;
+        }
+        KeyCode::Esc => {
+            if let InputKind::Search { previous } = &kind {
+                app.filter = previous.clone();
+                app.rebuild_view();
+            }
+            app.mode = Mode::Normal;
+        }
+        _ => {
+            app.mode = Mode::Input(kind, buffer);
+        }
+    }
+}
+
+// Same ownership move as handle_input_key, and for the same reason: a
+// toggle needs to call back into `app` (reload_tree_counts) while updating
+// the picker's own state.
+fn handle_picker_key(app: &mut App, conn: &Connection, code: KeyCode) {
+    let mode = std::mem::replace(&mut app.mode, Mode::Normal);
+    let Mode::Picker {
+        rows,
+        mut selected,
+        mut member,
+        entry_id,
+    } = mode
+    else {
+        app.mode = mode;
+        return;
+    };
+
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => return, // app.mode is already Normal
+        KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => {
+            if selected + 1 < rows.len() {
+                selected += 1;
+            }
+        }
+        KeyCode::Enter => {
+            let (_, collection_id, _) = rows[selected];
+            let is_member = member.contains(&collection_id);
+            let result = if is_member {
+                db::remove_entry_from_collection(conn, collection_id, entry_id)
+            } else {
+                db::add_entry_to_collection(conn, collection_id, entry_id)
+            };
+            match result {
+                Ok(_) => {
+                    if is_member {
+                        member.remove(&collection_id);
+                    } else {
+                        member.insert(collection_id);
+                    }
+                    // Membership changed a collection's entry_count; the
+                    // tree pane's counts need to catch up.
+                    if let Err(e) = app.reload_tree_counts(conn) {
+                        app.error = Some(e);
+                    }
+                }
+                Err(e) => app.error = Some(e.to_string()),
+            }
+        }
+        _ => {}
+    }
+
+    app.mode = Mode::Picker {
+        rows,
+        selected,
+        member,
+        entry_id,
+    };
 }
 
 // ---------------------------------------------------------------------
@@ -131,6 +328,73 @@ impl Focus {
             Focus::Details => Focus::Entries,
         }
     }
+    // Bounded, not cyclic: h/l in Entries/Details reads as "move to the
+    // pane in that physical direction", and there's no pane to the right
+    // of Details or to the left of Collections to wrap to.
+    fn left(self) -> Self {
+        match self {
+            Focus::Collections => Focus::Collections,
+            Focus::Entries => Focus::Collections,
+            Focus::Details => Focus::Entries,
+        }
+    }
+    fn right(self) -> Self {
+        match self {
+            Focus::Collections => Focus::Entries,
+            Focus::Entries => Focus::Details,
+            Focus::Details => Focus::Details,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SortKey {
+    Title,
+    Author,
+    Year,
+    Journal,
+}
+
+impl SortKey {
+    fn next(self) -> Self {
+        match self {
+            SortKey::Title => SortKey::Author,
+            SortKey::Author => SortKey::Year,
+            SortKey::Year => SortKey::Journal,
+            SortKey::Journal => SortKey::Title,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            SortKey::Title => "title",
+            SortKey::Author => "author",
+            SortKey::Year => "year",
+            SortKey::Journal => "journal",
+        }
+    }
+}
+
+// Normal mode is the only one where a keystroke is a command; the other two
+// modes eat every printable character into a buffer (see the module-level
+// "TRAP" note in DESIGN.md's Phase 12 section -- typing "query" must not
+// also quit at 'q' or reload at 'r').
+enum Mode {
+    Normal,
+    Input(InputKind, String),
+    Picker {
+        // (depth, collection id, name), same shape draw_tree renders from.
+        rows: Vec<(usize, i64, String)>,
+        selected: usize,
+        member: HashSet<i64>,
+        entry_id: i64,
+    },
+}
+
+enum InputKind {
+    // Carries the filter that was active before '/' was pressed, so Esc can
+    // restore it rather than just clearing it.
+    Search { previous: String },
+    NewCollection,
 }
 
 // One row of the rendered tree, including the synthetic "All Papers" root
@@ -152,12 +416,23 @@ struct App {
     selected_row: usize, // index into `rows` (not the visible subset)
 
     entries: Vec<Entry>,
-    table_selected: usize,
+    // Indices into `entries`, after filter then sort. The table's row index
+    // is an index into THIS, never into `entries` directly.
+    view: Vec<usize>,
+    table_selected: usize, // index into `view`
     // entry id -> [(attachment path, extracted-text char length)], loaded
     // alongside `entries` so the details pane never queries during render.
     attachment_lengths: AttachmentLengths,
 
+    filter: String,
+    sort_key: SortKey,
+    sort_desc: bool,
+
     focus: Focus,
+    mode: Mode,
+    // Set by a failed write or reload, shown on the footer for one
+    // keypress, then cleared by handle_key.
+    error: Option<String>,
     should_quit: bool,
 }
 
@@ -165,16 +440,24 @@ impl App {
     fn load(conn: &Connection) -> Result<Self, String> {
         let rows = load_tree(conn)?;
         let (entries, attachment_lengths) = load_entries(conn, None)?;
-        Ok(Self {
+        let mut app = Self {
             rows,
             collapsed: HashSet::new(),
             selected_row: 0,
             entries,
+            view: Vec::new(),
             table_selected: 0,
             attachment_lengths,
+            filter: String::new(),
+            sort_key: SortKey::Title,
+            sort_desc: false,
             focus: Focus::Collections,
+            mode: Mode::Normal,
+            error: None,
             should_quit: false,
-        })
+        };
+        app.rebuild_view();
+        Ok(app)
     }
 
     // Re-reads the tree and the currently selected collection's entries --
@@ -199,8 +482,119 @@ impl App {
         let (entries, lengths) = load_entries(conn, collection_id)?;
         self.entries = entries;
         self.attachment_lengths = lengths;
-        self.table_selected = clamp_selection(self.table_selected, self.entries.len());
+        self.rebuild_view();
         Ok(())
+    }
+
+    // Re-reads just the tree (rows + entry_count), keeping the current
+    // selection by id. Used after a picker toggle, which changes a count
+    // but not which entries are loaded into the table.
+    fn reload_tree_counts(&mut self, conn: &Connection) -> Result<(), String> {
+        let selected_id = self.rows[self.selected_row].id;
+        self.rows = load_tree(conn)?;
+        self.selected_row = self
+            .rows
+            .iter()
+            .position(|r| r.id == selected_id)
+            .unwrap_or(0);
+        self.ensure_selected_visible();
+        Ok(())
+    }
+
+    // Recomputes `view` from `filter` + sort, and clamps `table_selected`
+    // into it. The one place either changes, so every caller that touches
+    // `entries`, `filter`, `sort_key`, or `sort_desc` ends with this.
+    fn rebuild_view(&mut self) {
+        let needle = self.filter.to_lowercase();
+        self.view = (0..self.entries.len())
+            .filter(|&i| matches_filter(&self.entries[i], &needle))
+            .collect();
+        sort_view(&self.entries, &mut self.view, self.sort_key, self.sort_desc);
+        self.table_selected = clamp_selection(self.table_selected, self.view.len());
+    }
+
+    fn selected_entry(&self) -> Option<&Entry> {
+        self.view.get(self.table_selected).map(|&i| &self.entries[i])
+    }
+
+    // Creates a collection under `parent` (None = root, same as "All
+    // Papers" selected) and reloads so the tree's rows/counts pick it up.
+    // A DB error is shown on the footer rather than propagated -- a bad
+    // name shouldn't end the session.
+    fn create_collection(&mut self, conn: &Connection, parent: Option<i64>, name: &str) {
+        match db::create_collection_under(conn, parent, name) {
+            Ok(_) => {
+                if let Err(e) = self.reload(conn) {
+                    self.error = Some(e);
+                }
+            }
+            // db_error, not e.to_string(): a rejected name arrives as
+            // InvalidParameterName wrapping a message already written for a
+            // human, and to_string() prefixes it with "Invalid parameter
+            // name:" -- rusqlite's vocabulary leaking onto the footer.
+            Err(e) => self.error = Some(crate::db_error("create collection", e)),
+        }
+    }
+
+    // Opens the collection picker for the currently selected entry. Uses
+    // collection_tree directly (not the tree pane's rows) since there's
+    // nothing to file a paper into "All Papers" -- that's not a collection.
+    fn open_picker(&mut self, conn: &Connection) {
+        let Some(entry_id) = self.selected_entry().and_then(|e| e.id) else {
+            return;
+        };
+
+        let tree = match db::collection_tree(conn) {
+            Ok(t) => t,
+            Err(e) => {
+                self.error = Some(e.to_string());
+                return;
+            }
+        };
+        if tree.is_empty() {
+            self.error = Some("no collections exist yet -- create one with 'n' first".to_string());
+            return;
+        }
+
+        let member: HashSet<i64> = match db::collections_for_entry(conn, entry_id) {
+            Ok(v) => v.into_iter().collect(),
+            Err(e) => {
+                self.error = Some(e.to_string());
+                return;
+            }
+        };
+
+        let rows = tree
+            .into_iter()
+            .map(|(depth, c)| (depth, c.id, c.name))
+            .collect();
+
+        self.mode = Mode::Picker {
+            rows,
+            selected: 0,
+            member,
+            entry_id,
+        };
+    }
+
+    // Opens every attachment of the selected entry through the system
+    // opener. A failure (missing opener, no attachments) is shown on the
+    // footer rather than propagated -- a broken path shouldn't end the
+    // session.
+    fn open_selected(&mut self) {
+        let Some(entry) = self.selected_entry() else {
+            return;
+        };
+        if entry.attachments.is_empty() {
+            self.error = Some(format!("'{}' has no attachments", entry.cite_key));
+            return;
+        }
+        for a in &entry.attachments {
+            if let Err(e) = crate::open_path(&a.path) {
+                self.error = Some(e);
+                return;
+            }
+        }
     }
 
     // Moves the selection to the nearest visible ancestor when the selected
@@ -246,14 +640,20 @@ impl App {
 
     // Re-filters the entry table for the collection at `row_idx`. On a
     // fetch failure the previous entries stay put rather than blanking the
-    // pane over a transient error.
+    // pane over a transient error -- but the failure is reported, since the
+    // highlight has already moved and the table would otherwise be showing a
+    // different collection's entries with nothing to say so.
     fn select_row(&mut self, conn: &Connection, row_idx: usize) {
         self.selected_row = row_idx;
         let collection_id = self.rows[row_idx].id;
-        if let Ok((entries, lengths)) = load_entries(conn, collection_id) {
-            self.entries = entries;
-            self.attachment_lengths = lengths;
-            self.table_selected = 0;
+        match load_entries(conn, collection_id) {
+            Ok((entries, lengths)) => {
+                self.entries = entries;
+                self.attachment_lengths = lengths;
+                self.table_selected = 0;
+                self.rebuild_view();
+            }
+            Err(e) => self.error = Some(e),
         }
     }
 
@@ -269,6 +669,18 @@ impl App {
         let new_row = visible[new_pos];
         if new_row != self.selected_row {
             self.select_row(conn, new_row);
+        }
+    }
+
+    fn tree_top(&mut self, conn: &Connection) {
+        if let Some(&first) = self.visible().first() {
+            self.select_row(conn, first);
+        }
+    }
+
+    fn tree_bottom(&mut self, conn: &Connection) {
+        if let Some(&last) = self.visible().last() {
+            self.select_row(conn, last);
         }
     }
 
@@ -298,10 +710,10 @@ impl App {
     }
 
     fn move_table(&mut self, delta: i32) {
-        if self.entries.is_empty() {
+        if self.view.is_empty() {
             return;
         }
-        let len = self.entries.len() as i32;
+        let len = self.view.len() as i32;
         let new = (self.table_selected as i32 + delta).clamp(0, len - 1);
         self.table_selected = new as usize;
     }
@@ -311,8 +723,8 @@ impl App {
     }
 
     fn table_end(&mut self) {
-        if !self.entries.is_empty() {
-            self.table_selected = self.entries.len() - 1;
+        if !self.view.is_empty() {
+            self.table_selected = self.view.len() - 1;
         }
     }
 }
@@ -412,6 +824,94 @@ fn clamp_selection(selected: usize, len: usize) -> usize {
     }
 }
 
+// Case-insensitive substring match across every field a user would plausibly
+// search by. An empty needle matches everything, so clearing the search box
+// (or never opening it) is the same code path as "no filter".
+fn matches_filter(entry: &Entry, needle_lowercase: &str) -> bool {
+    if needle_lowercase.is_empty() {
+        return true;
+    }
+    if entry.title.to_lowercase().contains(needle_lowercase) {
+        return true;
+    }
+    for a in &entry.authors {
+        if a.last_name.to_lowercase().contains(needle_lowercase) {
+            return true;
+        }
+        if let Some(f) = &a.first_name
+            && f.to_lowercase().contains(needle_lowercase)
+        {
+            return true;
+        }
+    }
+    if let Some(j) = &entry.journal
+        && j.to_lowercase().contains(needle_lowercase)
+    {
+        return true;
+    }
+    if let Some(y) = entry.year
+        && y.to_string().contains(needle_lowercase)
+    {
+        return true;
+    }
+    if entry.cite_key.to_lowercase().contains(needle_lowercase) {
+        return true;
+    }
+    entry
+        .tags
+        .iter()
+        .any(|t| t.to_lowercase().contains(needle_lowercase))
+}
+
+// None always sorts last, in both directions -- reversing flips the order
+// among present values, not whether an absent one counts as smallest. An
+// entry missing a year belongs at the bottom of a year sort either way, not
+// at the top just because the direction flipped.
+fn cmp_optional<T: Ord>(a: Option<T>, b: Option<T>, desc: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(x), Some(y)) => {
+            let ord = x.cmp(&y);
+            if desc {
+                ord.reverse()
+            } else {
+                ord
+            }
+        }
+    }
+}
+
+// Sorts a `Vec` of indices into `entries` (never the entries themselves --
+// see `App::view`). String keys are lowercased for a case-insensitive order;
+// `sort_by` is stable, so entries that tie on the key keep their prior
+// relative order.
+fn sort_view(entries: &[Entry], view: &mut [usize], key: SortKey, desc: bool) {
+    view.sort_by(|&a, &b| {
+        let (a, b) = (&entries[a], &entries[b]);
+        match key {
+            SortKey::Title => cmp_optional(
+                Some(a.title.to_lowercase()),
+                Some(b.title.to_lowercase()),
+                desc,
+            ),
+            SortKey::Author => cmp_optional(
+                a.authors.first().map(|x| x.last_name.to_lowercase()),
+                b.authors.first().map(|x| x.last_name.to_lowercase()),
+                desc,
+            ),
+            SortKey::Year => cmp_optional(a.year, b.year, desc),
+            SortKey::Journal => cmp_optional(
+                a.journal.as_ref().map(|j| j.to_lowercase()),
+                b.journal.as_ref().map(|j| j.to_lowercase()),
+                desc,
+            ),
+        }
+    });
+}
+
 // Truncates `s` to at most `max_width` display columns, appending "…" if it
 // doesn't fit. Character-safe by construction (built one whole char at a
 // time, never sliced by byte index) and width-safe: width is measured with
@@ -472,17 +972,27 @@ fn draw(frame: &mut Frame, app: &App) {
     draw_tree(frame, cols[0], app);
     draw_table(frame, cols[1], app);
     draw_details(frame, cols[2], app);
-    draw_footer(frame, outer[1]);
+    draw_footer(frame, outer[1], app);
+
+    if let Mode::Picker {
+        rows,
+        selected,
+        member,
+        ..
+    } = &app.mode
+    {
+        draw_picker(frame, area, rows, *selected, member);
+    }
 }
 
-fn pane_block(title: &str, focused: bool) -> Block<'static> {
+fn pane_block(title: String, focused: bool) -> Block<'static> {
     let style = if focused {
         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
     Block::default()
-        .title(title.to_string())
+        .title(title)
         .borders(Borders::ALL)
         .border_style(style)
         .title_style(style)
@@ -515,7 +1025,7 @@ fn draw_tree(frame: &mut Frame, area: Rect, app: &App) {
     state.select(visible.iter().position(|&i| i == app.selected_row));
 
     let list = List::new(items)
-        .block(pane_block("COLLECTIONS", app.focus == Focus::Collections))
+        .block(pane_block("COLLECTIONS".to_string(), app.focus == Focus::Collections))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(list, area, &mut state);
 }
@@ -538,8 +1048,9 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &App) {
         .style(Style::default().add_modifier(Modifier::BOLD));
 
     let rows: Vec<Row> = app
-        .entries
+        .view
         .iter()
+        .map(|&i| &app.entries[i])
         .map(|e| {
             Row::new(vec![
                 truncate_display(&e.title, 60),
@@ -551,9 +1062,12 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &App) {
         .collect();
 
     let mut state = TableState::default();
-    if !app.entries.is_empty() {
+    if !app.view.is_empty() {
         state.select(Some(app.table_selected));
     }
+
+    let arrow = if app.sort_desc { '\u{2193}' } else { '\u{2191}' };
+    let title = format!("ENTRIES [{} {arrow}]", app.sort_key.label());
 
     let table = Table::new(
         rows,
@@ -565,7 +1079,7 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &App) {
         ],
     )
     .header(header)
-    .block(pane_block("ENTRIES", app.focus == Focus::Entries))
+    .block(pane_block(title, app.focus == Focus::Entries))
     .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(table, area, &mut state);
 }
@@ -635,7 +1149,7 @@ fn details_text(e: &Entry, lengths: Option<&Vec<(String, Option<i64>)>>) -> Stri
 }
 
 fn draw_details(frame: &mut Frame, area: Rect, app: &App) {
-    let text = match app.entries.get(app.table_selected) {
+    let text = match app.selected_entry() {
         None => "No entries.".to_string(),
         Some(e) => {
             let lengths = e.id.and_then(|id| app.attachment_lengths.get(&id));
@@ -644,14 +1158,73 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     let para = Paragraph::new(text)
-        .block(pane_block("DETAILS", app.focus == Focus::Details))
+        .block(pane_block("DETAILS".to_string(), app.focus == Focus::Details))
         .wrap(Wrap { trim: false });
     frame.render_widget(para, area);
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect) {
-    let footer = Paragraph::new(" Tab pane \u{b7} \u{2191}\u{2193} move \u{b7} \u{2190}\u{2192} fold \u{b7} r reload \u{b7} q quit");
+// Priority order: a pending error beats everything (it's transient, shown
+// once); then the input prompt, so the user can see what they're typing;
+// then the active filter, so it doesn't silently vanish from view; then the
+// keymap.
+fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let text = if let Some(err) = &app.error {
+        format!(" {err}")
+    } else {
+        match &app.mode {
+            Mode::Input(InputKind::Search { .. }, buffer) => format!(" /{buffer}"),
+            Mode::Input(InputKind::NewCollection, buffer) => {
+                format!(" New collection: {buffer}")
+            }
+            Mode::Picker { .. } => " Enter toggle \u{b7} jk move \u{b7} Esc/q close".to_string(),
+            Mode::Normal if !app.filter.is_empty() => format!(" filter: {}", app.filter),
+            Mode::Normal => {
+                " Tab pane \u{b7} jk move \u{b7} / search \u{b7} s sort \u{b7} n new \u{b7} \
+                 c file \u{b7} o open \u{b7} r reload \u{b7} q quit"
+                    .to_string()
+            }
+        }
+    };
+    let footer = Paragraph::new(text);
     frame.render_widget(footer, area);
+}
+
+// Centered modal, blanked with Clear first so the panes underneath don't
+// bleed through. Clamped to `frame_area` so it can't overflow a small
+// terminal into a panic-worthy negative size.
+fn draw_picker(
+    frame: &mut Frame,
+    frame_area: Rect,
+    rows: &[(usize, i64, String)],
+    selected: usize,
+    member: &HashSet<i64>,
+) {
+    let width = frame_area.width.saturating_sub(6).clamp(10, 60);
+    let height = ((rows.len() as u16) + 2)
+        .min(frame_area.height.saturating_sub(4))
+        .max(3);
+    let x = frame_area.x + frame_area.width.saturating_sub(width) / 2;
+    let y = frame_area.y + frame_area.height.saturating_sub(height) / 2;
+    let popup = Rect { x, y, width, height };
+
+    frame.render_widget(Clear, popup);
+
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|(depth, id, name)| {
+            let mark = if member.contains(id) { "[x]" } else { "[ ]" };
+            let indent = "  ".repeat(*depth);
+            ListItem::new(format!("{mark} {indent}{name}"))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(selected));
+
+    let list = List::new(items)
+        .block(Block::default().title("File into…").borders(Borders::ALL))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    frame.render_stateful_widget(list, popup, &mut state);
 }
 
 // ---------------------------------------------------------------------
@@ -661,6 +1234,7 @@ fn draw_footer(frame: &mut Frame, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Author;
 
     // Collapsing a parent hides its whole (contiguous, deeper) subtree;
     // collapsing a leaf hides nothing.
@@ -724,5 +1298,96 @@ mod tests {
         assert_eq!(clamp_selection(5, 2), 1);
         assert_eq!(clamp_selection(0, 0), 0);
         assert_eq!(clamp_selection(1, 5), 1);
+    }
+
+    fn mk_entry(title: &str, last_name: &str, year: Option<i32>, journal: &str) -> Entry {
+        let mut e = Entry::new("article".to_string(), title.to_string(), title.to_string());
+        if !last_name.is_empty() {
+            e.add_author(Author::new(last_name.to_string(), None));
+        }
+        e.year = year;
+        if !journal.is_empty() {
+            e.journal = Some(journal.to_string());
+        }
+        e
+    }
+
+    #[test]
+    fn matches_filter_hits_every_searchable_field_case_insensitively() {
+        let mut e = mk_entry("Deep Learning", "Smith", Some(2020), "Nature");
+        e.cite_key = "smith2020".to_string();
+        e.tags = vec!["ai".to_string()];
+
+        assert!(matches_filter(&e, "deep")); // title
+        assert!(matches_filter(&e, "smith")); // author
+        assert!(matches_filter(&e, "nature")); // journal
+        assert!(matches_filter(&e, "2020")); // year
+        assert!(matches_filter(&e, "smith2020")); // cite_key
+        assert!(matches_filter(&e, "ai")); // tag
+        assert!(!matches_filter(&e, "quantum")); // matches nothing
+        assert!(matches_filter(&e, "")); // empty matches everything
+    }
+
+    #[test]
+    fn sort_view_by_year_puts_missing_last_in_both_directions() {
+        let entries = vec![
+            mk_entry("B", "", Some(2019), ""),
+            mk_entry("A", "", None, ""),
+            mk_entry("C", "", Some(2021), ""),
+        ];
+        let mut view: Vec<usize> = vec![0, 1, 2];
+        sort_view(&entries, &mut view, SortKey::Year, false);
+        assert_eq!(view, vec![0, 2, 1], "ascending: 2019, 2021, then missing");
+
+        let mut view: Vec<usize> = vec![0, 1, 2];
+        sort_view(&entries, &mut view, SortKey::Year, true);
+        assert_eq!(view, vec![2, 0, 1], "descending: 2021, 2019, then still-missing-last");
+    }
+
+    #[test]
+    fn sort_view_by_title_is_case_insensitive() {
+        let entries = vec![
+            mk_entry("banana", "", None, ""),
+            mk_entry("Apple", "", None, ""),
+            mk_entry("Cherry", "", None, ""),
+        ];
+        let mut view: Vec<usize> = vec![0, 1, 2];
+        sort_view(&entries, &mut view, SortKey::Title, false);
+        assert_eq!(view, vec![1, 0, 2], "Apple, banana, Cherry");
+    }
+
+    #[test]
+    fn rebuild_view_clamps_selection_when_the_filter_shrinks_the_list() {
+        let mut app = App {
+            rows: vec![TreeRow {
+                id: None,
+                depth: 0,
+                name: "All Papers".to_string(),
+                entry_count: 2,
+            }],
+            collapsed: HashSet::new(),
+            selected_row: 0,
+            entries: vec![
+                mk_entry("Alpha", "Smith", None, ""),
+                mk_entry("Beta", "Jones", None, ""),
+            ],
+            view: Vec::new(),
+            table_selected: 1, // pointing at "Beta" before the filter narrows things
+            attachment_lengths: HashMap::new(),
+            filter: String::new(),
+            sort_key: SortKey::Title,
+            sort_desc: false,
+            focus: Focus::Entries,
+            mode: Mode::Normal,
+            error: None,
+            should_quit: false,
+        };
+        app.rebuild_view();
+        assert_eq!(app.table_selected, 1);
+
+        app.filter = "alpha".to_string();
+        app.rebuild_view();
+        assert_eq!(app.view.len(), 1);
+        assert_eq!(app.table_selected, 0, "clamped back into the shrunk view");
     }
 }
