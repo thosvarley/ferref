@@ -1208,6 +1208,175 @@ pub fn delete_entry(conn: &Connection, cite_key: &str) -> Result<()> {
     Ok(())
 }
 
+// Folds drop_id's tags, collections, and attachments into keep_id, then
+// deletes drop_id. keep_id's own scalar fields (title, doi, ...) are
+// untouched -- merge only moves relationships; Edit is what field-by-field
+// union would go through.
+//
+// entry_tags and collection_entries are both PRIMARY KEY (entry_id, X), so a
+// drop_id row that keep_id already has (same tag, same collection) can't be
+// re-parented without hitting that key. `UPDATE OR IGNORE` (confirmed
+// against real SQLite -- see the sqlite3 CLI check in this phase's notes,
+// and the #[test] below -- to skip just the conflicting row, not the whole
+// statement) leaves it parked on drop_id, where `DELETE FROM entries`'s
+// ON DELETE CASCADE sweeps it up for free.
+//
+// Attachments physically live at ./pdfs/<cite_key>.<ext> (Phase 12), so a
+// drop-side file's name stops matching the naming convention once its row
+// points at keep_id. Each one is renamed onto a name built from keep's
+// cite_key, claimed with the same O_EXCL discipline main.rs's
+// copy_into_library/land_downloaded_pdf use for the identical race: never
+// overwrite a file that's already there; if the natural name is taken by an
+// unrelated attachment keep already has, fall back to "-2", "-3", ...
+pub fn merge_entries(conn: &Connection, keep_id: i64, drop_id: i64) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+
+    let keep_cite_key: String = tx.query_row(
+        "SELECT cite_key FROM entries WHERE id = ?1",
+        [keep_id],
+        |row| row.get(0),
+    )?;
+
+    tx.execute(
+        "UPDATE OR IGNORE entry_tags SET entry_id = ?1 WHERE entry_id = ?2",
+        rusqlite::params![keep_id, drop_id],
+    )?;
+    tx.execute(
+        "UPDATE OR IGNORE collection_entries SET entry_id = ?1 WHERE entry_id = ?2",
+        rusqlite::params![keep_id, drop_id],
+    )?;
+
+    let drop_attachments: Vec<(i64, String)> = {
+        let mut stmt = tx.prepare("SELECT id, path FROM attachments WHERE entry_id = ?1")?;
+        stmt.query_map([drop_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    let base =
+        crate::doi::sanitize_filename(&keep_cite_key).map_err(rusqlite::Error::InvalidParameterName)?;
+
+    // Renames happen on the filesystem, outside SQLite's transaction, so
+    // committing/rolling back the DB rows can't undo them. The DB is
+    // hand-editable by design, so a row can point at a file that's already
+    // gone -- checked up front, before anything is touched, so a doomed
+    // merge fails loud with zero side effects rather than after moving some
+    // attachments but not others.
+    for (_, old_path_str) in &drop_attachments {
+        if !Path::new(old_path_str).is_file() {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "attachment file '{old_path_str}' does not exist on disk; refusing to merge"
+            )));
+        }
+    }
+
+    // Every source file existing up front doesn't rule out a rename failing
+    // partway through the loop (permissions, disk full, ...), so each
+    // successful (old, new) pair is tracked and rewound -- moved back to
+    // where it started -- if a later one fails, keeping the filesystem in
+    // step with the DB rows the aborted transaction is about to roll back.
+    let mut moved: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+
+    for (attachment_id, old_path_str) in drop_attachments {
+        match move_attachment(&tx, keep_id, &base, attachment_id, &old_path_str) {
+            Ok(pair) => moved.push(pair),
+            Err(e) => {
+                for (old, new) in moved.iter().rev() {
+                    let _ = std::fs::rename(new, old);
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    tx.execute("DELETE FROM entries WHERE id = ?1", [drop_id])?;
+
+    tx.commit()
+}
+
+// Claims a destination name under keep's cite_key, renames the attachment's
+// file onto it, and updates its DB row -- returns the (old, new) path pair
+// so a caller merging several attachments can unwind earlier successes if a
+// later one fails.
+fn move_attachment(
+    tx: &Connection,
+    keep_id: i64,
+    base: &str,
+    attachment_id: i64,
+    old_path_str: &str,
+) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let old_path = Path::new(old_path_str);
+    let dir = old_path.parent().ok_or_else(|| {
+        rusqlite::Error::InvalidParameterName(format!(
+            "attachment path '{old_path_str}' has no parent directory"
+        ))
+    })?;
+    let ext = old_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("pdf");
+
+    let new_path = claim_attachment_name(dir, base, ext)?;
+    if let Err(e) = std::fs::rename(old_path, &new_path) {
+        // The claim above created an empty placeholder at new_path -- don't
+        // leave it squatting on the name if the rename that was meant to
+        // fill it fails.
+        let _ = std::fs::remove_file(&new_path);
+        return Err(rusqlite::Error::InvalidParameterName(format!(
+            "failed to move attachment '{old_path_str}' to '{}': {e}",
+            new_path.display()
+        )));
+    }
+    let new_path_str = new_path.to_str().ok_or_else(|| {
+        rusqlite::Error::InvalidParameterName(format!(
+            "path {} is not valid UTF-8",
+            new_path.display()
+        ))
+    })?;
+    if let Err(e) = tx.execute(
+        "UPDATE attachments SET entry_id = ?1, path = ?2 WHERE id = ?3",
+        rusqlite::params![keep_id, new_path_str, attachment_id],
+    ) {
+        let _ = std::fs::rename(&new_path, old_path);
+        return Err(e);
+    }
+
+    Ok((old_path.to_path_buf(), new_path))
+}
+
+// Claims a free `<base>.<ext>` / `<base>-2.<ext>` / ... filename in `dir` via
+// O_EXCL (create_new) -- the same race-proof discipline
+// main.rs::copy_into_library/land_downloaded_pdf use: checking a name is
+// free and then writing to it are two steps, and a second mover can land in
+// between them. The empty file this claims is what merge_entries's
+// std::fs::rename then overwrites.
+fn claim_attachment_name(dir: &Path, base: &str, ext: &str) -> Result<std::path::PathBuf> {
+    for n in 1..=50 {
+        let candidate = if n == 1 {
+            dir.join(format!("{base}.{ext}"))
+        } else {
+            dir.join(format!("{base}-{n}.{ext}"))
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(rusqlite::Error::InvalidParameterName(format!(
+                    "failed to claim '{}': {e}",
+                    candidate.display()
+                )))
+            }
+        }
+    }
+    Err(rusqlite::Error::InvalidParameterName(format!(
+        "could not find a free filename for '{base}' in {}",
+        dir.display()
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2156,5 +2325,143 @@ mod tests {
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))
             .unwrap();
         assert_eq!(integrity, "ok", "database must not be left malformed");
+    }
+
+    // Real files on disk (not just DB rows) so a silent rename-overwrite
+    // would be observably wrong: keep and drop each get a distinct
+    // attachment, plus a shared tag and a shared collection to exercise the
+    // UPDATE OR IGNORE collision path this test would otherwise never touch.
+    #[test]
+    fn merge_entries_folds_tags_collections_and_attachments_without_collision() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferref-merge-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        let mut keep = Entry::new("article".to_string(), "keep2024".to_string(), "Keep".to_string());
+        keep.doi = None;
+        let keep_id = insert_entry(&conn, &keep).unwrap();
+
+        let mut drop = Entry::new("article".to_string(), "drop2024".to_string(), "Drop".to_string());
+        drop.doi = None;
+        let drop_id = insert_entry(&conn, &drop).unwrap();
+
+        // Shared tag: both entries get "physics" -- forces the entry_tags
+        // collision path.
+        add_tag(&conn, "keep2024", "physics").unwrap();
+        add_tag(&conn, "drop2024", "physics").unwrap();
+        // drop-only tag: should survive the move onto keep.
+        add_tag(&conn, "drop2024", "solo").unwrap();
+
+        // Shared collection: forces the collection_entries collision path.
+        create_collection(&conn, "Shelf").unwrap();
+        add_to_collection(&conn, "Shelf", "keep2024").unwrap();
+        add_to_collection(&conn, "Shelf", "drop2024").unwrap();
+
+        // Distinct attachment per entry, both real files on disk.
+        let keep_pdf = dir.join("keep2024.pdf");
+        std::fs::write(&keep_pdf, b"keep bytes").unwrap();
+        attach(&conn, "keep2024", keep_pdf.to_str().unwrap()).unwrap();
+
+        let drop_pdf = dir.join("drop2024.pdf");
+        std::fs::write(&drop_pdf, b"drop bytes").unwrap();
+        attach(&conn, "drop2024", drop_pdf.to_str().unwrap()).unwrap();
+
+        merge_entries(&conn, keep_id, drop_id).unwrap();
+
+        // drop's entry row is gone.
+        assert!(get_entry(&conn, "drop2024").unwrap().is_none());
+
+        let kept = get_entry(&conn, "keep2024").unwrap().unwrap();
+
+        // Union of tags, no duplicate-row error, no lost drop-only tag.
+        assert_eq!(kept.tags, vec!["physics".to_string(), "solo".to_string()]);
+
+        // Still in the shared collection exactly once (PK collision handled).
+        let in_shelf: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM collection_entries ce \
+                 JOIN collections c ON c.id = ce.collection_id \
+                 WHERE c.name = 'Shelf' AND ce.entry_id = ?1",
+                [keep_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(in_shelf, 1);
+
+        // Both attachments now belong to keep, at two distinct real files --
+        // neither clobbered the other.
+        assert_eq!(kept.attachments.len(), 2);
+        let mut contents: Vec<Vec<u8>> = kept
+            .attachments
+            .iter()
+            .map(|a| std::fs::read(&a.path).expect("attachment file must exist on disk"))
+            .collect();
+        contents.sort();
+        assert_eq!(contents, vec![b"drop bytes".to_vec(), b"keep bytes".to_vec()]);
+        let paths: std::collections::HashSet<&str> =
+            kept.attachments.iter().map(|a| a.path.as_str()).collect();
+        assert_eq!(paths.len(), 2, "attachment paths must be distinct, not one overwriting the other");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A drop-side attachment row pointing at a file that no longer exists
+    // (the DB is hand-editable by design, so this is reachable without any
+    // bug elsewhere) must fail the whole merge before anything is touched --
+    // not after quietly moving the *other* attachment first. Regression
+    // test for a bug an adversarial review caught: the original
+    // implementation moved files one at a time inside the loop, so a
+    // failure on attachment 2 left attachment 1 already renamed on disk
+    // while its DB row (rolled back with the rest of the transaction) still
+    // pointed at the old, now-nonexistent path.
+    #[test]
+    fn merge_entries_leaves_everything_untouched_when_a_drop_attachment_file_is_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferref-merge-missing-file-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        let keep = Entry::new("article".to_string(), "keep2024".to_string(), "Keep".to_string());
+        let keep_id = insert_entry(&conn, &keep).unwrap();
+        let drop = Entry::new("article".to_string(), "drop2024".to_string(), "Drop".to_string());
+        let drop_id = insert_entry(&conn, &drop).unwrap();
+
+        // A real file that will actually get renamed if the pre-flight
+        // check doesn't fire first.
+        let real_pdf = dir.join("drop2024.pdf");
+        std::fs::write(&real_pdf, b"real bytes").unwrap();
+        attach(&conn, "drop2024", real_pdf.to_str().unwrap()).unwrap();
+
+        // A second attachment row whose file was deleted out from under it
+        // (or hand-inserted, same effect) -- this is what should make the
+        // whole merge fail.
+        let ghost_pdf = dir.join("ghost.pdf");
+        conn.execute(
+            "INSERT INTO attachments (entry_id, path, date_added) VALUES (?1, ?2, ?3)",
+            rusqlite::params![drop_id, ghost_pdf.to_str().unwrap(), 0],
+        )
+        .unwrap();
+
+        let err = merge_entries(&conn, keep_id, drop_id);
+        assert!(err.is_err(), "merge must fail when a drop attachment file is missing");
+
+        // Nothing moved: the real file is exactly where it started, keep
+        // has no attachments, and drop still owns both rows.
+        assert!(real_pdf.exists(), "the real file must not have been moved");
+        let kept = get_entry(&conn, "keep2024").unwrap().unwrap();
+        assert!(kept.attachments.is_empty(), "keep must gain nothing from a failed merge");
+        let dropped = get_entry(&conn, "drop2024").unwrap().unwrap();
+        assert_eq!(dropped.attachments.len(), 2, "drop must keep both attachment rows");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

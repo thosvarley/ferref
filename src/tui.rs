@@ -70,7 +70,7 @@ fn event_loop(
                 {
                     return Ok(());
                 }
-                handle_key(app, conn, key.code, key.modifiers);
+                handle_key(app, conn, terminal, key.code, key.modifiers);
                 if app.should_quit {
                     return Ok(());
                 }
@@ -85,7 +85,13 @@ fn event_loop(
 // Dispatches on mode FIRST, before any key is interpreted as a command --
 // the one rule that keeps a search query like "query" from also quitting at
 // 'q' or reloading at 'r' along the way.
-fn handle_key(app: &mut App, conn: &Connection, code: KeyCode, modifiers: KeyModifiers) {
+fn handle_key(
+    app: &mut App,
+    conn: &Connection,
+    terminal: &mut ratatui::DefaultTerminal,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) {
     // An error is shown for exactly one frame: whatever key dismisses it
     // also clears it, so it can't linger over unrelated activity.
     app.error = None;
@@ -94,19 +100,25 @@ fn handle_key(app: &mut App, conn: &Connection, code: KeyCode, modifiers: KeyMod
         Mode::Normal => handle_normal_key(app, conn, code, modifiers),
         Mode::Input(..) => handle_input_key(app, conn, code),
         Mode::Picker { .. } => handle_picker_key(app, conn, code),
+        Mode::Command { .. } => handle_command_key(app, conn, terminal, code),
+        Mode::FieldPicker { .. } => handle_field_picker_key(app, code),
+        Mode::EntryPicker { .. } => handle_entry_picker_key(app, code),
+        Mode::Confirm { .. } => handle_confirm_key(app, conn, code),
     }
 }
 
 fn handle_normal_key(app: &mut App, conn: &Connection, code: KeyCode, modifiers: KeyModifiers) {
     match code {
         KeyCode::Char('q') => app.should_quit = true,
-        // Esc clears an active filter rather than quitting, so backing out
-        // of a search doesn't also close the app.
+        // Esc clears an active filter and any merge marks rather than
+        // quitting, so backing out of a search or a mark-in-progress
+        // doesn't also close the app.
         KeyCode::Esc => {
-            if app.filter.is_empty() {
+            if app.filter.is_empty() && app.marked.is_empty() {
                 app.should_quit = true;
             } else {
                 app.filter.clear();
+                app.marked.clear();
                 app.rebuild_view();
             }
         }
@@ -186,6 +198,19 @@ fn handle_normal_key(app: &mut App, conn: &Connection, code: KeyCode, modifiers:
         KeyCode::Char('o') if matches!(app.focus, Focus::Entries | Focus::Details) => {
             app.open_selected();
         }
+        // Toggles the current row into the merge marks. Insertion order
+        // matters (first marked survives a merge, second is folded in and
+        // deleted) -- see App::toggle_mark.
+        KeyCode::Char(' ') if app.focus == Focus::Entries => app.toggle_mark(),
+        // The ":" command palette (Edit/Fetch/Merge/Delete), scoped to
+        // whichever entry is currently selected.
+        KeyCode::Char(':')
+            if matches!(app.focus, Focus::Entries | Focus::Details) && !app.view.is_empty() =>
+        {
+            if let Some(entry_id) = app.selected_entry().and_then(|e| e.id) {
+                app.mode = Mode::Command { entry_id };
+            }
+        }
         _ => {}
     }
 }
@@ -222,22 +247,56 @@ fn handle_input_key(app: &mut App, conn: &Connection, code: KeyCode) {
             app.mode = Mode::Input(kind, buffer);
         }
         KeyCode::Enter => {
-            if let InputKind::NewCollection = kind {
-                let name = buffer.trim().to_string();
-                if !name.is_empty() {
-                    let parent = app.rows[app.selected_row].id;
-                    app.create_collection(conn, parent, &name);
+            match kind {
+                InputKind::NewCollection => {
+                    let name = buffer.trim().to_string();
+                    if !name.is_empty() {
+                        let parent = app.rows[app.selected_row].id;
+                        app.create_collection(conn, parent, &name);
+                    }
+                    // Search: the filter was already applied live as it was typed.
+                    app.mode = Mode::Normal;
+                }
+                InputKind::Search { .. } => {
+                    app.mode = Mode::Normal;
+                }
+                InputKind::EditField {
+                    entry_id,
+                    field,
+                    return_selected,
+                } => {
+                    app.apply_field_edit(conn, entry_id, field, &buffer);
+                    app.mode = Mode::FieldPicker {
+                        entry_id,
+                        selected: return_selected,
+                    };
                 }
             }
-            // Search: the filter was already applied live as it was typed.
-            app.mode = Mode::Normal;
         }
         KeyCode::Esc => {
-            if let InputKind::Search { previous } = &kind {
-                app.filter = previous.clone();
-                app.rebuild_view();
+            match kind {
+                InputKind::Search { previous } => {
+                    app.filter = previous;
+                    app.rebuild_view();
+                    app.mode = Mode::Normal;
+                }
+                InputKind::NewCollection => {
+                    app.mode = Mode::Normal;
+                }
+                // Esc on a field edit backs out to the field picker without
+                // saving, not all the way to Normal -- Enter is the only
+                // way this input box writes anything.
+                InputKind::EditField {
+                    entry_id,
+                    return_selected,
+                    ..
+                } => {
+                    app.mode = Mode::FieldPicker {
+                        entry_id,
+                        selected: return_selected,
+                    };
+                }
             }
-            app.mode = Mode::Normal;
         }
         _ => {
             app.mode = Mode::Input(kind, buffer);
@@ -302,6 +361,170 @@ fn handle_picker_key(app: &mut App, conn: &Connection, code: KeyCode) {
         member,
         entry_id,
     };
+}
+
+// The ":" palette: Edit / Fetch / Merge / Delete, scoped to whichever entry
+// was selected when it opened.
+fn handle_command_key(
+    app: &mut App,
+    conn: &Connection,
+    terminal: &mut ratatui::DefaultTerminal,
+    code: KeyCode,
+) {
+    let mode = std::mem::replace(&mut app.mode, Mode::Normal);
+    let Mode::Command { entry_id } = mode else {
+        app.mode = mode;
+        return;
+    };
+
+    match code {
+        KeyCode::Esc => {} // app.mode is already Normal
+        KeyCode::Char('e') => {
+            app.mode = Mode::FieldPicker {
+                entry_id,
+                selected: 0,
+            };
+        }
+        KeyCode::Char('f') => app.fetch_selected(conn, terminal, entry_id),
+        KeyCode::Char('m') => app.begin_merge(entry_id),
+        KeyCode::Char('d') => app.begin_delete(entry_id),
+        _ => app.mode = Mode::Command { entry_id },
+    }
+}
+
+// Edit's field-name picker. Enter opens Mode::Input pre-filled with the
+// field's current value; Esc backs out to Normal.
+fn handle_field_picker_key(app: &mut App, code: KeyCode) {
+    let mode = std::mem::replace(&mut app.mode, Mode::Normal);
+    let Mode::FieldPicker {
+        entry_id,
+        mut selected,
+    } = mode
+    else {
+        app.mode = mode;
+        return;
+    };
+
+    match code {
+        KeyCode::Esc => {} // app.mode is already Normal
+        KeyCode::Up | KeyCode::Char('k') => {
+            selected = selected.saturating_sub(1);
+            app.mode = Mode::FieldPicker { entry_id, selected };
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if selected + 1 < EditField::ALL.len() {
+                selected += 1;
+            }
+            app.mode = Mode::FieldPicker { entry_id, selected };
+        }
+        KeyCode::Enter => {
+            let Some(entry) = app.entries.iter().find(|e| e.id == Some(entry_id)) else {
+                return;
+            };
+            let field = EditField::ALL[selected];
+            let initial = field.current_value(entry);
+            app.mode = Mode::Input(
+                InputKind::EditField {
+                    entry_id,
+                    field,
+                    return_selected: selected,
+                },
+                initial,
+            );
+        }
+        _ => app.mode = Mode::FieldPicker { entry_id, selected },
+    }
+}
+
+// Merge's fold-in-entry picker: types narrow `filter`, Up/Down move the
+// selection (not j/k -- both are ordinary letters someone might filter by,
+// and this picker has a live text box the collection picker doesn't).
+fn handle_entry_picker_key(app: &mut App, code: KeyCode) {
+    let mode = std::mem::replace(&mut app.mode, Mode::Normal);
+    let Mode::EntryPicker {
+        keep_id,
+        mut filter,
+        mut rows,
+        mut selected,
+    } = mode
+    else {
+        app.mode = mode;
+        return;
+    };
+
+    match code {
+        KeyCode::Esc => {
+            app.marked.clear();
+            return; // app.mode is already Normal
+        }
+        KeyCode::Up => selected = selected.saturating_sub(1),
+        KeyCode::Down => {
+            if selected + 1 < rows.len() {
+                selected += 1;
+            }
+        }
+        KeyCode::Backspace => {
+            filter.pop();
+            rows = app.entry_picker_rows(keep_id, &filter);
+            selected = 0;
+        }
+        KeyCode::Char(c) => {
+            filter.push(c);
+            rows = app.entry_picker_rows(keep_id, &filter);
+            selected = 0;
+        }
+        KeyCode::Enter => {
+            if let Some(drop_id) = rows.get(selected).and_then(|&i| app.entries[i].id) {
+                app.confirm_merge(keep_id, drop_id);
+                return;
+            }
+        }
+        _ => {}
+    }
+
+    app.mode = Mode::EntryPicker {
+        keep_id,
+        filter,
+        rows,
+        selected,
+    };
+}
+
+// Delete/Merge confirm: any key but 'y' cancels. Marks are cleared either
+// way, per DESIGN.md's Phase 16 merge rule.
+fn handle_confirm_key(app: &mut App, conn: &Connection, code: KeyCode) {
+    let mode = std::mem::replace(&mut app.mode, Mode::Normal);
+    let Mode::Confirm { action, .. } = mode else {
+        app.mode = mode;
+        return;
+    };
+
+    if code != KeyCode::Char('y') {
+        app.marked.clear();
+        return; // app.mode is already Normal
+    }
+
+    let result = match action {
+        PendingAction::Delete { entry_id } => app
+            .entries
+            .iter()
+            .find(|e| e.id == Some(entry_id))
+            .map(|e| e.cite_key.clone())
+            .ok_or_else(|| "entry no longer exists".to_string())
+            .and_then(|cite_key| db::delete_entry(conn, &cite_key).map_err(|e| e.to_string())),
+        PendingAction::Merge { keep_id, drop_id } => db::merge_entries(conn, keep_id, drop_id)
+            .map_err(|e| crate::db_error("merge entries", e)),
+    };
+    if let Err(e) = result {
+        app.error = Some(e);
+    }
+
+    app.marked.clear();
+    // The entry list's shape changed (a row is gone) either way -- reload
+    // rather than patch app.entries in place.
+    if let Err(e) = app.reload(conn) {
+        app.error = Some(e);
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -390,6 +613,22 @@ enum Mode {
         member: HashSet<i64>,
         entry_id: i64,
     },
+    // The ":" palette (Edit/Fetch/Merge/Delete), scoped to one entry.
+    Command { entry_id: i64 },
+    // Edit's field-name list, opened by ":" -> "e".
+    FieldPicker { entry_id: i64, selected: usize },
+    // Merge's fold-in-entry picker, opened by ":" -> "m" when fewer than two
+    // entries are marked. `keep_id` is fixed for the picker's lifetime;
+    // `rows` are indices into `App::entries` matching `filter`.
+    EntryPicker {
+        keep_id: i64,
+        filter: String,
+        rows: Vec<usize>,
+        selected: usize,
+    },
+    // Delete/merge confirmation. An enum of pending actions (rather than a
+    // boxed closure) since there are exactly two call sites.
+    Confirm { message: String, action: PendingAction },
 }
 
 enum InputKind {
@@ -397,6 +636,169 @@ enum InputKind {
     // restore it rather than just clearing it.
     Search { previous: String },
     NewCollection,
+    // Edit's value box. `return_selected` is the field picker's row to
+    // return to on Enter/Esc, so fixing several fields in one visit doesn't
+    // reset the list to the top each time.
+    EditField {
+        entry_id: i64,
+        field: EditField,
+        return_selected: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum PendingAction {
+    Delete { entry_id: i64 },
+    Merge { keep_id: i64, drop_id: i64 },
+}
+
+// Field names Edit (":" -> "e") can change: Entry's own scalar columns plus
+// authors (whole-list replace, the same semantics `ferref edit --author`
+// already has). Tags aren't here -- they're not an `entries` column, and
+// DESIGN.md's Phase 16 section lists tagging from the TUI as out of scope.
+#[derive(Clone, Copy, PartialEq)]
+enum EditField {
+    Title,
+    Year,
+    Journal,
+    Volume,
+    Pages,
+    Doi,
+    Url,
+    Abstract,
+    Authors,
+}
+
+impl EditField {
+    const ALL: [EditField; 9] = [
+        EditField::Title,
+        EditField::Year,
+        EditField::Journal,
+        EditField::Volume,
+        EditField::Pages,
+        EditField::Doi,
+        EditField::Url,
+        EditField::Abstract,
+        EditField::Authors,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            EditField::Title => "title",
+            EditField::Year => "year",
+            EditField::Journal => "journal",
+            EditField::Volume => "volume",
+            EditField::Pages => "pages",
+            EditField::Doi => "doi",
+            EditField::Url => "url",
+            EditField::Abstract => "abstract",
+            EditField::Authors => "authors",
+        }
+    }
+
+    // Pre-fills the Input box with the field's string form as it stands now,
+    // so an unchanged Enter is a no-op rather than blanking the field.
+    fn current_value(self, e: &Entry) -> String {
+        match self {
+            EditField::Title => e.title.clone(),
+            EditField::Year => e.year.map(|y| y.to_string()).unwrap_or_default(),
+            EditField::Journal => e.journal.clone().unwrap_or_default(),
+            EditField::Volume => e.volume.clone().unwrap_or_default(),
+            EditField::Pages => e.pages.clone().unwrap_or_default(),
+            EditField::Doi => e.doi.clone().unwrap_or_default(),
+            EditField::Url => e.url.clone().unwrap_or_default(),
+            EditField::Abstract => e.abstract_text.clone().unwrap_or_default(),
+            EditField::Authors => e
+                .authors
+                .iter()
+                .map(|a| match &a.first_name {
+                    Some(f) => format!("{}, {}", a.last_name, f),
+                    None => a.last_name.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+        }
+    }
+
+    // Applies the edited text onto a clone of the current entry --
+    // db::update_entry replaces every scalar column at once, so every field
+    // this isn't editing has to already be sitting on `entry` untouched.
+    fn apply(self, entry: &mut Entry, raw: &str) -> Result<(), String> {
+        let trimmed = raw.trim();
+        match self {
+            EditField::Title => {
+                if trimmed.is_empty() {
+                    return Err("title cannot be empty".to_string());
+                }
+                entry.title = trimmed.to_string();
+            }
+            EditField::Year => {
+                entry.year = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(
+                        trimmed
+                            .parse::<i32>()
+                            .map_err(|_| "year must be a whole number".to_string())?,
+                    )
+                };
+            }
+            EditField::Journal => entry.journal = (!trimmed.is_empty()).then(|| trimmed.to_string()),
+            EditField::Volume => entry.volume = (!trimmed.is_empty()).then(|| trimmed.to_string()),
+            EditField::Pages => entry.pages = (!trimmed.is_empty()).then(|| trimmed.to_string()),
+            EditField::Doi => entry.doi = (!trimmed.is_empty()).then(|| trimmed.to_string()),
+            EditField::Url => entry.url = (!trimmed.is_empty()).then(|| trimmed.to_string()),
+            EditField::Abstract => {
+                entry.abstract_text = (!trimmed.is_empty()).then(|| trimmed.to_string())
+            }
+            EditField::Authors => {
+                entry.authors = if trimmed.is_empty() {
+                    Vec::new()
+                } else {
+                    trimmed
+                        .split(';')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(crate::cli::parse_author)
+                        .collect::<Result<Vec<_>, String>>()?
+                };
+            }
+        }
+        Ok(())
+    }
+}
+
+// The ":" -> "m" branching rule from DESIGN.md's Phase 16 section, factored
+// out as pure logic over `&[i64]` so it's testable without a live App.
+#[derive(Debug, PartialEq)]
+enum MergePlan {
+    // 0 or 1 marked: the selected entry (carried here) is the keeper: open
+    // a picker to choose what folds into it.
+    PickDrop(i64),
+    // Exactly 2 marked: order already decides keep/drop.
+    Pair(i64, i64),
+    // 3+ marked: out of scope for one merge.
+    TooMany,
+}
+
+fn plan_merge(marked: &[i64], selected_id: Option<i64>) -> Option<MergePlan> {
+    match marked.len() {
+        0 | 1 => selected_id.map(MergePlan::PickDrop),
+        2 => Some(MergePlan::Pair(marked[0], marked[1])),
+        _ => Some(MergePlan::TooMany),
+    }
+}
+
+// Space (Entries, Normal): toggles `id` into `marked`. A `Vec`, not a
+// `HashSet` -- insertion order is the whole point, since the first entry
+// marked is the merge survivor and the second is folded in and deleted.
+// Marking the same id twice unmarks it.
+fn toggle_marked(marked: &mut Vec<i64>, id: i64) {
+    if let Some(pos) = marked.iter().position(|&m| m == id) {
+        marked.remove(pos);
+    } else {
+        marked.push(id);
+    }
 }
 
 // One row of the rendered tree, including the synthetic "All Papers" root
@@ -435,6 +837,10 @@ struct App {
     sort_key: SortKey,
     sort_desc: bool,
 
+    // Entries marked for merge (Space, Entries pane). Insertion-ordered:
+    // see toggle_marked.
+    marked: Vec<i64>,
+
     focus: Focus,
     mode: Mode,
     // Set by a failed write or reload, shown on the footer for one
@@ -458,6 +864,7 @@ impl App {
             filter: String::new(),
             sort_key: SortKey::Title,
             sort_desc: false,
+            marked: Vec::new(),
             focus: Focus::Collections,
             mode: Mode::Normal,
             error: None,
@@ -602,6 +1009,152 @@ impl App {
                 return;
             }
         }
+    }
+
+    fn toggle_mark(&mut self) {
+        if let Some(id) = self.selected_entry().and_then(|e| e.id) {
+            toggle_marked(&mut self.marked, id);
+        }
+    }
+
+    // Refetches one entry by id and swaps it into `entries` in place, then
+    // recomputes `view` -- used after an edit or fetch, where the entry
+    // list's shape (which rows exist) hasn't changed, only one row's data.
+    // Merge and delete DO change the shape, and use `reload` instead.
+    fn refresh_entry(&mut self, conn: &Connection, entry_id: i64) -> Result<(), String> {
+        let Some(idx) = self.entries.iter().position(|e| e.id == Some(entry_id)) else {
+            return Ok(());
+        };
+        let cite_key = self.entries[idx].cite_key.clone();
+        if let Some(fresh) = db::get_entry(conn, &cite_key).map_err(|e| e.to_string())? {
+            self.entries[idx] = fresh;
+        }
+        self.rebuild_view();
+        Ok(())
+    }
+
+    // Edit's Input box, on Enter: applies the field to a clone of the
+    // current entry and writes it with db::update_entry -- the same
+    // function `ferref edit` uses, so a TUI edit and a CLI edit go through
+    // one write path.
+    fn apply_field_edit(&mut self, conn: &Connection, entry_id: i64, field: EditField, raw: &str) {
+        let Some(current) = self.entries.iter().find(|e| e.id == Some(entry_id)) else {
+            return;
+        };
+        let mut updated = current.clone();
+        if let Err(e) = field.apply(&mut updated, raw) {
+            self.error = Some(e);
+            return;
+        }
+        match db::update_entry(conn, &updated) {
+            Ok(()) => {
+                if let Err(e) = self.refresh_entry(conn, entry_id) {
+                    self.error = Some(e);
+                }
+            }
+            Err(e) => self.error = Some(crate::db_error("update entry", e)),
+        }
+    }
+
+    // Fetch (":" -> "f"): the Unpaywall round-trip and PDF download block
+    // the event loop, so a "Fetching…" footer is drawn (reusing `error`'s
+    // slot, the one line already rendered every frame) *before* the
+    // blocking call, or the freeze reads as a hang rather than progress.
+    // No --email equivalent in the TUI: falls back to FERREF_EMAIL / the
+    // config file, same as the CLI does when --email is omitted.
+    fn fetch_selected(
+        &mut self,
+        conn: &Connection,
+        terminal: &mut ratatui::DefaultTerminal,
+        entry_id: i64,
+    ) {
+        let Some(cite_key) = self
+            .entries
+            .iter()
+            .find(|e| e.id == Some(entry_id))
+            .map(|e| e.cite_key.clone())
+        else {
+            return;
+        };
+
+        self.error = Some(format!("Fetching PDF for '{cite_key}'\u{2026}"));
+        let _ = terminal.draw(|frame| draw(frame, self));
+
+        match crate::fetch_pdf_for_entry(conn, &cite_key, None) {
+            Ok(crate::FetchOutcome::NoPdfFound { is_oa, .. }) => {
+                self.error = Some(if is_oa {
+                    format!("'{cite_key}' is open access, but Unpaywall has no direct PDF link")
+                } else {
+                    format!("No open-access copy found for '{cite_key}'")
+                });
+            }
+            Ok(crate::FetchOutcome::Downloaded { path, extraction, .. }) => {
+                self.error = Some(match extraction {
+                    Ok(chars) => format!("Downloaded '{path}' ({chars} chars extracted)"),
+                    Err(e) => format!("Downloaded '{path}', but extraction failed: {e}"),
+                });
+                if let Err(e) = self.refresh_entry(conn, entry_id) {
+                    self.error = Some(e);
+                }
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    // Builds the rows for the merge entry-picker: every entry except
+    // `keep_id` itself, narrowed by `matches_filter` (the same
+    // case-insensitive substring match "/" search uses).
+    fn entry_picker_rows(&self, keep_id: i64, filter: &str) -> Vec<usize> {
+        let needle = filter.to_lowercase();
+        (0..self.entries.len())
+            .filter(|&i| {
+                self.entries[i].id != Some(keep_id) && matches_filter(&self.entries[i], &needle)
+            })
+            .collect()
+    }
+
+    // ":" -> "m": see MergePlan / plan_merge for the branching rule itself.
+    fn begin_merge(&mut self, entry_id: i64) {
+        match plan_merge(&self.marked, Some(entry_id)) {
+            Some(MergePlan::PickDrop(keep_id)) => {
+                self.mode = Mode::EntryPicker {
+                    keep_id,
+                    filter: String::new(),
+                    rows: self.entry_picker_rows(keep_id, ""),
+                    selected: 0,
+                };
+            }
+            Some(MergePlan::Pair(keep_id, drop_id)) => self.confirm_merge(keep_id, drop_id),
+            Some(MergePlan::TooMany) => {
+                self.error = Some("merge only supports two entries at a time".to_string());
+            }
+            None => {}
+        }
+    }
+
+    fn confirm_merge(&mut self, keep_id: i64, drop_id: i64) {
+        let title_of = |id: i64| {
+            self.entries
+                .iter()
+                .find(|e| e.id == Some(id))
+                .map(|e| e.title.clone())
+                .unwrap_or_default()
+        };
+        self.mode = Mode::Confirm {
+            message: format!("Merge '{}' into '{}'? y/n", title_of(drop_id), title_of(keep_id)),
+            action: PendingAction::Merge { keep_id, drop_id },
+        };
+    }
+
+    // ":" -> "d".
+    fn begin_delete(&mut self, entry_id: i64) {
+        let Some(entry) = self.entries.iter().find(|e| e.id == Some(entry_id)) else {
+            return;
+        };
+        self.mode = Mode::Confirm {
+            message: format!("Delete '{}' [{}]? y/n", entry.title, entry.cite_key),
+            action: PendingAction::Delete { entry_id },
+        };
     }
 
     // Moves the selection to the nearest visible ancestor when the selected
@@ -978,14 +1531,25 @@ fn draw(frame: &mut Frame, app: &App) {
     draw_details(frame, cols[2], app);
     draw_footer(frame, outer[1], app);
 
-    if let Mode::Picker {
-        rows,
-        selected,
-        member,
-        ..
-    } = &app.mode
-    {
-        draw_picker(frame, area, rows, *selected, member);
+    match &app.mode {
+        Mode::Picker {
+            rows,
+            selected,
+            member,
+            ..
+        } => draw_picker(frame, area, rows, *selected, member),
+        Mode::Command { entry_id } => draw_command(frame, area, app, *entry_id),
+        Mode::FieldPicker { entry_id, selected } => {
+            draw_field_picker(frame, area, app, *entry_id, *selected)
+        }
+        Mode::EntryPicker {
+            filter,
+            rows,
+            selected,
+            ..
+        } => draw_entry_picker(frame, area, app, filter, rows, *selected),
+        Mode::Confirm { message, .. } => draw_confirm(frame, area, message),
+        Mode::Normal | Mode::Input(..) => {}
     }
 }
 
@@ -1056,6 +1620,7 @@ fn sep_cell() -> Cell<'static> {
 fn draw_table(frame: &mut Frame, area: Rect, app: &App) {
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let header = Row::new(vec![
+        Cell::from(" "),
         Cell::from("Title").style(bold),
         sep_cell(),
         Cell::from("Authors").style(bold),
@@ -1070,7 +1635,17 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &App) {
         .iter()
         .map(|&i| &app.entries[i])
         .map(|e| {
+            // A colored marker in a leading column, not just the selection
+            // highlight -- a mark must stay visible after the cursor moves
+            // off the row, which REVERSED alone wouldn't show.
+            let marked = e.id.is_some_and(|id| app.marked.contains(&id));
+            let mark_cell = if marked {
+                Cell::from("\u{25cf}").style(Style::default().fg(Color::Yellow))
+            } else {
+                Cell::from(" ")
+            };
             Row::new(vec![
+                mark_cell,
                 Cell::from(truncate_display(&e.title, 60)),
                 sep_cell(),
                 Cell::from(truncate_display(&author_summary(&e.authors), 14)),
@@ -1088,11 +1663,15 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let arrow = if app.sort_desc { '\u{2193}' } else { '\u{2191}' };
-    let title = format!("ENTRIES [{} {arrow}]", app.sort_key.label());
+    let mut title = format!("ENTRIES [{} {arrow}]", app.sort_key.label());
+    if !app.marked.is_empty() {
+        title.push_str(&format!(" ({} marked)", app.marked.len()));
+    }
 
     let table = Table::new(
         rows,
         [
+            Constraint::Length(1),
             Constraint::Min(10),
             Constraint::Length(1),
             Constraint::Length(14),
@@ -1228,11 +1807,23 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             Mode::Input(InputKind::NewCollection, buffer) => {
                 format!(" New collection: {buffer}")
             }
+            Mode::Input(InputKind::EditField { field, .. }, buffer) => {
+                format!(" {}: {buffer}", field.label())
+            }
             Mode::Picker { .. } => " Enter toggle \u{b7} jk move \u{b7} Esc/q close".to_string(),
+            Mode::Command { .. } => {
+                " e edit \u{b7} f fetch \u{b7} m merge \u{b7} d delete \u{b7} Esc close".to_string()
+            }
+            Mode::FieldPicker { .. } => " Enter edit \u{b7} jk move \u{b7} Esc back".to_string(),
+            Mode::EntryPicker { .. } => {
+                " type to filter \u{b7} \u{2191}\u{2193} move \u{b7} Enter pick \u{b7} Esc cancel"
+                    .to_string()
+            }
+            Mode::Confirm { message, .. } => format!(" {message}"),
             Mode::Normal if !app.filter.is_empty() => format!(" filter: {}", app.filter),
             Mode::Normal => {
                 " Tab pane \u{b7} jk move \u{b7} / search \u{b7} s sort \u{b7} n new \u{b7} \
-                 c file \u{b7} o open \u{b7} r reload \u{b7} q quit"
+                 c file \u{b7} o open \u{b7} space mark \u{b7} : cmd \u{b7} r reload \u{b7} q quit"
                     .to_string()
             }
         }
@@ -1277,6 +1868,134 @@ fn draw_picker(
         .block(Block::default().title("File into…").borders(Borders::ALL))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(list, popup, &mut state);
+}
+
+// The ":" palette -- a small fixed list, titled with the scoped entry's
+// cite_key so it's clear which paper the four actions apply to.
+fn draw_command(frame: &mut Frame, frame_area: Rect, app: &App, entry_id: i64) {
+    let cite_key = app
+        .entries
+        .iter()
+        .find(|e| e.id == Some(entry_id))
+        .map(|e| e.cite_key.as_str())
+        .unwrap_or("");
+
+    let width = 26u16.min(frame_area.width.saturating_sub(4)).max(12);
+    let height = 6u16.min(frame_area.height.saturating_sub(4)).max(3);
+    let x = frame_area.x + frame_area.width.saturating_sub(width) / 2;
+    let y = frame_area.y + frame_area.height.saturating_sub(height) / 2;
+    let popup = Rect { x, y, width, height };
+
+    frame.render_widget(Clear, popup);
+    let items = vec![
+        ListItem::new("e  Edit field"),
+        ListItem::new("f  Fetch PDF"),
+        ListItem::new("m  Merge"),
+        ListItem::new("d  Delete"),
+    ];
+    let list = List::new(items).block(Block::default().title(cite_key.to_string()).borders(Borders::ALL));
+    frame.render_widget(list, popup);
+}
+
+// Edit's field-name list: label plus each field's current value, so picking
+// one is informed rather than a guess at what's already there.
+fn draw_field_picker(frame: &mut Frame, frame_area: Rect, app: &App, entry_id: i64, selected: usize) {
+    let Some(entry) = app.entries.iter().find(|e| e.id == Some(entry_id)) else {
+        return;
+    };
+
+    let width = frame_area.width.saturating_sub(6).clamp(20, 70);
+    let height = ((EditField::ALL.len() as u16) + 2)
+        .min(frame_area.height.saturating_sub(4))
+        .max(3);
+    let x = frame_area.x + frame_area.width.saturating_sub(width) / 2;
+    let y = frame_area.y + frame_area.height.saturating_sub(height) / 2;
+    let popup = Rect { x, y, width, height };
+
+    frame.render_widget(Clear, popup);
+
+    let value_width = (width as usize).saturating_sub(14);
+    let items: Vec<ListItem> = EditField::ALL
+        .iter()
+        .map(|&f| {
+            let value = truncate_display(&f.current_value(entry), value_width);
+            ListItem::new(format!("{:<10}{value}", f.label()))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(selected));
+
+    let list = List::new(items)
+        .block(Block::default().title("Edit field").borders(Borders::ALL))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    frame.render_stateful_widget(list, popup, &mut state);
+}
+
+// Merge's fold-in-entry picker: a filter box folded into the title (there's
+// no separate input line in the popup) plus the matching entries, title and
+// cite_key both shown since either might be what the user remembers.
+fn draw_entry_picker(
+    frame: &mut Frame,
+    frame_area: Rect,
+    app: &App,
+    filter: &str,
+    rows: &[usize],
+    selected: usize,
+) {
+    let width = frame_area.width.saturating_sub(6).clamp(20, 70);
+    let height = ((rows.len() as u16) + 2)
+        .min(frame_area.height.saturating_sub(4))
+        .max(3);
+    let x = frame_area.x + frame_area.width.saturating_sub(width) / 2;
+    let y = frame_area.y + frame_area.height.saturating_sub(height) / 2;
+    let popup = Rect { x, y, width, height };
+
+    frame.render_widget(Clear, popup);
+
+    let text_width = (width as usize).saturating_sub(2);
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|&i| {
+            let e = &app.entries[i];
+            let label = format!("{} ({})", e.title, e.cite_key);
+            ListItem::new(truncate_display(&label, text_width))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    if !rows.is_empty() {
+        state.select(Some(selected));
+    }
+
+    let title = if filter.is_empty() {
+        "Merge into…".to_string()
+    } else {
+        format!("Merge into… /{filter}")
+    };
+    let list = List::new(items)
+        .block(Block::default().title(title).borders(Borders::ALL))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    frame.render_stateful_widget(list, popup, &mut state);
+}
+
+// Delete/merge confirmation: just the message, sized to fit it.
+fn draw_confirm(frame: &mut Frame, frame_area: Rect, message: &str) {
+    let width = (message.len() as u16 + 4)
+        .min(frame_area.width.saturating_sub(2))
+        .max(20);
+    // A one-line message always fits a 3-row box (border, content, border);
+    // draw()'s own MIN_HEIGHT check guarantees frame_area is tall enough.
+    let height = 3;
+    let x = frame_area.x + frame_area.width.saturating_sub(width) / 2;
+    let y = frame_area.y + frame_area.height.saturating_sub(height) / 2;
+    let popup = Rect { x, y, width, height };
+
+    frame.render_widget(Clear, popup);
+    let para = Paragraph::new(message.to_string())
+        .block(Block::default().borders(Borders::ALL))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(para, popup);
 }
 
 // ---------------------------------------------------------------------
@@ -1429,6 +2148,7 @@ mod tests {
             filter: String::new(),
             sort_key: SortKey::Title,
             sort_desc: false,
+            marked: Vec::new(),
             focus: Focus::Entries,
             mode: Mode::Normal,
             error: None,
@@ -1467,5 +2187,32 @@ mod tests {
             .position(|l| std::ptr::eq(l, doi_line))
             .unwrap();
         assert!(lines[..doi_idx].iter().any(|l| l.spans.is_empty()));
+    }
+
+    // Insertion order matters (first marked survives a merge), and marking
+    // the same id twice unmarks it rather than adding a duplicate.
+    #[test]
+    fn toggle_marked_is_insertion_ordered_and_toggles_off() {
+        let mut marked = Vec::new();
+        toggle_marked(&mut marked, 5);
+        toggle_marked(&mut marked, 2);
+        assert_eq!(marked, vec![5, 2], "insertion order preserved, not sorted");
+
+        toggle_marked(&mut marked, 5);
+        assert_eq!(marked, vec![2], "marking again unmarks");
+    }
+
+    #[test]
+    fn plan_merge_branches_on_how_many_are_marked() {
+        // 0 marked: falls back to the selected row as keeper.
+        assert_eq!(plan_merge(&[], Some(9)), Some(MergePlan::PickDrop(9)));
+        // 1 marked: still falls back to the selected row, ignoring the mark.
+        assert_eq!(plan_merge(&[1], Some(9)), Some(MergePlan::PickDrop(9)));
+        // 0 or 1 marked with nothing selected: nothing to do.
+        assert_eq!(plan_merge(&[], None), None);
+        // Exactly 2: order decides keep/drop, no picker needed.
+        assert_eq!(plan_merge(&[1, 2], Some(9)), Some(MergePlan::Pair(1, 2)));
+        // 3+: out of scope for one merge.
+        assert_eq!(plan_merge(&[1, 2, 3], Some(9)), Some(MergePlan::TooMany));
     }
 }

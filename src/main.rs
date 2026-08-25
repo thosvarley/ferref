@@ -292,6 +292,31 @@ fn main() {
             }
         }
 
+        Command::Merge { keep, drop, json } => {
+            if keep == drop {
+                die("keep and drop must be different entries");
+            }
+            let keep_id = match db::get_entry(&conn, &keep) {
+                Ok(Some(e)) => e.id.unwrap(),
+                Ok(None) => die(&format!("no entry found with cite_key '{keep}'")),
+                Err(e) => die(&format!("failed to fetch entry: {e}")),
+            };
+            let drop_id = match db::get_entry(&conn, &drop) {
+                Ok(Some(e)) => e.id.unwrap(),
+                Ok(None) => die(&format!("no entry found with cite_key '{drop}'")),
+                Err(e) => die(&format!("failed to fetch entry: {e}")),
+            };
+            if let Err(e) = db::merge_entries(&conn, keep_id, drop_id) {
+                die(&format!("failed to merge entries: {e}"));
+            }
+            if json {
+                let out = serde_json::json!({ "kept": keep, "dropped": drop });
+                emit_json(&out);
+            } else {
+                emit(&format!("Merged '{drop}' into '{keep}', deleting '{drop}'"));
+            }
+        }
+
         Command::Tag {
             cite_key,
             tag,
@@ -671,97 +696,152 @@ fn cmd_import(conn: &rusqlite::Connection, path: PathBuf, json: bool) {
         }
     }
 
+// What happened when trying to fetch an open-access PDF for an entry via
+// Unpaywall. `doi` rides along in both branches since every caller reports
+// it regardless of outcome, and `fetch_pdf_for_entry` is the only place that
+// looked it up.
+enum FetchOutcome {
+    // Unpaywall was queried; either the paper isn't OA at all, or it's OA
+    // with no direct PDF link -- `is_oa` is what tells those two apart, and
+    // callers must not conflate them (telling someone their OA paper isn't
+    // OA sends them looking for the wrong thing).
+    NoPdfFound { doi: String, is_oa: bool },
+    // A PDF was landed at `path` (or was already there, per
+    // `already_present`) and attached as `attachment_id`. Extraction is a
+    // separate, partial step -- a failed extraction still leaves the
+    // attachment in place, so it travels inside `Ok` rather than failing the
+    // whole fetch.
+    Downloaded {
+        doi: String,
+        path: String,
+        // Carried per the design brief for future consumers (e.g. a TUI
+        // "re-extract" action); neither cmd_fetch nor the TUI's fetch
+        // handler reads it today, so it stays here rather than being
+        // dropped only to be re-derived later.
+        #[allow(dead_code)]
+        attachment_id: i64,
+        already_present: bool,
+        extraction: Result<usize, String>,
+    },
+}
+
+// The actual work of `fetch`: DOI lookup on the entry, email resolution,
+// Unpaywall query, download+land+extract. Pulled out of cmd_fetch so the TUI
+// can call it too without dying on failure -- every error path here returns
+// Err instead of calling die()/process::exit, which cmd_fetch alone still
+// does, at the same messages it always has.
+fn fetch_pdf_for_entry(
+    conn: &rusqlite::Connection,
+    cite_key: &str,
+    email: Option<String>,
+) -> Result<FetchOutcome, String> {
+    let entry = db::get_entry(conn, cite_key)
+        .map_err(|e| format!("failed to fetch entry: {e}"))?
+        .ok_or_else(|| format!("no entry found with cite_key '{cite_key}'"))?;
+
+    let Some(doi_value) = entry.doi.clone() else {
+        return Err(format!(
+            "'{cite_key}' has no DOI on record; set one with `ferref edit {cite_key} --doi <doi>`"
+        ));
+    };
+
+    let resolved_email = config::resolve_email(email)?;
+
+    let oa = doi::fetch_oa_pdf_url(&doi_value, &resolved_email)
+        .map_err(|e| format!("failed to query Unpaywall: {e}"))?;
+
+    // Having no PDF to fetch is a normal, legitimate answer, not an error.
+    let Some(pdf_url) = oa.pdf_url else {
+        return Ok(FetchOutcome::NoPdfFound {
+            doi: doi_value,
+            is_oa: oa.is_oa,
+        });
+    };
+
+    let (path_str, attachment_id, already_present) = land_downloaded_pdf(conn, cite_key, &pdf_url)?;
+    let abs_path = PathBuf::from(&path_str);
+
+    // Partial failure: the attachment persists even if extraction fails --
+    // same rule as `attach --extract` (Phase 7).
+    let extraction: Result<usize, String> =
+        text::extract_text(&abs_path).and_then(|extracted| save_extracted(conn, attachment_id, &extracted));
+
+    Ok(FetchOutcome::Downloaded {
+        doi: doi_value,
+        path: path_str,
+        attachment_id,
+        already_present,
+        extraction,
+    })
+}
+
 fn cmd_fetch(
     conn: &rusqlite::Connection,
     cite_key: String,
     email: Option<String>,
     json: bool,
 ) {
-        let entry = match db::get_entry(conn, &cite_key) {
-            Ok(Some(e)) => e,
-            Ok(None) => die(&format!("no entry found with cite_key '{cite_key}'")),
-            Err(e) => die(&format!("failed to fetch entry: {e}")),
-        };
-        let Some(doi_value) = entry.doi.clone() else {
-            die(&format!(
-                "'{cite_key}' has no DOI on record; set one with `ferref edit {cite_key} --doi <doi>`"
-            ));
-        };
-
-        let resolved_email = match config::resolve_email(email) {
-            Ok(e) => e,
+        let outcome = match fetch_pdf_for_entry(conn, &cite_key, email) {
+            Ok(o) => o,
             Err(e) => die(&e),
         };
 
-        let oa = match doi::fetch_oa_pdf_url(&doi_value, &resolved_email) {
-            Ok(status) => status,
-            Err(e) => die(&format!("failed to query Unpaywall: {e}")),
-        };
-
-        // Having no PDF to fetch is a normal, legitimate answer -- exit 0,
-        // not an error. But "open access with no direct PDF link" and "not
-        // open access" are different facts, and telling a user their OA
-        // paper isn't OA would send them looking for the wrong thing.
-        let Some(pdf_url) = oa.pdf_url else {
-            if json {
-                let out = serde_json::json!({
-                    "cite_key": cite_key,
-                    "doi": doi_value,
-                    "oa_found": false,
-                    "is_oa": oa.is_oa,
-                });
-                emit_json(&out);
-            } else if oa.is_oa {
-                emit(&format!(
-                    "'{cite_key}' (DOI {doi_value}) is open access, but Unpaywall \
-                     has no direct PDF link for it -- only landing pages"
-                ));
-            } else {
-                emit(&format!(
-                    "No open-access copy found for '{cite_key}' (DOI {doi_value})"
-                ));
+        match outcome {
+            FetchOutcome::NoPdfFound { doi, is_oa } => {
+                if json {
+                    let out = serde_json::json!({
+                        "cite_key": cite_key,
+                        "doi": doi,
+                        "oa_found": false,
+                        "is_oa": is_oa,
+                    });
+                    emit_json(&out);
+                } else if is_oa {
+                    emit(&format!(
+                        "'{cite_key}' (DOI {doi}) is open access, but Unpaywall \
+                         has no direct PDF link for it -- only landing pages"
+                    ));
+                } else {
+                    emit(&format!(
+                        "No open-access copy found for '{cite_key}' (DOI {doi})"
+                    ));
+                }
             }
-            return;
-        };
+            FetchOutcome::Downloaded {
+                doi,
+                path,
+                already_present,
+                extraction,
+                ..
+            } => {
+                if json {
+                    let mut out = serde_json::json!({
+                        "cite_key": cite_key,
+                        "doi": doi,
+                        "oa_found": true,
+                        "path": path,
+                        "already_present": already_present,
+                        "extracted": extraction.is_ok(),
+                    });
+                    match &extraction {
+                        Ok(chars) => out["chars"] = serde_json::json!(chars),
+                        Err(e) => out["extract_error"] = serde_json::json!(e),
+                    }
+                    emit_json(&out);
+                } else {
+                    emit(&format!(
+                        "Downloaded open-access PDF for '{cite_key}' to '{path}'"
+                    ));
+                    match &extraction {
+                        Ok(chars) => emit(&format!("Extracted {chars} characters from '{path}'")),
+                        Err(e) => emit(&format!("Warning: extraction failed for '{path}': {e}")),
+                    }
+                }
 
-        let (path_str, attachment_id, already_present) =
-            match land_downloaded_pdf(conn, &cite_key, &pdf_url) {
-                Ok(landed) => landed,
-                Err(e) => die(&e),
-            };
-        let abs_path = PathBuf::from(&path_str);
-
-        // Partial failure: the attachment persists even if extraction
-        // fails -- same rule as `attach --extract` (Phase 7).
-        let extraction: Result<usize, String> = text::extract_text(&abs_path)
-            .and_then(|extracted| save_extracted(conn, attachment_id, &extracted));
-
-        if json {
-            let mut out = serde_json::json!({
-                "cite_key": cite_key,
-                "doi": doi_value,
-                "oa_found": true,
-                "path": path_str,
-                "already_present": already_present,
-                "extracted": extraction.is_ok(),
-            });
-            match &extraction {
-                Ok(chars) => out["chars"] = serde_json::json!(chars),
-                Err(e) => out["extract_error"] = serde_json::json!(e),
+                if extraction.is_err() {
+                    std::process::exit(1);
+                }
             }
-            emit_json(&out);
-        } else {
-            emit(&format!(
-                "Downloaded open-access PDF for '{cite_key}' to '{path_str}'"
-            ));
-            match &extraction {
-                Ok(chars) => emit(&format!("Extracted {chars} characters from '{path_str}'")),
-                Err(e) => emit(&format!("Warning: extraction failed for '{path_str}': {e}")),
-            }
-        }
-
-        if extraction.is_err() {
-            std::process::exit(1);
         }
     }
 

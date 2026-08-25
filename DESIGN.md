@@ -120,6 +120,12 @@ All fifteen phases are complete.
   `config::library_root()` now resolves one fixed location (`FERREF_HOME` env
   var, else `~/.ferref`), so `ferref` is a single library reachable from any
   directory — unlike a git repo, there's nothing to `cd` into.
+- `delete_entry` (and merge's fold-then-delete of the dropped entry) removes
+  the DB rows but never the attachment files in `./pdfs/` — they're orphaned
+  on disk, not cleaned up. True since `rm` shipped in Phase 1; Phase 16 makes
+  it easier to hit casually, since `:d` in the TUI is one confirm away rather
+  than a deliberate CLI invocation. `ferref doctor` (Roadmap) is the natural
+  place to eventually report — and offer to clean up — orphans like these.
 
 BibTeX round trips (Phase 3) lose two things, both inherent to the target format
 rather than fixable in our mapping:
@@ -975,6 +981,28 @@ before review caught them: the attachment-filename collision on merge
 (silent overwrite is exactly the Phase 12 `attach` race bug, in a new
 location) and a blocking network call inside a render loop that must not
 leave the terminal in a broken state if it errors or panics mid-request.
+
+**What review caught.** The attachment-collision handling itself (claim with
+`O_EXCL`, fall back to `-2`/`-3`/...) was correct on the first pass — an
+adversarial review confirmed it directly by forcing a real collision. What
+wasn't correct: `merge_entries`'s attachment loop renamed each drop-side file
+on the filesystem *and then* recorded the move in the (uncommitted) SQL
+transaction, one attachment at a time. Renames aren't transactional — if a
+later attachment in the same merge failed (its DB row pointing at a file
+that had already gone missing, since the database is hand-editable by
+design), the transaction rolled back cleanly, but the earlier attachment's
+file had already been physically moved and stayed moved. Result, reproduced
+directly: a `drop`-side attachment row left pointing at a path that no
+longer existed, and an orphaned file sitting at the destination name with no
+DB row pointing at it — `PRAGMA integrity_check` still reported `ok`, since
+SQLite's own consistency was never in question, only DB-vs-filesystem
+agreement. Fixed two ways: every drop-side attachment's source file is
+checked to actually exist *before* any renames start, so the reported case
+fails loud with zero side effects; and each successful rename is tracked and
+unwound (renamed back) if a later one in the same merge fails, so a
+same-scale problem the pre-flight check can't rule out (permissions, disk
+full, mid-loop) can't leave a half-migrated merge either. A regression test
+reproduces the exact missing-file case.
 
 ---
 

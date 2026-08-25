@@ -225,6 +225,15 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Fold `drop`'s tags, collections, and attachments into `keep`, then
+    /// delete `drop`. `keep`'s own fields (title, doi, ...) are untouched --
+    /// this only moves relationships, not a field-by-field union.
+    Merge {
+        keep: String,
+        drop: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage collections -- nested groupings a paper lives in (unlike tags,
     /// which describe a paper and don't nest).
     Collection {
