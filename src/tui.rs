@@ -1821,18 +1821,18 @@ fn draw(frame: &mut Frame, app: &App) {
         return;
     }
 
-    let outer = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
-    let cols = Layout::horizontal([
+    let [main, footer] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+    let [tree, table, details] = Layout::horizontal([
         Constraint::Length(26),
         Constraint::Min(20),
         Constraint::Length(34),
     ])
-    .split(outer[0]);
+    .areas(main);
 
-    draw_tree(frame, cols[0], app);
-    draw_table(frame, cols[1], app);
-    draw_details(frame, cols[2], app);
-    draw_footer(frame, outer[1], app);
+    draw_tree(frame, tree, app);
+    draw_table(frame, table, app);
+    draw_details(frame, details, app);
+    draw_footer(frame, footer, app);
 
     match &app.mode {
         Mode::Picker {
@@ -1859,17 +1859,52 @@ fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
+// The one cyan-bold accent this whole UI uses for "this needs your
+// attention": a focused pane's border, and -- unconditionally, see
+// floating_window below -- every floating window's border and title.
+const FLOAT_ACCENT: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+
 fn pane_block(title: String, focused: bool) -> Block<'static> {
-    let style = if focused {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
+    let style = if focused { FLOAT_ACCENT } else { Style::default() };
     Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_style(style)
         .title_style(style)
+}
+
+// Rect-centering, Clear, and the accented bordered Block every floating
+// window (a popup, a picker, a menu, a confirmation, an overlay) shares --
+// see DESIGN.md's Phase 16 addendum: every floating window uses
+// FLOAT_ACCENT, unconditionally, no exceptions. Sharing this setup is what
+// makes that true by construction: three popups already shipped without it
+// once, when each of the six draw_* functions below hand-rolled its own
+// copy of exactly this preamble.
+//
+// Returns the popup's Rect and an already-accented Block for the caller to
+// attach to whatever widget it renders into that Rect (`.block(block)`) --
+// the Block isn't rendered here on its own, since a widget needs to own its
+// Block to compute where its content goes *inside* the border; rendering
+// the border separately first would leave the content widget drawing over
+// it. A caller that also needs the accent for content inside the window (a
+// hotkey letter, a heading) uses FLOAT_ACCENT directly.
+fn floating_window(
+    frame: &mut Frame,
+    frame_area: Rect,
+    width: u16,
+    height: u16,
+    title: impl Into<String>,
+) -> (Rect, Block<'static>) {
+    let x = frame_area.x + frame_area.width.saturating_sub(width) / 2;
+    let y = frame_area.y + frame_area.height.saturating_sub(height) / 2;
+    let popup = Rect { x, y, width, height };
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(title.into())
+        .borders(Borders::ALL)
+        .border_style(FLOAT_ACCENT)
+        .title_style(FLOAT_ACCENT);
+    (popup, block)
 }
 
 fn draw_tree(frame: &mut Frame, area: Rect, app: &App) {
@@ -2162,15 +2197,11 @@ fn draw_picker(
     let height = ((rows.len() as u16) + 2)
         .min(frame_area.height.saturating_sub(4))
         .max(3);
-    let x = frame_area.x + frame_area.width.saturating_sub(width) / 2;
-    let y = frame_area.y + frame_area.height.saturating_sub(height) / 2;
-    let popup = Rect { x, y, width, height };
-
-    frame.render_widget(Clear, popup);
-
-    // Cyan-bold on every floating window's border/title -- see DESIGN.md's
-    // Phase 16 addendum: a standing rule, not a per-popup choice.
-    let accent = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let title = match bulk_count {
+        Some(n) => format!("File {n} marked into…"),
+        None => "File into…".to_string(),
+    };
+    let (popup, block) = floating_window(frame, frame_area, width, height, title);
 
     let items: Vec<ListItem> = rows
         .iter()
@@ -2184,18 +2215,8 @@ fn draw_picker(
     let mut state = ListState::default();
     state.select(Some(selected));
 
-    let title = match bulk_count {
-        Some(n) => format!("File {n} marked into…"),
-        None => "File into…".to_string(),
-    };
     let list = List::new(items)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(accent)
-                .title_style(accent),
-        )
+        .block(block)
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(list, popup, &mut state);
 }
@@ -2256,13 +2277,8 @@ fn draw_help(frame: &mut Frame, frame_area: Rect) {
         .map(|(_, rows)| rows.len() as u16 + 1) // +1 for the group heading
         .sum();
     let height = (line_count + 2).min(frame_area.height.saturating_sub(2)).max(3);
-    let x = frame_area.x + frame_area.width.saturating_sub(width) / 2;
-    let y = frame_area.y + frame_area.height.saturating_sub(height) / 2;
-    let popup = Rect { x, y, width, height };
+    let (popup, block) = floating_window(frame, frame_area, width, height, "Keymap");
 
-    frame.render_widget(Clear, popup);
-
-    let accent = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
     let key_width = GROUPS
         .iter()
         .flat_map(|(_, rows)| rows.iter().map(|(k, _)| k.len()))
@@ -2271,7 +2287,7 @@ fn draw_help(frame: &mut Frame, frame_area: Rect) {
 
     let mut lines: Vec<Line> = Vec::new();
     for (heading, rows) in GROUPS {
-        lines.push(Line::from(Span::styled(*heading, accent)));
+        lines.push(Line::from(Span::styled(*heading, FLOAT_ACCENT)));
         for (key, desc) in *rows {
             lines.push(Line::from(vec![
                 Span::raw(format!("  {key:<key_width$}  ")),
@@ -2280,15 +2296,7 @@ fn draw_help(frame: &mut Frame, frame_area: Rect) {
         }
     }
 
-    let para = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title("Keymap")
-                .borders(Borders::ALL)
-                .border_style(accent)
-                .title_style(accent),
-        )
-        .wrap(Wrap { trim: false });
+    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
     frame.render_widget(para, popup);
 }
 
@@ -2299,19 +2307,11 @@ fn draw_command(frame: &mut Frame, frame_area: Rect, app: &App, entry_id: i64) {
 
     let width = 26u16.min(frame_area.width.saturating_sub(4)).max(12);
     let height = 8u16.min(frame_area.height.saturating_sub(4)).max(3);
-    let x = frame_area.x + frame_area.width.saturating_sub(width) / 2;
-    let y = frame_area.y + frame_area.height.saturating_sub(height) / 2;
-    let popup = Rect { x, y, width, height };
+    let (popup, block) = floating_window(frame, frame_area, width, height, cite_key.to_string());
 
-    frame.render_widget(Clear, popup);
-    // Cyan is this codebase's existing "active/focused" accent (see
-    // pane_block), reused here so the palette visibly pops against the
-    // plain-bordered popups (field/entry pickers, confirm) instead of
-    // reading as identical text on a default-styled box.
-    let accent = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
     let hotkey = |key: &'static str, label: &'static str| {
         ListItem::new(Line::from(vec![
-            Span::styled(key, accent),
+            Span::styled(key, FLOAT_ACCENT),
             Span::raw(format!("  {label}")),
         ]))
     };
@@ -2323,14 +2323,7 @@ fn draw_command(frame: &mut Frame, frame_area: Rect, app: &App, entry_id: i64) {
         hotkey("t", "Tag"),
         hotkey("u", "Untag"),
     ];
-    let list = List::new(items).block(
-        Block::default()
-            .title(cite_key.to_string())
-            .borders(Borders::ALL)
-            .border_style(accent)
-            .title_style(accent),
-    );
-    frame.render_widget(list, popup);
+    frame.render_widget(List::new(items).block(block), popup);
 }
 
 // Edit's field-name list: label plus each field's current value, so picking
@@ -2344,15 +2337,7 @@ fn draw_field_picker(frame: &mut Frame, frame_area: Rect, app: &App, entry_id: i
     let height = ((EditField::ALL.len() as u16) + 2)
         .min(frame_area.height.saturating_sub(4))
         .max(3);
-    let x = frame_area.x + frame_area.width.saturating_sub(width) / 2;
-    let y = frame_area.y + frame_area.height.saturating_sub(height) / 2;
-    let popup = Rect { x, y, width, height };
-
-    frame.render_widget(Clear, popup);
-
-    // Cyan-bold on every floating window's border/title -- see DESIGN.md's
-    // Phase 16 addendum: a standing rule, not a per-popup choice.
-    let accent = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let (popup, block) = floating_window(frame, frame_area, width, height, "Edit field");
 
     let value_width = (width as usize).saturating_sub(14);
     let items: Vec<ListItem> = EditField::ALL
@@ -2367,13 +2352,7 @@ fn draw_field_picker(frame: &mut Frame, frame_area: Rect, app: &App, entry_id: i
     state.select(Some(selected));
 
     let list = List::new(items)
-        .block(
-            Block::default()
-                .title("Edit field")
-                .borders(Borders::ALL)
-                .border_style(accent)
-                .title_style(accent),
-        )
+        .block(block)
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(list, popup, &mut state);
 }
@@ -2394,15 +2373,17 @@ fn draw_entry_picker(
     let height = ((rows.len() as u16) + 2)
         .min(frame_area.height.saturating_sub(4))
         .max(3);
-    let x = frame_area.x + frame_area.width.saturating_sub(width) / 2;
-    let y = frame_area.y + frame_area.height.saturating_sub(height) / 2;
-    let popup = Rect { x, y, width, height };
-
-    frame.render_widget(Clear, popup);
-
-    // Cyan-bold on every floating window's border/title -- see DESIGN.md's
-    // Phase 16 addendum: a standing rule, not a per-popup choice.
-    let accent = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let base_title = if within_marked {
+        "Merge into… (marked)"
+    } else {
+        "Merge into…"
+    };
+    let title = if filter.is_empty() {
+        base_title.to_string()
+    } else {
+        format!("{base_title} /{filter}")
+    };
+    let (popup, block) = floating_window(frame, frame_area, width, height, title);
 
     let text_width = (width as usize).saturating_sub(2);
     let items: Vec<ListItem> = rows
@@ -2419,24 +2400,8 @@ fn draw_entry_picker(
         state.select(Some(selected));
     }
 
-    let base_title = if within_marked {
-        "Merge into… (marked)"
-    } else {
-        "Merge into…"
-    };
-    let title = if filter.is_empty() {
-        base_title.to_string()
-    } else {
-        format!("{base_title} /{filter}")
-    };
     let list = List::new(items)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(accent)
-                .title_style(accent),
-        )
+        .block(block)
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(list, popup, &mut state);
 }
@@ -2449,18 +2414,11 @@ fn draw_confirm(frame: &mut Frame, frame_area: Rect, message: &str) {
     // A one-line message always fits a 3-row box (border, content, border);
     // draw()'s own MIN_HEIGHT check guarantees frame_area is tall enough.
     let height = 3;
-    let x = frame_area.x + frame_area.width.saturating_sub(width) / 2;
-    let y = frame_area.y + frame_area.height.saturating_sub(height) / 2;
-    let popup = Rect { x, y, width, height };
-
-    frame.render_widget(Clear, popup);
-    // Same cyan accent as the ':' palette (see draw_command) -- a
-    // destructive/mutating confirmation should pop at least as much as the
-    // menu that led to it, not read as plain text.
-    let accent = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-    let para = Paragraph::new(message.to_string())
-        .block(Block::default().borders(Borders::ALL).border_style(accent))
-        .wrap(Wrap { trim: true });
+    // No title (empty string): a destructive/mutating confirmation still
+    // needs to pop, hence going through floating_window at all, but has
+    // nothing worth naming in the border.
+    let (popup, block) = floating_window(frame, frame_area, width, height, "");
+    let para = Paragraph::new(message.to_string()).block(block).wrap(Wrap { trim: true });
     frame.render_widget(para, popup);
 }
 

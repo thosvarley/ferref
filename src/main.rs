@@ -45,134 +45,10 @@ fn main() {
             url,
             abstract_text,
             json,
-        } => {
-            // --from-url is the third way in, alongside --doi and the manual
-            // flags. It reads a landing page's citation_* meta tags; if the
-            // page names a DOI it hands off to the Crossref path below, since
-            // publisher pages abbreviate and Crossref is authoritative.
-            let mut pending_pdf: Option<String> = None;
-            let mut doi = doi;
-            let mut page: Option<doi::PageMetadata> = None;
-
-            if let Some(page_url) = &from_url {
-                let found = match doi::fetch_page_metadata(page_url) {
-                    Ok(m) => m,
-                    Err(e) => die(&format!("failed to read '{page_url}': {e}")),
-                };
-                if found.doi.is_none() && found.title.is_none() {
-                    die(&format!(
-                        "'{page_url}' has no citation_doi or citation_title meta tag -- \
-                         ferref reads the Highwire Press tags publishers emit for Google \
-                         Scholar, and this page doesn't carry them. Add it by hand, or \
-                         with --doi if you know it."
-                    ));
-                }
-                pending_pdf = found.pdf_url.clone();
-                doi = found.doi.clone();
-                page = Some(found);
-            }
-
-            // --doi fetches metadata from Crossref instead of taking it from
-            // flags -- see Command::Add's docs. Everything else (--type,
-            // --title, --author, --year, ...) is ignored in this mode; only
-            // --key (to override the derived cite_key) still applies.
-            let mut entry = if let Some(doi_value) = doi {
-                let mut entry = match doi::fetch_metadata(&doi_value) {
-                    Ok(e) => e,
-                    Err(e) => die(&format!(
-                        "failed to fetch metadata for DOI '{doi_value}': {e}"
-                    )),
-                };
-                entry.doi = Some(doi_value);
-                // Keep the page we were pointed at. Crossref supplies the
-                // metadata but not this, and dropping it only on the DOI path
-                // meant the common --from-url case lost the URL the user typed
-                // while the rarer fallback kept it.
-                if entry.url.is_none() {
-                    entry.url = from_url.clone();
-                }
-                entry.cite_key = match cite_key {
-                    Some(key) => key,
-                    None => match derive_cite_key(&conn, &entry) {
-                        Ok(key) => key,
-                        Err(e) => die(&e),
-                    },
-                };
-                entry
-            } else if let Some(found) = page {
-                // A page with no DOI: fall back to what it told us directly.
-                // Weaker than Crossref, but it's the difference between working
-                // on a preprint server and refusing to.
-                let mut entry = Entry::new(
-                    "article".to_string(),
-                    String::new(),
-                    found.title.clone().unwrap_or_default(),
-                );
-                for raw in &found.authors {
-                    // citation_author is "Last, First" by convention; parse_author
-                    // treats a comma-less name as all surname, which degrades
-                    // sensibly for the publishers that ignore that.
-                    match cli::parse_author(raw) {
-                        Ok(author) => entry.add_author(author),
-                        Err(_) => continue,
-                    }
-                }
-                entry.year = found.year;
-                entry.journal = found.journal.clone();
-                entry.url = from_url.clone();
-                entry.cite_key = match cite_key {
-                    Some(key) => key,
-                    None => match derive_cite_key(&conn, &entry) {
-                        Ok(key) => key,
-                        Err(e) => die(&e),
-                    },
-                };
-                entry
-            } else {
-                // clap's required_unless_present_any guarantees these are Some
-                // when neither --doi nor --from-url was passed.
-                let mut entry = Entry::new(
-                    entry_type.expect("--type required by clap without --doi"),
-                    cite_key.expect("--key required by clap without --doi"),
-                    title.expect("--title required by clap without --doi"),
-                );
-                for raw in authors {
-                    match cli::parse_author(&raw) {
-                        Ok(author) => entry.add_author(author),
-                        Err(e) => die(&e),
-                    }
-                }
-                entry.year = year;
-                entry.journal = journal;
-                entry.volume = volume;
-                entry.pages = pages;
-                entry.url = url;
-                entry.abstract_text = abstract_text;
-                entry
-            };
-
-            match db::insert_entry(&conn, &entry) {
-                Ok(id) => entry.id = Some(id),
-                Err(e) => die(&db_error("add entry", e)),
-            }
-
-            // The entry is committed before the PDF is attempted: a download
-            // that fails (off the VPN, say) must not cost you the metadata you
-            // just fetched. Same partial-failure rule as `attach --extract`.
-            let pdf = pending_pdf.map(|url| add_pdf_from_page(&conn, &entry.cite_key, &url));
-
-            output_entry(&entry, json);
-            if !json {
-                match &pdf {
-                    Some(Ok(path)) => emit(&format!("Attached '{path}'")),
-                    Some(Err(e)) => eprintln!("Warning: {e}"),
-                    None => {}
-                }
-            }
-            if matches!(pdf, Some(Err(_))) {
-                std::process::exit(1);
-            }
-        }
+        } => cmd_add(
+            &conn, entry_type, cite_key, title, authors, year, journal, volume, pages, doi,
+            from_url, url, abstract_text, json,
+        ),
 
         Command::List {
             tag,
@@ -227,6 +103,10 @@ fn main() {
                 Err(e) => die(&format!("failed to fetch entry: {e}")),
             };
 
+            // title is the one field here that isn't Option<T> on Entry (it's
+            // never null), so unlike every field below it this can't just
+            // reassign the whole Option -- it has to unwrap and move the
+            // String out of Some.
             if let Some(title) = title {
                 entry.title = title;
             }
@@ -508,6 +388,152 @@ fn main() {
                 die(&e);
             }
         }
+    }
+}
+
+// An explicit --key always wins; otherwise derive one from the entry (first
+// author's last name + year, e.g. "kucsko2013") the way both the DOI and
+// --from-url paths in cmd_add need to, identically.
+fn resolve_cite_key(conn: &rusqlite::Connection, explicit: Option<String>, entry: &Entry) -> String {
+    match explicit {
+        Some(key) => key,
+        None => match derive_cite_key(conn, entry) {
+            Ok(key) => key,
+            Err(e) => die(&e),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // one per --flag on `ferref add`, same shape as Command::Add itself
+fn cmd_add(
+    conn: &rusqlite::Connection,
+    entry_type: Option<String>,
+    cite_key: Option<String>,
+    title: Option<String>,
+    authors: Vec<String>,
+    year: Option<i32>,
+    journal: Option<String>,
+    volume: Option<String>,
+    pages: Option<String>,
+    doi: Option<String>,
+    from_url: Option<String>,
+    url: Option<String>,
+    abstract_text: Option<String>,
+    json: bool,
+) {
+    // --from-url is the third way in, alongside --doi and the manual
+    // flags. It reads a landing page's citation_* meta tags; if the
+    // page names a DOI it hands off to the Crossref path below, since
+    // publisher pages abbreviate and Crossref is authoritative.
+    let mut pending_pdf: Option<String> = None;
+    let mut doi = doi;
+    let mut page: Option<doi::PageMetadata> = None;
+
+    if let Some(page_url) = &from_url {
+        let found = match doi::fetch_page_metadata(page_url) {
+            Ok(m) => m,
+            Err(e) => die(&format!("failed to read '{page_url}': {e}")),
+        };
+        if found.doi.is_none() && found.title.is_none() {
+            die(&format!(
+                "'{page_url}' has no citation_doi or citation_title meta tag -- \
+                 ferref reads the Highwire Press tags publishers emit for Google \
+                 Scholar, and this page doesn't carry them. Add it by hand, or \
+                 with --doi if you know it."
+            ));
+        }
+        pending_pdf = found.pdf_url.clone();
+        doi = found.doi.clone();
+        page = Some(found);
+    }
+
+    // --doi fetches metadata from Crossref instead of taking it from
+    // flags -- see Command::Add's docs. Everything else (--type,
+    // --title, --author, --year, ...) is ignored in this mode; only
+    // --key (to override the derived cite_key) still applies.
+    let mut entry = if let Some(doi_value) = doi {
+        let mut entry = match doi::fetch_metadata(&doi_value) {
+            Ok(e) => e,
+            Err(e) => die(&format!(
+                "failed to fetch metadata for DOI '{doi_value}': {e}"
+            )),
+        };
+        entry.doi = Some(doi_value);
+        // Keep the page we were pointed at. Crossref supplies the
+        // metadata but not this, and dropping it only on the DOI path
+        // meant the common --from-url case lost the URL the user typed
+        // while the rarer fallback kept it.
+        if entry.url.is_none() {
+            entry.url = from_url.clone();
+        }
+        entry.cite_key = resolve_cite_key(conn, cite_key, &entry);
+        entry
+    } else if let Some(found) = page {
+        // A page with no DOI: fall back to what it told us directly.
+        // Weaker than Crossref, but it's the difference between working
+        // on a preprint server and refusing to.
+        let mut entry = Entry::new(
+            "article".to_string(),
+            String::new(),
+            found.title.clone().unwrap_or_default(),
+        );
+        for raw in &found.authors {
+            // citation_author is "Last, First" by convention; parse_author
+            // treats a comma-less name as all surname, which degrades
+            // sensibly for the publishers that ignore that.
+            match cli::parse_author(raw) {
+                Ok(author) => entry.add_author(author),
+                Err(_) => continue,
+            }
+        }
+        entry.year = found.year;
+        entry.journal = found.journal.clone();
+        entry.url = from_url.clone();
+        entry.cite_key = resolve_cite_key(conn, cite_key, &entry);
+        entry
+    } else {
+        // clap's required_unless_present_any guarantees these are Some
+        // when neither --doi nor --from-url was passed.
+        let mut entry = Entry::new(
+            entry_type.expect("--type required by clap without --doi"),
+            cite_key.expect("--key required by clap without --doi"),
+            title.expect("--title required by clap without --doi"),
+        );
+        for raw in authors {
+            match cli::parse_author(&raw) {
+                Ok(author) => entry.add_author(author),
+                Err(e) => die(&e),
+            }
+        }
+        entry.year = year;
+        entry.journal = journal;
+        entry.volume = volume;
+        entry.pages = pages;
+        entry.url = url;
+        entry.abstract_text = abstract_text;
+        entry
+    };
+
+    match db::insert_entry(conn, &entry) {
+        Ok(id) => entry.id = Some(id),
+        Err(e) => die(&db_error("add entry", e)),
+    }
+
+    // The entry is committed before the PDF is attempted: a download
+    // that fails (off the VPN, say) must not cost you the metadata you
+    // just fetched. Same partial-failure rule as `attach --extract`.
+    let pdf = pending_pdf.map(|url| add_pdf_from_page(conn, &entry.cite_key, &url));
+
+    output_entry(&entry, json);
+    if !json {
+        match &pdf {
+            Some(Ok(path)) => emit(&format!("Attached '{path}'")),
+            Some(Err(e)) => eprintln!("Warning: {e}"),
+            None => {}
+        }
+    }
+    if matches!(pdf, Some(Err(_))) {
+        std::process::exit(1);
     }
 }
 
