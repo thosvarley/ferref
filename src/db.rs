@@ -384,13 +384,9 @@ pub fn attachments_for_entry(
 // so an attachment row points into the library directory, not at wherever the
 // file was downloaded. Idempotent per the UNIQUE(entry_id, path) constraint; the
 // bool reports whether a row was added.
-// An unknown cite_key is an error (QueryReturnedNoRows), same as add_tag.
+// An unknown cite_key is an error (QueryReturnedNoRows), see entry_id_for.
 pub fn attach(conn: &Connection, cite_key: &str, path: &str) -> Result<(i64, bool)> {
-    let entry_id: i64 = conn.query_row(
-        "SELECT id FROM entries WHERE cite_key = ?1",
-        [cite_key],
-        |row| row.get(0),
-    )?;
+    let entry_id = entry_id_for(conn, cite_key)?;
 
     conn.execute(
         "INSERT OR IGNORE INTO attachments (entry_id, path, date_added) VALUES (?1, ?2, ?3)",
@@ -421,15 +417,10 @@ pub fn set_full_text(conn: &Connection, attachment_id: i64, text: &str) -> Resul
     )
 }
 
-// The attachment paths for one entry, unknown cite_key is an error
-// (QueryReturnedNoRows), same pattern as attach/add_tag.
-// (id, path) pairs -- the id is what set_full_text keys on.
+// The attachment paths for one entry: (id, path) pairs, the id being what
+// set_full_text keys on.
 pub fn attachments_for_cite_key(conn: &Connection, cite_key: &str) -> Result<Vec<(i64, String)>> {
-    let entry_id: i64 = conn.query_row(
-        "SELECT id FROM entries WHERE cite_key = ?1",
-        [cite_key],
-        |row| row.get(0),
-    )?;
+    let entry_id = entry_id_for(conn, cite_key)?;
     let mut stmt =
         conn.prepare("SELECT id, path FROM attachments WHERE entry_id = ?1 ORDER BY id")?;
     stmt.query_map([entry_id], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -517,11 +508,7 @@ pub fn add_tag(conn: &Connection, cite_key: &str, tag: &str) -> Result<bool> {
     let name = normalize_tag(tag).map_err(rusqlite::Error::InvalidParameterName)?;
     let tx = conn.unchecked_transaction()?;
 
-    let entry_id: i64 = tx.query_row(
-        "SELECT id FROM entries WHERE cite_key = ?1",
-        [cite_key],
-        |row| row.get(0),
-    )?;
+    let entry_id = entry_id_for(&tx, cite_key)?;
 
     let changed = attach_tag(&tx, entry_id, &name)?;
 
@@ -537,11 +524,7 @@ pub fn remove_tag(conn: &Connection, cite_key: &str, tag: &str) -> Result<bool> 
     let name = normalize_tag(tag).map_err(rusqlite::Error::InvalidParameterName)?;
     let tx = conn.unchecked_transaction()?;
 
-    let entry_id: i64 = tx.query_row(
-        "SELECT id FROM entries WHERE cite_key = ?1",
-        [cite_key],
-        |row| row.get(0),
-    )?;
+    let entry_id = entry_id_for(&tx, cite_key)?;
 
     tx.execute(
         "DELETE FROM entry_tags WHERE entry_id = ?1 \
@@ -615,6 +598,33 @@ pub fn collection_by_path(conn: &Connection, path: &str) -> Result<Option<i64>> 
         }
     }
     Ok(current)
+}
+
+// Looks up an entry's id by cite_key, exactly the way every write against a
+// single entry needs to before it can touch anything else -- attach,
+// add_tag, remove_tag, add_to_collection, remove_from_collection, and
+// update_entry all did this inline, each with its own "same as attach" or
+// "same as add_tag" comment pointing at one of the others. An unknown
+// cite_key is Err(QueryReturnedNoRows), which `main::entry_error` turns
+// into "no entry found with cite_key '...'" for the user -- that mapping
+// lives at the call site since only the caller knows what action to name
+// in the fallback "failed to {action}" case.
+fn entry_id_for(conn: &Connection, cite_key: &str) -> Result<i64> {
+    conn.query_row(
+        "SELECT id FROM entries WHERE cite_key = ?1",
+        [cite_key],
+        |row| row.get(0),
+    )
+}
+
+// Resolves a collection path or fails with a message already written for a
+// human (InvalidParameterName, which `main::db_error` passes straight
+// through) -- the same "not found" case `collection_by_path` alone leaves
+// as a bare `None` for callers that can't just skip a missing collection.
+fn require_collection(conn: &Connection, path: &str) -> Result<i64> {
+    collection_by_path(conn, path)?.ok_or_else(|| {
+        rusqlite::Error::InvalidParameterName(format!("no collection found at path '{path}'"))
+    })
 }
 
 // One segment of create_collection's mkdir -p loop, and the core the TUI
@@ -736,32 +746,20 @@ pub fn remove_entry_from_collection(conn: &Connection, collection_id: i64, entry
     Ok(conn.changes() > 0)
 }
 
-// Same shape as add_tag: returns whether membership actually changed.
-// Unknown cite_key -> Err(QueryReturnedNoRows), same as add_tag. Unknown
-// collection path -> Err(InvalidParameterName) with a message naming the
-// path, so it isn't confused with the cite_key error upstream.
+// Returns whether membership actually changed. Unknown cite_key ->
+// Err(QueryReturnedNoRows); unknown collection path -> Err(InvalidParameterName)
+// with a message naming the path, so it isn't confused with the cite_key
+// error upstream -- see entry_id_for/require_collection.
 pub fn add_to_collection(conn: &Connection, path: &str, cite_key: &str) -> Result<bool> {
-    let entry_id: i64 = conn.query_row(
-        "SELECT id FROM entries WHERE cite_key = ?1",
-        [cite_key],
-        |row| row.get(0),
-    )?;
-    let collection_id = collection_by_path(conn, path)?.ok_or_else(|| {
-        rusqlite::Error::InvalidParameterName(format!("no collection found at path '{path}'"))
-    })?;
+    let entry_id = entry_id_for(conn, cite_key)?;
+    let collection_id = require_collection(conn, path)?;
     add_entry_to_collection(conn, collection_id, entry_id)
 }
 
 // Same error shape as add_to_collection.
 pub fn remove_from_collection(conn: &Connection, path: &str, cite_key: &str) -> Result<bool> {
-    let entry_id: i64 = conn.query_row(
-        "SELECT id FROM entries WHERE cite_key = ?1",
-        [cite_key],
-        |row| row.get(0),
-    )?;
-    let collection_id = collection_by_path(conn, path)?.ok_or_else(|| {
-        rusqlite::Error::InvalidParameterName(format!("no collection found at path '{path}'"))
-    })?;
+    let entry_id = entry_id_for(conn, cite_key)?;
+    let collection_id = require_collection(conn, path)?;
     remove_entry_from_collection(conn, collection_id, entry_id)
 }
 
@@ -780,15 +778,11 @@ pub fn collections_for_entry(conn: &Connection, entry_id: i64) -> Result<Vec<i64
 // graph it's validating, so it's bounded (32 hops) rather than trusting the
 // graph is acyclic going in.
 pub fn move_collection(conn: &Connection, path: &str, new_parent: Option<&str>) -> Result<()> {
-    let id = collection_by_path(conn, path)?.ok_or_else(|| {
-        rusqlite::Error::InvalidParameterName(format!("no collection found at path '{path}'"))
-    })?;
+    let id = require_collection(conn, path)?;
 
     let new_parent_id: Option<i64> = match new_parent {
         None => None,
-        Some(p) => Some(collection_by_path(conn, p)?.ok_or_else(|| {
-            rusqlite::Error::InvalidParameterName(format!("no collection found at path '{p}'"))
-        })?),
+        Some(p) => Some(require_collection(conn, p)?),
     };
 
     if let Some(np) = new_parent_id {
@@ -915,9 +909,7 @@ fn subtree_ids(conn: &Connection, root: i64) -> Result<Vec<i64>> {
 // how many collections went. Entries are never touched -- only
 // collection_entries membership rows, which cascade off collection_id.
 pub fn delete_collection(conn: &Connection, path: &str) -> Result<usize> {
-    let id = collection_by_path(conn, path)?.ok_or_else(|| {
-        rusqlite::Error::InvalidParameterName(format!("no collection found at path '{path}'"))
-    })?;
+    let id = require_collection(conn, path)?;
     let count = subtree_ids(conn, id)?.len();
     conn.execute("DELETE FROM collections WHERE id = ?1", [id])?;
     Ok(count)
@@ -1181,11 +1173,7 @@ pub fn list_entries(conn: &Connection, filter: &Filter, with_full_text: bool) ->
 pub fn update_entry(conn: &Connection, entry: &Entry) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
 
-    let entry_id: i64 = tx.query_row(
-        "SELECT id FROM entries WHERE cite_key = ?1",
-        [&entry.cite_key],
-        |row| row.get(0),
-    )?;
+    let entry_id = entry_id_for(&tx, &entry.cite_key)?;
 
     reject_duplicate_doi(&tx, entry, Some(entry_id))?;
 
@@ -1359,38 +1347,17 @@ fn move_attachment(
     Ok((old_path.to_path_buf(), new_path))
 }
 
-// Claims a free `<base>.<ext>` / `<base>-2.<ext>` / ... filename in `dir` via
-// O_EXCL (create_new) -- the same race-proof discipline
-// main.rs::copy_into_library/land_downloaded_pdf use: checking a name is
-// free and then writing to it are two steps, and a second mover can land in
-// between them. The empty file this claims is what merge_entries's
+// Claims a free `<base>.<ext>` / `<base>-2.<ext>` / ... filename in `dir`,
+// via the same O_EXCL race-proof claim `main::copy_into_library` uses for
+// the identical problem. The empty file this claims is what merge_entries's
 // std::fs::rename then overwrites.
 fn claim_attachment_name(dir: &Path, base: &str, ext: &str) -> Result<std::path::PathBuf> {
-    for n in 1..=50 {
-        let candidate = if n == 1 {
-            dir.join(format!("{base}.{ext}"))
-        } else {
-            dir.join(format!("{base}-{n}.{ext}"))
-        };
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(_) => return Ok(candidate),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => {
-                return Err(rusqlite::Error::InvalidParameterName(format!(
-                    "failed to claim '{}': {e}",
-                    candidate.display()
-                )))
-            }
-        }
-    }
-    Err(rusqlite::Error::InvalidParameterName(format!(
-        "could not find a free filename for '{base}' in {}",
-        dir.display()
-    )))
+    crate::claim_free_name(dir, base, ext).map_err(|e| {
+        rusqlite::Error::InvalidParameterName(format!(
+            "failed to claim a filename for '{base}' in {}: {e}",
+            dir.display()
+        ))
+    })
 }
 
 #[cfg(test)]

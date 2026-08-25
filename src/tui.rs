@@ -95,9 +95,10 @@ fn handle_key(
     code: KeyCode,
     modifiers: KeyModifiers,
 ) {
-    // An error is shown for exactly one frame: whatever key dismisses it
-    // also clears it, so it can't linger over unrelated activity.
-    app.error = None;
+    // A status message is shown for exactly one frame: whatever key
+    // dismisses it also clears it, so it can't linger over unrelated
+    // activity.
+    app.status = None;
 
     match app.mode {
         Mode::Normal => handle_normal_key(app, conn, code, modifiers),
@@ -132,7 +133,7 @@ fn handle_normal_key(app: &mut App, conn: &Connection, code: KeyCode, modifiers:
             // A failed reload leaves the previous state in place rather
             // than crashing the session over a transient DB error.
             if let Err(e) = app.reload(conn) {
-                app.error = Some(e);
+                app.status = Some(e);
             }
         }
         KeyCode::Up | KeyCode::Char('k') => match app.focus {
@@ -372,18 +373,18 @@ fn handle_picker_key(app: &mut App, conn: &Connection, code: KeyCode) {
                     }
                 }
                 match err {
-                    Some(e) => app.error = Some(e),
+                    Some(e) => app.status = Some(e),
                     None => {
                         member.insert(collection_id); // flips to [x]: confirms this row was filed into
-                        app.error = Some(format!(
+                        app.status = Some(format!(
                             "Filed {filed} of {} marked entr{} into '{collection_name}'",
                             ids.len(),
-                            if ids.len() == 1 { "y" } else { "ies" }
+                            entries_plural(ids.len())
                         ));
                     }
                 }
                 if let Err(e) = app.reload_tree_counts(conn) {
-                    app.error = Some(e);
+                    app.status = Some(e);
                 }
             } else {
                 let is_member = member.contains(&collection_id);
@@ -402,10 +403,10 @@ fn handle_picker_key(app: &mut App, conn: &Connection, code: KeyCode) {
                         // Membership changed a collection's entry_count; the
                         // tree pane's counts need to catch up.
                         if let Err(e) = app.reload_tree_counts(conn) {
-                            app.error = Some(e);
+                            app.status = Some(e);
                         }
                     }
-                    Err(e) => app.error = Some(e.to_string()),
+                    Err(e) => app.status = Some(e.to_string()),
                 }
             }
         }
@@ -484,7 +485,7 @@ fn handle_field_picker_key(app: &mut App, code: KeyCode) {
             app.mode = Mode::FieldPicker { entry_id, selected };
         }
         KeyCode::Enter => {
-            let Some(entry) = app.entries.iter().find(|e| e.id == Some(entry_id)) else {
+            let Some(entry) = app.entry_by_id(entry_id) else {
                 return;
             };
             let field = EditField::ALL[selected];
@@ -574,9 +575,7 @@ fn handle_confirm_key(app: &mut App, conn: &Connection, code: KeyCode) {
 
     let result = match action {
         PendingAction::Delete { entry_id } => app
-            .entries
-            .iter()
-            .find(|e| e.id == Some(entry_id))
+            .entry_by_id(entry_id)
             .map(|e| e.cite_key.clone())
             .ok_or_else(|| "entry no longer exists".to_string())
             .and_then(|cite_key| db::delete_entry(conn, &cite_key).map_err(|e| e.to_string())),
@@ -584,14 +583,14 @@ fn handle_confirm_key(app: &mut App, conn: &Connection, code: KeyCode) {
             .map_err(|e| crate::db_error("merge entries", e)),
     };
     if let Err(e) = result {
-        app.error = Some(e);
+        app.status = Some(e);
     }
 
     app.marked.clear();
     // The entry list's shape changed (a row is gone) either way -- reload
     // rather than patch app.entries in place.
     if let Err(e) = app.reload(conn) {
-        app.error = Some(e);
+        app.status = Some(e);
     }
 }
 
@@ -796,15 +795,7 @@ impl EditField {
             EditField::Doi => e.doi.clone().unwrap_or_default(),
             EditField::Url => e.url.clone().unwrap_or_default(),
             EditField::Abstract => e.abstract_text.clone().unwrap_or_default(),
-            EditField::Authors => e
-                .authors
-                .iter()
-                .map(|a| match &a.first_name {
-                    Some(f) => format!("{}, {}", a.last_name, f),
-                    None => a.last_name.clone(),
-                })
-                .collect::<Vec<_>>()
-                .join("; "),
+            EditField::Authors => crate::format_authors(&e.authors),
         }
     }
 
@@ -935,9 +926,10 @@ struct App {
 
     focus: Focus,
     mode: Mode,
-    // Set by a failed write or reload, shown on the footer for one
-    // keypress, then cleared by handle_key.
-    error: Option<String>,
+    // The footer's one-line message slot: an error, a confirmation, or an
+    // in-progress notice ("Fetching…", "Copied ...", "Filed N of M..."),
+    // shown for exactly one keypress, then cleared by handle_key.
+    status: Option<String>,
     should_quit: bool,
 
     // "y"'s clipboard handle, created once and held for the app's whole
@@ -970,7 +962,7 @@ impl App {
             marked: Vec::new(),
             focus: Focus::Collections,
             mode: Mode::Normal,
-            error: None,
+            status: None,
             should_quit: false,
             clipboard: arboard::Clipboard::new().ok(),
         };
@@ -1035,6 +1027,14 @@ impl App {
         self.view.get(self.table_selected).map(|&i| &self.entries[i])
     }
 
+    // Looks up an entry by id in the already-loaded set -- the id half of
+    // what selected_entry does by table position. What "not found" means
+    // (a no-op, an error, an empty default) differs by call site, same as
+    // it always did; this only shares the lookup itself.
+    fn entry_by_id(&self, id: i64) -> Option<&Entry> {
+        self.entries.iter().find(|e| e.id == Some(id))
+    }
+
     // The target set for a bulk action (export, tag/untag): the marked
     // entries, or just `entry_id` alone with nothing marked. Same rule
     // `open_picker`'s bulk-file mode uses.
@@ -1054,14 +1054,14 @@ impl App {
         match db::create_collection_under(conn, parent, name) {
             Ok(_) => {
                 if let Err(e) = self.reload(conn) {
-                    self.error = Some(e);
+                    self.status = Some(e);
                 }
             }
             // db_error, not e.to_string(): a rejected name arrives as
             // InvalidParameterName wrapping a message already written for a
             // human, and to_string() prefixes it with "Invalid parameter
             // name:" -- rusqlite's vocabulary leaking onto the footer.
-            Err(e) => self.error = Some(crate::db_error("create collection", e)),
+            Err(e) => self.status = Some(crate::db_error("create collection", e)),
         }
     }
 
@@ -1086,12 +1086,12 @@ impl App {
         let tree = match db::collection_tree(conn) {
             Ok(t) => t,
             Err(e) => {
-                self.error = Some(e.to_string());
+                self.status = Some(e.to_string());
                 return;
             }
         };
         if tree.is_empty() {
-            self.error = Some("no collections exist yet -- create one with 'n' first".to_string());
+            self.status = Some("no collections exist yet -- create one with 'n' first".to_string());
             return;
         }
 
@@ -1104,7 +1104,7 @@ impl App {
             match db::collections_for_entry(conn, entry_id) {
                 Ok(v) => v.into_iter().collect(),
                 Err(e) => {
-                    self.error = Some(e.to_string());
+                    self.status = Some(e.to_string());
                     return;
                 }
             }
@@ -1133,12 +1133,12 @@ impl App {
             return;
         };
         if entry.attachments.is_empty() {
-            self.error = Some(format!("'{}' has no attachments", entry.cite_key));
+            self.status = Some(format!("'{}' has no attachments", entry.cite_key));
             return;
         }
         for a in &entry.attachments {
             if let Err(e) = crate::open_path(&a.path) {
-                self.error = Some(e);
+                self.status = Some(e);
                 return;
             }
         }
@@ -1165,10 +1165,10 @@ impl App {
             return;
         };
         let Some(url) = url_for_entry(entry) else {
-            self.error = Some(format!("'{}' has no URL or DOI to copy", entry.cite_key));
+            self.status = Some(format!("'{}' has no URL or DOI to copy", entry.cite_key));
             return;
         };
-        self.error = Some(match &mut self.clipboard {
+        self.status = Some(match &mut self.clipboard {
             Some(cb) => match cb.set_text(&url) {
                 Ok(()) => format!("Copied {url}"),
                 Err(e) => format!("failed to copy to clipboard: {e}"),
@@ -1207,21 +1207,21 @@ impl App {
     // function `ferref edit` uses, so a TUI edit and a CLI edit go through
     // one write path.
     fn apply_field_edit(&mut self, conn: &Connection, entry_id: i64, field: EditField, raw: &str) {
-        let Some(current) = self.entries.iter().find(|e| e.id == Some(entry_id)) else {
+        let Some(current) = self.entry_by_id(entry_id) else {
             return;
         };
         let mut updated = current.clone();
         if let Err(e) = field.apply(&mut updated, raw) {
-            self.error = Some(e);
+            self.status = Some(e);
             return;
         }
         match db::update_entry(conn, &updated) {
             Ok(()) => {
                 if let Err(e) = self.refresh_entry(conn, entry_id) {
-                    self.error = Some(e);
+                    self.status = Some(e);
                 }
             }
-            Err(e) => self.error = Some(crate::db_error("update entry", e)),
+            Err(e) => self.status = Some(crate::db_error("update entry", e)),
         }
     }
 
@@ -1232,23 +1232,23 @@ impl App {
     // Fetch has no --email flag here.
     fn export_bibtex(&mut self, ids: &[i64], path: &str) {
         if path.is_empty() {
-            self.error = Some("export path cannot be empty".to_string());
+            self.status = Some("export path cannot be empty".to_string());
             return;
         }
         let selected: Vec<Entry> = ids
             .iter()
-            .filter_map(|id| self.entries.iter().find(|e| e.id == Some(*id)).cloned())
+            .filter_map(|&id| self.entry_by_id(id).cloned())
             .collect();
         let bibtex_str = crate::bibtex::export(&selected, false);
         match std::fs::write(path, &bibtex_str) {
             Ok(()) => {
-                self.error = Some(format!(
+                self.status = Some(format!(
                     "Exported {} entr{} to '{path}'",
                     selected.len(),
-                    if selected.len() == 1 { "y" } else { "ies" }
+                    entries_plural(selected.len())
                 ));
             }
-            Err(e) => self.error = Some(format!("failed to write '{path}': {e}")),
+            Err(e) => self.status = Some(format!("failed to write '{path}': {e}")),
         }
     }
 
@@ -1258,12 +1258,12 @@ impl App {
     // already tagged, some not) is not an error.
     fn apply_tag(&mut self, conn: &Connection, ids: &[i64], tag: &str, add: bool) {
         if tag.is_empty() {
-            self.error = Some("tag name cannot be empty".to_string());
+            self.status = Some("tag name cannot be empty".to_string());
             return;
         }
         let cite_keys: Vec<String> = ids
             .iter()
-            .filter_map(|id| self.entries.iter().find(|e| e.id == Some(*id)).map(|e| e.cite_key.clone()))
+            .filter_map(|&id| self.entry_by_id(id).map(|e| e.cite_key.clone()))
             .collect();
 
         let mut changed = 0usize;
@@ -1276,7 +1276,14 @@ impl App {
             match result {
                 Ok(did_change) => changed += did_change as usize,
                 Err(e) => {
-                    self.error = Some(e.to_string());
+                    // crate::entry_error, not e.to_string(): add_tag/remove_tag
+                    // report an unknown cite_key as QueryReturnedNoRows, which
+                    // would otherwise reach the footer as the bare SQLite
+                    // message "Query returned no rows" instead of naming the
+                    // entry that vanished (e.g. deleted from another session
+                    // between load and this tag action).
+                    let action = if add { "tag entry" } else { "untag entry" };
+                    self.status = Some(crate::entry_error(cite_key, action, e));
                     return;
                 }
             }
@@ -1287,16 +1294,16 @@ impl App {
         // show stale tags until the next full reload.
         for &id in ids {
             if let Err(e) = self.refresh_entry(conn, id) {
-                self.error = Some(e);
+                self.status = Some(e);
                 return;
             }
         }
 
         let verb = if add { "Tagged" } else { "Untagged" };
-        self.error = Some(format!(
+        self.status = Some(format!(
             "{verb} {changed} of {} entr{} with '{tag}'",
             cite_keys.len(),
-            if cite_keys.len() == 1 { "y" } else { "ies" }
+            entries_plural(cite_keys.len())
         ));
     }
 
@@ -1312,36 +1319,31 @@ impl App {
         terminal: &mut ratatui::DefaultTerminal,
         entry_id: i64,
     ) {
-        let Some(cite_key) = self
-            .entries
-            .iter()
-            .find(|e| e.id == Some(entry_id))
-            .map(|e| e.cite_key.clone())
-        else {
+        let Some(cite_key) = self.entry_by_id(entry_id).map(|e| e.cite_key.clone()) else {
             return;
         };
 
-        self.error = Some(format!("Fetching PDF for '{cite_key}'\u{2026}"));
+        self.status = Some(format!("Fetching PDF for '{cite_key}'\u{2026}"));
         let _ = terminal.draw(|frame| draw(frame, self));
 
         match crate::fetch_pdf_for_entry(conn, &cite_key, None) {
             Ok(crate::FetchOutcome::NoPdfFound { is_oa, .. }) => {
-                self.error = Some(if is_oa {
+                self.status = Some(if is_oa {
                     format!("'{cite_key}' is open access, but Unpaywall has no direct PDF link")
                 } else {
                     format!("No open-access copy found for '{cite_key}'")
                 });
             }
             Ok(crate::FetchOutcome::Downloaded { path, extraction, .. }) => {
-                self.error = Some(match extraction {
+                self.status = Some(match extraction {
                     Ok(chars) => format!("Downloaded '{path}' ({chars} chars extracted)"),
                     Err(e) => format!("Downloaded '{path}', but extraction failed: {e}"),
                 });
                 if let Err(e) = self.refresh_entry(conn, entry_id) {
-                    self.error = Some(e);
+                    self.status = Some(e);
                 }
             }
-            Err(e) => self.error = Some(e),
+            Err(e) => self.status = Some(e),
         }
     }
 
@@ -1393,9 +1395,7 @@ impl App {
         // so a long title plus the trailing "y/n" can't wrap the confirm
         // box past one line and push the actual prompt off screen.
         let title_of = |id: i64| {
-            self.entries
-                .iter()
-                .find(|e| e.id == Some(id))
+            self.entry_by_id(id)
                 .map(|e| truncate_display(&e.title, 20))
                 .unwrap_or_default()
         };
@@ -1407,7 +1407,7 @@ impl App {
 
     // ":" -> "d".
     fn begin_delete(&mut self, entry_id: i64) {
-        let Some(entry) = self.entries.iter().find(|e| e.id == Some(entry_id)) else {
+        let Some(entry) = self.entry_by_id(entry_id) else {
             return;
         };
         self.mode = Mode::Confirm {
@@ -1476,7 +1476,7 @@ impl App {
                 self.table_selected = 0;
                 self.rebuild_view();
             }
-            Err(e) => self.error = Some(e),
+            Err(e) => self.status = Some(e),
         }
     }
 
@@ -1650,6 +1650,12 @@ fn clamp_selection(selected: usize, len: usize) -> usize {
 // turned into a real, resolvable link (not just the bare identifier), else
 // nothing to copy. Pure and DB-free so it's testable without a live
 // clipboard -- see App::copy_url for the actual arboard call.
+// "entry" or "entries" depending on n, for the several footer messages that
+// report how many of a marked/bulk set something happened to.
+fn entries_plural(n: usize) -> &'static str {
+    if n == 1 { "y" } else { "ies" }
+}
+
 fn url_for_entry(entry: &Entry) -> Option<String> {
     if let Some(url) = &entry.url {
         return Some(url.clone());
@@ -2007,15 +2013,7 @@ fn details_lines(e: &Entry, lengths: Option<&Vec<Option<i64>>>) -> Vec<Line<'sta
     ))];
 
     if !e.authors.is_empty() {
-        let names: Vec<String> = e
-            .authors
-            .iter()
-            .map(|a| match &a.first_name {
-                Some(f) => format!("{}, {}", a.last_name, f),
-                None => a.last_name.clone(),
-            })
-            .collect();
-        lines.push(Line::raw(names.join("; ")));
+        lines.push(Line::raw(crate::format_authors(&e.authors)));
     }
 
     let mut meta = Vec::new();
@@ -2094,13 +2092,13 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(para, area);
 }
 
-// Priority order: a pending error beats everything (it's transient, shown
-// once); then the input prompt, so the user can see what they're typing;
-// then the active filter, so it doesn't silently vanish from view; then the
-// keymap.
+// Priority order: a pending status message beats everything (it's
+// transient, shown once); then the input prompt, so the user can see what
+// they're typing; then the active filter, so it doesn't silently vanish
+// from view; then the keymap.
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let text = if let Some(err) = &app.error {
-        format!(" {err}")
+    let text = if let Some(status) = &app.status {
+        format!(" {status}")
     } else {
         match &app.mode {
             Mode::Input(InputKind::Search { .. }, buffer) => format!(" /{buffer}"),
@@ -2111,14 +2109,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 format!(" {}: {buffer}", field.label())
             }
             Mode::Input(InputKind::ExportPath { ids }, buffer) => {
-                format!(" Export {} entr{} to: {buffer}", ids.len(), if ids.len() == 1 { "y" } else { "ies" })
+                format!(" Export {} entr{} to: {buffer}", ids.len(), entries_plural(ids.len()))
             }
             Mode::Input(InputKind::Tag { ids, add }, buffer) => {
                 format!(
                     " {} {} entr{}: {buffer}",
                     if *add { "Tag" } else { "Untag" },
                     ids.len(),
-                    if ids.len() == 1 { "y" } else { "ies" }
+                    entries_plural(ids.len())
                 )
             }
             Mode::Picker { bulk: None, .. } => {
@@ -2297,12 +2295,7 @@ fn draw_help(frame: &mut Frame, frame_area: Rect) {
 // The ":" palette -- a small fixed list, titled with the scoped entry's
 // cite_key so it's clear which paper the four actions apply to.
 fn draw_command(frame: &mut Frame, frame_area: Rect, app: &App, entry_id: i64) {
-    let cite_key = app
-        .entries
-        .iter()
-        .find(|e| e.id == Some(entry_id))
-        .map(|e| e.cite_key.as_str())
-        .unwrap_or("");
+    let cite_key = app.entry_by_id(entry_id).map(|e| e.cite_key.as_str()).unwrap_or("");
 
     let width = 26u16.min(frame_area.width.saturating_sub(4)).max(12);
     let height = 8u16.min(frame_area.height.saturating_sub(4)).max(3);
@@ -2343,7 +2336,7 @@ fn draw_command(frame: &mut Frame, frame_area: Rect, app: &App, entry_id: i64) {
 // Edit's field-name list: label plus each field's current value, so picking
 // one is informed rather than a guess at what's already there.
 fn draw_field_picker(frame: &mut Frame, frame_area: Rect, app: &App, entry_id: i64, selected: usize) {
-    let Some(entry) = app.entries.iter().find(|e| e.id == Some(entry_id)) else {
+    let Some(entry) = app.entry_by_id(entry_id) else {
         return;
     };
 
@@ -2556,6 +2549,27 @@ mod tests {
         e
     }
 
+    // EditField::Authors::current_value formats an author list into the
+    // "Last, First; Last, First" text box, and ::apply parses that same
+    // text back into a Vec<Author> -- a serialize/deserialize pair that
+    // nothing previously checked agree with each other. Re-applying a
+    // value the field itself just produced must be a fixed point: it
+    // shouldn't add, drop, or reorder an author, or start requiring commas
+    // parse_author doesn't actually need (a lone surname has none).
+    #[test]
+    fn edit_field_authors_round_trips_through_its_own_current_value() {
+        let mut e = Entry::new("article".to_string(), "k".to_string(), "T".to_string());
+        e.add_author(Author::new("Shannon".to_string(), Some("C.E.".to_string())));
+        e.add_author(Author::new("Jaynes".to_string(), None));
+
+        let text = EditField::Authors.current_value(&e);
+        assert_eq!(text, "Shannon, C.E.; Jaynes");
+
+        let mut roundtripped = mk_entry("T", "", None, "");
+        EditField::Authors.apply(&mut roundtripped, &text).unwrap();
+        assert_eq!(roundtripped.authors, e.authors);
+    }
+
     #[test]
     fn url_for_entry_prefers_url_then_falls_back_to_doi_then_nothing() {
         let mut e = mk_entry("Paper", "Smith", Some(2020), "");
@@ -2636,7 +2650,7 @@ mod tests {
             marked: Vec::new(),
             focus: Focus::Entries,
             mode: Mode::Normal,
-            error: None,
+            status: None,
             should_quit: false,
             clipboard: None,
         };

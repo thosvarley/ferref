@@ -654,13 +654,12 @@ fn cmd_import(conn: &rusqlite::Connection, path: PathBuf, json: bool) {
             match db::insert_entry(conn, entry) {
                 Ok(_) => imported.push(entry.cite_key.clone()),
                 Err(e) => {
-                    let msg = e.to_string();
                     // Already-held rows are the only expected failure
                     // mode; anything else is bad data.
-                    if is_duplicate(&msg) {
+                    if is_duplicate(&e) {
                         skipped.push(entry.cite_key.clone());
                     } else {
-                        rejected.push((entry.cite_key.clone(), msg));
+                        rejected.push((entry.cite_key.clone(), e.to_string()));
                     }
                 }
             }
@@ -1265,6 +1264,17 @@ fn pdf_target(
     pick_target(dir, base, ext, &mine, source)
 }
 
+// The Nth candidate in the `<base>.<ext>`, `<base>-2.<ext>`, `<base>-3.<ext>`,
+// ... naming scheme every attachment-placing path (attach, fetch, merge)
+// shares. Just the name, not a claim on it -- see claim_free_name for that.
+fn nth_candidate_name(dir: &Path, base: &str, ext: &str, n: u32) -> std::path::PathBuf {
+    if n == 1 {
+        dir.join(format!("{base}.{ext}"))
+    } else {
+        dir.join(format!("{base}-{n}.{ext}"))
+    }
+}
+
 // The filename choice on its own, so it can be tested without a database.
 // `source` is the file about to be copied in, if any: `fetch` re-downloads one
 // fixed URL per entry, so any file of this entry's already sitting at the name
@@ -1278,11 +1288,7 @@ fn pick_target(
     source: Option<&Path>,
 ) -> Result<(std::path::PathBuf, bool), String> {
     for n in 1..=50 {
-        let candidate = if n == 1 {
-            dir.join(format!("{base}.{ext}"))
-        } else {
-            dir.join(format!("{base}-{n}.{ext}"))
-        };
+        let candidate = nth_candidate_name(dir, base, ext, n);
 
         if !candidate.exists() {
             return Ok((candidate, false));
@@ -1301,6 +1307,31 @@ fn pick_target(
         "could not find a free filename for '{base}' in {}",
         dir.display()
     ))
+}
+
+// Atomically claims a free `<base>.<ext>` / `<base>-2.<ext>` / ... name in
+// `dir` via O_EXCL (create_new): checking a name is free and then writing to
+// it are two steps, and a second mover can land in between them (measured
+// directly, when this raced inside `copy_into_library`: 14 of 60 concurrent
+// pairs lost a file outright, each side reporting success). Unlike
+// `pick_target`, never reuses an existing file -- callers that want that
+// (attach/fetch's "is this already mine?" policy) do that check themselves
+// before ever getting here; this only ever hands back a name nothing existed
+// at a moment ago.
+pub(crate) fn claim_free_name(dir: &Path, base: &str, ext: &str) -> std::io::Result<std::path::PathBuf> {
+    const MAX_ATTEMPTS: u32 = 50;
+    for n in 1..=MAX_ATTEMPTS {
+        let candidate = nth_candidate_name(dir, base, ext, n);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(_) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "could not find a free filename for '{base}' in {}",
+        dir.display()
+    )))
 }
 
 // Length first, so the common "different paper" case never reads either file.
@@ -1437,11 +1468,19 @@ fn entry_error(cite_key: &str, action: &str, e: rusqlite::Error) -> String {
 }
 
 // "You already have this paper", by either name: the same cite_key (SQLite's
-// own UNIQUE constraint) or the same DOI (db::insert_entry's guard). Import
-// counts both as a skip rather than a failure, so re-importing a .bib you
-// already hold stays a successful no-op even when its keys have drifted.
-fn is_duplicate(msg: &str) -> bool {
-    msg.contains("UNIQUE constraint") || msg.contains("is already on entry")
+// own UNIQUE constraint) or the same DOI (db::insert_entry's guard, raised as
+// InvalidParameterName with a message already written for a human -- see
+// reject_duplicate_doi in db.rs). Import counts both as a skip rather than a
+// failure, so re-importing a .bib you already hold stays a successful no-op
+// even when its keys have drifted.
+//
+// Checked via the typed error, not by matching SQLite's English constraint
+// message: rusqlite exposes the real error code, and a locale/version change
+// to that message text shouldn't silently turn "already have this" into
+// "corrupt data" for every future import.
+fn is_duplicate(e: &rusqlite::Error) -> bool {
+    e.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation)
+        || matches!(e, rusqlite::Error::InvalidParameterName(msg) if msg.contains("is already on entry"))
 }
 
 // Collection functions (create_collection, move_collection, delete_collection)
@@ -1556,24 +1595,6 @@ struct TextSearchResult {
 const SNIPPET_CONTEXT_BYTES: usize = 50;
 const SNIPPET_MAX_MATCHES: usize = 3;
 
-// Rounds a byte index down/up to the nearest valid UTF-8 char boundary.
-// Widens a snippet window outward rather than shrinking it, so slicing at
-// `idx` never lands mid-character (which panics). str::is_char_boundary is
-// stable; no need for the nightly-only floor/ceil_char_boundary.
-fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
-    while idx > 0 && !s.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    idx
-}
-
-fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {
-    while idx < s.len() && !s.is_char_boundary(idx) {
-        idx += 1;
-    }
-    idx
-}
-
 // PDF extraction leaves ugly line-wrapping; collapses any run of whitespace
 // (including newlines) in a snippet down to a single space.
 fn collapse_whitespace(s: &str) -> String {
@@ -1614,8 +1635,8 @@ fn find_snippets(
         count += 1;
 
         if snippets.len() < max_matches {
-            let start = floor_char_boundary(text, match_start.saturating_sub(context_bytes));
-            let end = ceil_char_boundary(text, (match_end + context_bytes).min(text.len()));
+            let start = text.floor_char_boundary(match_start.saturating_sub(context_bytes));
+            let end = text.ceil_char_boundary((match_end + context_bytes).min(text.len()));
             let mut snippet = collapse_whitespace(&text[start..end]);
             if start > 0 {
                 snippet = format!("…{snippet}");

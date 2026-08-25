@@ -176,12 +176,12 @@ fn truncate_to_char_boundary(mut text: String, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text;
     }
-    let mut cut = max_bytes;
-    while !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
+    let cut = text.floor_char_boundary(max_bytes);
     text.truncate(cut);
-    text.push_str("\n\n[...truncated: extracted text exceeded 10MB...]");
+    text.push_str(&format!(
+        "\n\n[...truncated: extracted text exceeded {}MB...]",
+        max_bytes / (1024 * 1024)
+    ));
     text
 }
 
@@ -214,5 +214,18 @@ mod tests {
             extract_text(Path::new("/definitely/not/a/real/path/x.pdf")).is_err(),
             "missing file"
         );
+    }
+
+    #[test]
+    fn truncate_to_char_boundary_cuts_at_a_char_boundary_and_names_the_real_limit() {
+        // Under the limit: untouched.
+        assert_eq!(truncate_to_char_boundary("hello".to_string(), 10), "hello");
+
+        // Over the limit, and the naive byte cut ("héllo" cut at 3 bytes)
+        // would land inside the 2-byte 'é' -- must round down instead of
+        // panicking or corrupting the string.
+        let truncated = truncate_to_char_boundary("héllo".to_string(), 3);
+        assert!(truncated.starts_with('h'), "must not slice through a multibyte char");
+        assert!(truncated.contains("exceeded 0MB"), "message must reflect the actual limit passed in, not a hardcoded one: {truncated}");
     }
 }

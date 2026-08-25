@@ -61,7 +61,7 @@ pub struct Entry {
     pub date_modified: i64,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Author {
     // first_name is optional (some citations only have last names)
     pub first_name: Option<String>,
