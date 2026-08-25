@@ -846,18 +846,138 @@ without one. Fixed by loading one entry's attachments at a time
 
 ---
 
+## Phase 16 — TUI: editing, fetch, delete, and merge
+
+Phase 12 drew a line — "the TUI can file and find papers, but cannot destroy
+data" — as an implementation-time scoping call, not something the user ever
+asked for. In practice it's pure friction: fixing a typo'd journal name or
+adding a missing DOI by hand means leaving the TUI for another pane to run
+`ferref edit`. This phase moves that line: the TUI gains editing, `fetch`,
+delete, and merge, gated behind a `:`-command palette (vim-style) rather than
+bare keystrokes, so the mutating/destructive actions are deliberate rather
+than a stray keypress away. Sorting, search, and collection filing (`c`, `n`)
+keep their existing bare-key bindings — only the four new operations below go
+through `:`.
+
+**The `:` palette.** Pressing `:` with focus on `Entries` or `Details` and a
+row selected opens a small popup, scoped to the selected entry:
+
+```
+┌ shannon1948 ───────────┐
+│ e  Edit field          │
+│ f  Fetch PDF           │
+│ m  Merge               │
+│ d  Delete              │
+└─────────────────────────┘
+```
+
+`Esc` closes it with no effect. A new `Mode::Command` variant, rendered the
+same way `Mode::Picker`'s popup already is (`draw_picker`, `Clear` first so
+panes underneath don't bleed through).
+
+**Edit** (`e`) opens a picker of fields — title, year, journal, volume,
+pages, doi, url, abstract, authors — each showing its current value.
+Selecting one opens `Mode::Input` (reusing the existing single-line input the
+search box and "new collection" prompt already use) pre-filled with that
+field's current value; `Enter` saves via `db::update_entry` (`db.rs:1165`,
+already exists, already used by `ferref edit`) and returns to the field
+picker rather than to `Normal`, so several fields can be fixed in one visit.
+`Esc` at the field picker returns to `Normal`. Authors edit as one
+semicolon-separated "Last, First; Last, First" line replacing the whole
+list — the same whole-list-replace semantics `ferref edit --author` already
+has, not a new per-author sub-editor.
+
+**Fetch** (`f`) reuses `cmd_fetch`'s logic (`main.rs:674`) — Unpaywall lookup
+by the entry's DOI, download and land the PDF, extract text — which today
+calls `die()` (`process::exit`) on any failure. That has to be pulled out
+into a function returning `Result<FetchOutcome, String>` that both the CLI
+handler and the TUI call, so a fetch failure in the TUI becomes a footer
+error (`app.error`) instead of killing the whole session. No async runtime
+(consistent with Phase 11's call): the network request blocks the event
+loop for its duration. The UI must render a "Fetching…" footer state
+*before* making the blocking call, not after, or the freeze looks like a
+hang rather than progress.
+
+**Delete** (`d`) opens a y/n confirm popup ("Delete '<title>' [<cite_key>]?
+y/n") before calling `db::delete_entry` (`db.rs:1206`). Any other key than
+`y` cancels. A new `Mode::Confirm { message, on_yes }`-shaped variant (exact
+shape is an implementation detail — an enum of pending actions is simplest,
+a boxed closure is more general and probably unneeded for four call sites).
+
+**Merge** (`m`) is new at every layer — `db::merge_entries` doesn't exist yet
+(it was a "roadmap, not yet scoped" bullet; this phase scopes and builds it),
+and so does a CLI `ferref merge <keep> <drop>` that calls the same function,
+matching the existing rule that a write has exactly one implementation
+regardless of which front end triggers it. `merge_entries(conn, keep_id,
+drop_id)`:
+
+- Re-parents `drop_id`'s rows in `entry_tags` and `collection_entries` onto
+  `keep_id` (`INSERT OR IGNORE`, since `drop` and `keep` may already share a
+  tag or collection — both tables have the entry_id in their primary key).
+- Re-parents `attachments` rows onto `keep_id`, handling the real trap the
+  roadmap note flagged: attachments physically live at `./pdfs/<cite_key>.<ext>`
+  (Phase 12), so a `drop`-side attachment's path collides with a `keep`-side
+  file of the same extension. Needs the same claim-with-`O_EXCL` discipline
+  Phase 12's `attach` race fix already established, not a bare
+  `UPDATE ... SET entry_id`.
+- Deletes the `drop` entry (`db::delete_entry`), cascading its now-empty
+  `authors` row via the existing `ON DELETE CASCADE`.
+- Whichever entry's own fields (title, year, doi, ...) `keep_id` had going in
+  are untouched — merge folds relationships (tags, collections, attachments)
+  into the survivor, it does not attempt a field-by-field union. If `drop`
+  had a field `keep` is missing, that's what Edit is for afterward.
+
+**Choosing the pair to merge, in the TUI.** `Space` (Entries pane, `Normal`
+mode) toggles the current row into a new `marked: Vec<i64>` on `App` —
+insertion-ordered, not a `HashSet`, because order is the whole UX: the first
+entry marked is the one that survives, the second is the one that gets
+folded in and deleted. Marked rows get a visible marker (a distinct cell
+style, not just the existing selection highlight, since a mark must stay
+visible after the cursor moves off the row) and the `ENTRIES` pane title
+gains a `(N marked)` suffix whenever the set is non-empty, so the state is
+never invisible. `Esc` (which already clears the search filter) clears
+marks too.
+
+`:` → `m` behavior depends on how many are marked:
+- **Exactly 2** — those two are the pair; skip straight to the confirm popup
+  ("Merge '<drop title>' into '<keep title>'? y/n"), naming both explicitly
+  since order isn't visually obvious from the mark alone.
+- **0 or 1** (the default — this is "default to 1" from user's mark being
+  optional) — the *selected* row is the keeper, and a live-filtered picker
+  (same list-with-typeahead widget the Phase 12 collection picker already
+  is, just listing entries instead of collections) opens to choose the entry
+  to fold in and delete. Then the same confirm popup.
+- **3 or more** — footer error ("merge only supports two entries at a time"),
+  no action. Chained/N-way merges are out of scope; do them one pair at a
+  time.
+
+Marks are cleared after a merge completes either way.
+
+**Still out of scope.** Renaming a cite_key (Phase 10's own noted
+limitation — a `/` in a collection name has no addressable path, and a
+cite_key rename has the same shape of problem for attachment filenames that
+merge's collision handling exists to solve; worth its own phase). Creating a
+brand-new entry from inside the TUI (`add` stays CLI-only; the TUI's job is
+managing what's already there). Tagging/untagging from the TUI (not asked
+for here, and `Edit`'s field list doesn't cover tags since they're not an
+`entries` column).
+
+Delegation: **yes / yes**. Bigger than Phase 12's grind (five new modes worth
+of key handling, a field-by-field editor, a confirm flow) plus two genuine
+correctness traps in the same class Phase 12 and 15 were both burned by
+before review caught them: the attachment-filename collision on merge
+(silent overwrite is exactly the Phase 12 `attach` race bug, in a new
+location) and a blocking network call inside a render loop that must not
+leave the terminal in a broken state if it errors or panics mid-request.
+
+---
+
 ## Roadmap (not yet scoped)
 
 Ideas worth doing sometime, deliberately not designed in detail yet — see
 DESIGN.md's "read the phase's section before starting" rule; these don't have
 one yet.
 
-- **`ferref merge <a> <b>`** — fold a duplicate entry's tags, collections, and
-  attachments into another and delete the loser. Motivated by the existing
-  limitation that nothing stops the same paper being added twice (two DOIs,
-  or one DOI and one manual entry). Nontrivial: attachment filenames collide
-  on the target's cite_key and need re-landing under it, not just a DB row
-  move.
 - **Semantic search via embeddings** — "papers related to multivariate
   information decomposition" instead of a literal substring. Embed each
   entry (title/abstract, or full text) and rank by vector similarity instead
@@ -888,7 +1008,7 @@ one yet.
 
 ## Order of work
 
-Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
+Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
 
 ---
 
@@ -914,6 +1034,7 @@ Which phases get farmed out to a `coder` subagent, and which get an
 | 13 — `add --from-url` | no | **yes** | Specifying it *was* the work — the design question (why meta tags and not translators) is the whole phase. Review earns its keep: it's a new network path taking untrusted HTML. |
 | 14 — Fixed library location + `install.sh` | no | no | Small, mechanical, same env-var-then-`$HOME` pattern `config.rs` already has. `install.sh` is an install script, not a trust boundary in the running program. |
 | 15 — `search --text` (FTS5-trigram) | **yes** | **yes** | Real schema migration (virtual table, sync triggers, backfill), not a one-clause extension. A trigger that silently fails to fire is exactly the "review earns its keep on silent failures" case. |
+| 16 — TUI editing, fetch, delete, merge | **yes** | **yes** | Biggest TUI grind yet (five new modes), plus two silent-failure traps: attachment-filename collision on merge (same class as Phase 12's `attach` race) and a blocking network call inside the render loop that must not corrupt terminal state on failure. |
 
 The table is a default, not a rule. The reasoning behind it, which outlives the
 table if the phases change:
