@@ -18,8 +18,10 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers
 use ratatui::crossterm::tty::IsTty;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
+    Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+    Wrap,
 };
 use ratatui::Frame;
 use rusqlite::Connection;
@@ -923,8 +925,6 @@ fn sort_view(entries: &[Entry], view: &mut [usize], key: SortKey, desc: bool) {
 // `.len()` or `.chars().count()`, so wide (CJK) characters count as 2
 // columns and combining marks don't inflate the count.
 fn truncate_display(s: &str, max_width: usize) -> String {
-    use ratatui::text::Span;
-
     if Span::raw(s).width() <= max_width {
         return s.to_string();
     }
@@ -1047,9 +1047,23 @@ fn author_summary(authors: &[crate::models::Author]) -> String {
     }
 }
 
+// A dim "│" cell dropped between real columns so the splits in ENTRIES read
+// clearly without a full bordered-table widget.
+fn sep_cell() -> Cell<'static> {
+    Cell::from("\u{2502}").style(Style::default().fg(Color::DarkGray))
+}
+
 fn draw_table(frame: &mut Frame, area: Rect, app: &App) {
-    let header = Row::new(vec!["Title", "Authors", "Year", "Journal"])
-        .style(Style::default().add_modifier(Modifier::BOLD));
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let header = Row::new(vec![
+        Cell::from("Title").style(bold),
+        sep_cell(),
+        Cell::from("Authors").style(bold),
+        sep_cell(),
+        Cell::from("Year").style(bold),
+        sep_cell(),
+        Cell::from("Journal").style(bold),
+    ]);
 
     let rows: Vec<Row> = app
         .view
@@ -1057,10 +1071,13 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &App) {
         .map(|&i| &app.entries[i])
         .map(|e| {
             Row::new(vec![
-                truncate_display(&e.title, 60),
-                truncate_display(&author_summary(&e.authors), 14),
-                e.year.map(|y| y.to_string()).unwrap_or_default(),
-                truncate_display(e.journal.as_deref().unwrap_or(""), 14),
+                Cell::from(truncate_display(&e.title, 60)),
+                sep_cell(),
+                Cell::from(truncate_display(&author_summary(&e.authors), 14)),
+                sep_cell(),
+                Cell::from(e.year.map(|y| y.to_string()).unwrap_or_default()),
+                sep_cell(),
+                Cell::from(truncate_display(e.journal.as_deref().unwrap_or(""), 14)),
             ])
         })
         .collect();
@@ -1077,8 +1094,11 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &App) {
         rows,
         [
             Constraint::Min(10),
+            Constraint::Length(1),
             Constraint::Length(14),
+            Constraint::Length(1),
             Constraint::Length(4),
+            Constraint::Length(1),
             Constraint::Length(14),
         ],
     )
@@ -1088,8 +1108,24 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-fn details_text(e: &Entry, lengths: Option<&Vec<Option<i64>>>) -> String {
-    let mut lines = vec![e.title.clone()];
+// A bold, all-caps "LABEL: value" line, so scanning the field names in
+// DETAILS (doi, url, volume, ...) doesn't require reading the whole value
+// first to tell where one field ends and the next begins.
+fn field_line(label: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{}: ", label.to_uppercase()),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(value),
+    ])
+}
+
+fn details_lines(e: &Entry, lengths: Option<&Vec<Option<i64>>>) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        e.title.clone(),
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
 
     if !e.authors.is_empty() {
         let names: Vec<String> = e
@@ -1100,7 +1136,7 @@ fn details_text(e: &Entry, lengths: Option<&Vec<Option<i64>>>) -> String {
                 None => a.last_name.clone(),
             })
             .collect();
-        lines.push(names.join("; "));
+        lines.push(Line::raw(names.join("; ")));
     }
 
     let mut meta = Vec::new();
@@ -1111,53 +1147,65 @@ fn details_text(e: &Entry, lengths: Option<&Vec<Option<i64>>>) -> String {
         meta.push(j.clone());
     }
     if !meta.is_empty() {
-        lines.push(meta.join(" \u{b7} "));
+        lines.push(Line::raw(meta.join(" \u{b7} ")));
     }
+
+    let mut fields = Vec::new();
     if let Some(v) = &e.volume {
-        lines.push(format!("vol. {v}"));
+        fields.push(field_line("volume", v.clone()));
     }
     if let Some(p) = &e.pages {
-        lines.push(format!("pp. {p}"));
+        fields.push(field_line("pages", p.clone()));
     }
     if let Some(d) = &e.doi {
-        lines.push(format!("doi: {d}"));
+        fields.push(field_line("doi", d.clone()));
     }
     if let Some(u) = &e.url {
-        lines.push(format!("url: {u}"));
+        fields.push(field_line("url", u.clone()));
     }
+    if !fields.is_empty() {
+        lines.push(Line::raw(""));
+        lines.extend(fields);
+    }
+
     if !e.tags.is_empty() {
-        lines.push(
+        lines.push(Line::raw(""));
+        lines.push(field_line(
+            "tags",
             e.tags
                 .iter()
                 .map(|t| format!("#{t}"))
                 .collect::<Vec<_>>()
                 .join(" "),
-        );
+        ));
     }
 
-    for (i, a) in e.attachments.iter().enumerate() {
-        let status = match lengths.and_then(|l| l.get(i)) {
-            Some(Some(n)) => format!("text: {n} chars"),
-            Some(None) => "text: not extracted".to_string(),
-            None => "text: unknown".to_string(),
-        };
-        lines.push(format!("{} ({status})", a.path));
+    if !e.attachments.is_empty() {
+        lines.push(Line::raw(""));
+        for (i, a) in e.attachments.iter().enumerate() {
+            let status = match lengths.and_then(|l| l.get(i)) {
+                Some(Some(n)) => format!("text: {n} chars"),
+                Some(None) => "text: not extracted".to_string(),
+                None => "text: unknown".to_string(),
+            };
+            lines.push(Line::raw(format!("{} ({status})", a.path)));
+        }
     }
 
     if let Some(abs) = &e.abstract_text {
-        lines.push(String::new());
-        lines.push(abs.clone());
+        lines.push(Line::raw(""));
+        lines.push(Line::raw(abs.clone()));
     }
 
-    lines.join("\n")
+    lines
 }
 
 fn draw_details(frame: &mut Frame, area: Rect, app: &App) {
     let text = match app.selected_entry() {
-        None => "No entries.".to_string(),
+        None => Text::from("No entries."),
         Some(e) => {
             let lengths = e.id.and_then(|id| app.attachment_lengths.get(&id));
-            details_text(e, lengths)
+            Text::from(details_lines(e, lengths))
         }
     };
 
@@ -1393,5 +1441,31 @@ mod tests {
         app.rebuild_view();
         assert_eq!(app.view.len(), 1);
         assert_eq!(app.table_selected, 0, "clamped back into the shrunk view");
+    }
+
+    // A field's label span is bold and upper-cased, distinct from its value
+    // span, and a blank line separates the volume/pages/doi/url block from
+    // the author/year line above it.
+    #[test]
+    fn details_lines_bolds_and_caps_field_labels() {
+        let mut e = mk_entry("Deep Learning", "Smith", Some(2020), "Nature");
+        e.doi = Some("10.1/xyz".to_string());
+        e.url = Some("https://example.com".to_string());
+
+        let lines = details_lines(&e, None);
+        let doi_line = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("10.1/xyz")))
+            .expect("doi line present");
+        let label = &doi_line.spans[0];
+        assert_eq!(label.content.as_ref(), "DOI: ");
+        assert!(label.style.add_modifier.contains(Modifier::BOLD));
+
+        // blank line immediately before the volume/pages/doi/url block
+        let doi_idx = lines
+            .iter()
+            .position(|l| std::ptr::eq(l, doi_line))
+            .unwrap();
+        assert!(lines[..doi_idx].iter().any(|l| l.spans.is_empty()));
     }
 }
