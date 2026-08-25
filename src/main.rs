@@ -155,7 +155,7 @@ fn main() {
             }
 
             if let Err(e) = db::update_entry(&conn, &entry) {
-                die(&db_error("update entry", e));
+                die(&friendly(Some(&entry.cite_key), "update entry", e));
             }
 
             // Refetch so the printed entry reflects what update_entry actually
@@ -233,7 +233,7 @@ fn main() {
                         emit(&format!("'{cite_key}' already tagged '{normalized}'"));
                     }
                 }
-                Err(e) => die(&entry_error(&cite_key, "tag entry", e)),
+                Err(e) => die(&friendly(Some(&cite_key), "tag entry", e)),
             }
         }
 
@@ -261,7 +261,7 @@ fn main() {
                         emit(&format!("'{cite_key}' was not tagged '{normalized}'"));
                     }
                 }
-                Err(e) => die(&entry_error(&cite_key, "untag entry", e)),
+                Err(e) => die(&friendly(Some(&cite_key), "untag entry", e)),
             }
         }
 
@@ -539,7 +539,7 @@ fn cmd_add(
 
     match db::insert_entry(conn, &entry) {
         Ok(id) => entry.id = Some(id),
-        Err(e) => die(&db_error("add entry", e)),
+        Err(e) => die(&friendly(None, "add entry", e)),
     }
 
     // The entry is committed before the PDF is attempted: a download
@@ -584,7 +584,7 @@ fn cmd_attach(
             if copied {
                 let _ = std::fs::remove_file(&resolved);
             }
-            die(&entry_error(&cite_key, "attach file", e))
+            die(&friendly(Some(&cite_key), "attach file", e))
         }
     };
 
@@ -634,7 +634,7 @@ fn cmd_attach(
 fn cmd_extract(conn: &rusqlite::Connection, cite_key: String, json: bool) {
     let attachments = match db::attachments_for_cite_key(conn, &cite_key) {
         Ok(a) => a,
-        Err(e) => die(&entry_error(&cite_key, "extract text", e)),
+        Err(e) => die(&friendly(Some(&cite_key), "extract text", e)),
     };
     if attachments.is_empty() {
         die(&format!("'{cite_key}' has no attachments"));
@@ -950,7 +950,7 @@ fn dispatch_collection(conn: &rusqlite::Connection, command: cli::CollectionComm
                     emit(&format!("Created collection '{path}' (id {id})"));
                 }
             }
-            Err(e) => die(&db_error("create collection", e)),
+            Err(e) => die(&friendly(None, "create collection", e)),
         },
 
         CollectionCommand::Ls { json } => {
@@ -1009,11 +1009,7 @@ fn dispatch_collection(conn: &rusqlite::Connection, command: cli::CollectionComm
                     emit(&format!("'{cite_key}' is already in '{path}'"));
                 }
             }
-            Err(e) => die(&collection_entry_error(
-                &cite_key,
-                "add entry to collection",
-                e,
-            )),
+            Err(e) => die(&friendly(Some(&cite_key), "add entry to collection", e)),
         },
 
         CollectionCommand::Rm {
@@ -1035,8 +1031,8 @@ fn dispatch_collection(conn: &rusqlite::Connection, command: cli::CollectionComm
                     emit(&format!("'{cite_key}' was not in '{path}'"));
                 }
             }
-            Err(e) => die(&collection_entry_error(
-                &cite_key,
+            Err(e) => die(&friendly(
+                Some(&cite_key),
                 "remove entry from collection",
                 e,
             )),
@@ -1067,7 +1063,7 @@ fn dispatch_collection(conn: &rusqlite::Connection, command: cli::CollectionComm
                         }
                     }
                 }
-                Err(e) => die(&db_error("move collection", e)),
+                Err(e) => die(&friendly(None, "move collection", e)),
             }
         }
 
@@ -1080,7 +1076,7 @@ fn dispatch_collection(conn: &rusqlite::Connection, command: cli::CollectionComm
                     emit(&format!("Deleted '{path}' and {count} collection(s)"));
                 }
             }
-            Err(e) => die(&db_error("delete collection", e)),
+            Err(e) => die(&friendly(None, "delete collection", e)),
         },
     }
 }
@@ -1300,7 +1296,7 @@ fn land_downloaded_pdf(
         .to_string();
 
     let (attachment_id, _changed) = db::attach(conn, cite_key, &path_str)
-        .map_err(|e| cleanup(entry_error(cite_key, "attach downloaded PDF", e)))?;
+        .map_err(|e| cleanup(friendly(Some(cite_key), "attach downloaded PDF", e)))?;
 
     Ok((path_str, attachment_id, already_present))
 }
@@ -1326,7 +1322,13 @@ fn pdf_target(
         // An unknown cite_key surfaces here first, before anything is written
         // to disk, so it has to read as "no such entry" and not as a lookup
         // failure.
-        .map_err(|e| entry_error(cite_key, &format!("list attachments for '{cite_key}'"), e))?
+        .map_err(|e| {
+            friendly(
+                Some(cite_key),
+                &format!("list attachments for '{cite_key}'"),
+                e,
+            )
+        })?
         .into_iter()
         .map(|(_, path)| path)
         .collect();
@@ -1535,14 +1537,33 @@ fn save_extracted(
     }
 }
 
-// add_tag/remove_tag/attach report an unknown cite_key as QueryReturnedNoRows, which
-// would otherwise reach the user as "Query returned no rows". Every other
-// command names the key it couldn't find; these should too.
-fn entry_error(cite_key: &str, action: &str, e: rusqlite::Error) -> String {
+// Shapes a database error for a human instead of showing SQLite's own
+// wording. Every fallible write in db.rs raises one of two error shapes
+// (see entry_id_for/require_collection there): an unknown cite_key as
+// QueryReturnedNoRows, which would otherwise reach the user as the bare
+// "Query returned no rows" -- named here using whichever cite_key the
+// caller was operating on, when it has one to name -- or an
+// already-complete, human-written message as InvalidParameterName (an
+// unknown collection path, a duplicate DOI, an empty tag name, ...), passed
+// through as-is rather than wrapped in "failed to {action}: ...". Any other
+// error is a genuine unexpected failure, shown with rusqlite's own text
+// since nothing more specific is known about it.
+//
+// One function rather than three (as this used to be: entry_error,
+// db_error, and collection_entry_error, the last of which was, by its own
+// doc comment, just the first two combined) -- splitting them let one
+// caller reach for the wrong one and lose the QueryReturnedNoRows handling
+// (update_entry's Command::Edit call site did exactly this, silently, until
+// this consolidation caught it: a bad cite_key there raced against a
+// concurrent delete would have shown "failed to update entry: Query
+// returned no rows" instead of naming the entry).
+fn friendly(cite_key: Option<&str>, action: &str, e: rusqlite::Error) -> String {
     match e {
-        rusqlite::Error::QueryReturnedNoRows => {
-            format!("no entry found with cite_key '{cite_key}'")
-        }
+        rusqlite::Error::QueryReturnedNoRows => match cite_key {
+            Some(key) => format!("no entry found with cite_key '{key}'"),
+            None => format!("failed to {action}: no matching row found"),
+        },
+        rusqlite::Error::InvalidParameterName(msg) => msg,
         e => format!("failed to {action}: {e}"),
     }
 }
@@ -1561,30 +1582,6 @@ fn entry_error(cite_key: &str, action: &str, e: rusqlite::Error) -> String {
 fn is_duplicate(e: &rusqlite::Error) -> bool {
     e.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation)
         || matches!(e, rusqlite::Error::InvalidParameterName(msg) if msg.contains("is already on entry"))
-}
-
-// Collection functions (create_collection, move_collection, delete_collection)
-// report an unknown/invalid path via InvalidParameterName(msg), where msg is
-// already a complete, human-readable message -- see db.rs.
-fn db_error(action: &str, e: rusqlite::Error) -> String {
-    match e {
-        rusqlite::Error::InvalidParameterName(msg) => msg,
-        e => format!("failed to {action}: {e}"),
-    }
-}
-
-// add_to_collection/remove_from_collection can fail on either an unknown
-// cite_key (QueryReturnedNoRows, same as add_tag) or an unknown collection
-// path (InvalidParameterName, already human-readable). Combines entry_error
-// and db_error's handling.
-fn collection_entry_error(cite_key: &str, action: &str, e: rusqlite::Error) -> String {
-    match e {
-        rusqlite::Error::QueryReturnedNoRows => {
-            format!("no entry found with cite_key '{cite_key}'")
-        }
-        rusqlite::Error::InvalidParameterName(msg) => msg,
-        e => format!("failed to {action}: {e}"),
-    }
 }
 
 fn output_entry(entry: &Entry, json: bool) {

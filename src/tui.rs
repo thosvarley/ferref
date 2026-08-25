@@ -567,7 +567,7 @@ fn handle_confirm_key(app: &mut App, conn: &Connection, code: KeyCode, action: P
             .ok_or_else(|| "entry no longer exists".to_string())
             .and_then(|cite_key| db::delete_entry(conn, &cite_key).map_err(|e| e.to_string())),
         PendingAction::Merge { keep_id, drop_id } => db::merge_entries(conn, keep_id, drop_id)
-            .map_err(|e| crate::db_error("merge entries", e)),
+            .map_err(|e| crate::friendly(None, "merge entries", e)),
     };
     if let Err(e) = result {
         app.status = Some(e);
@@ -1067,7 +1067,7 @@ impl App {
             // InvalidParameterName wrapping a message already written for a
             // human, and to_string() prefixes it with "Invalid parameter
             // name:" -- rusqlite's vocabulary leaking onto the footer.
-            Err(e) => self.status = Some(crate::db_error("create collection", e)),
+            Err(e) => self.status = Some(crate::friendly(None, "create collection", e)),
         }
     }
 
@@ -1227,7 +1227,9 @@ impl App {
                     self.status = Some(e);
                 }
             }
-            Err(e) => self.status = Some(crate::db_error("update entry", e)),
+            Err(e) => {
+                self.status = Some(crate::friendly(Some(&updated.cite_key), "update entry", e))
+            }
         }
     }
 
@@ -1289,7 +1291,7 @@ impl App {
                     // entry that vanished (e.g. deleted from another session
                     // between load and this tag action).
                     let action = if add { "tag entry" } else { "untag entry" };
-                    self.status = Some(crate::entry_error(cite_key, action, e));
+                    self.status = Some(crate::friendly(Some(cite_key), action, e));
                     return;
                 }
             }
