@@ -942,11 +942,17 @@ marks too.
 - **Exactly 2** — those two are the pair; skip straight to the confirm popup
   ("Merge '<drop title>' into '<keep title>'? y/n"), naming both explicitly
   since order isn't visually obvious from the mark alone.
-- **0 or 1** (the default — this is "default to 1" from user's mark being
-  optional) — the *selected* row is the keeper, and a live-filtered picker
-  (same list-with-typeahead widget the Phase 12 collection picker already
-  is, just listing entries instead of collections) opens to choose the entry
-  to fold in and delete. Then the same confirm popup.
+- **0 or 1** (the default — this is "default to 1" from the mark being
+  optional) — the *selected* row is the keeper, and a new picker opens to
+  choose the entry to fold in and delete: a bordered popup list, rendered
+  the way `draw_picker` already renders the collection picker, but over
+  `app.entries` instead of the collection tree, *and* with a live text
+  filter — the collection picker is just `j`/`k` over a short tree with no
+  filter box, which doesn't scale to a library with hundreds of entries.
+  Reuse `matches_filter` (`tui.rs`, already does case-insensitive substring
+  matching across title/authors/journal/year/cite_key/tags for `/`) to drive
+  it, typing narrows the list, `j`/`k` moves, `Enter` picks. Then the same
+  confirm popup.
 - **3 or more** — footer error ("merge only supports two entries at a time"),
   no action. Chained/N-way merges are out of scope; do them one pair at a
   time.
