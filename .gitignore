@@ -11,3 +11,5 @@ pdfs/
 restart_claude.sh
 
 .claude/
+
+user_notes.txt
