@@ -1004,6 +1004,28 @@ same-scale problem the pre-flight check can't rule out (permissions, disk
 full, mid-loop) can't leave a half-migrated merge either. A regression test
 reproduces the exact missing-file case.
 
+**Follow-on: two more bulk actions over the marked set.** After the phase
+shipped, marking turned out to be useful for more than merge — the same
+"these are the ones I mean" primitive now backs two more actions, both
+reusing marks without introducing a new selection mechanism:
+
+- `x` exports the marked entries (or, with nothing marked, just the
+  selected one) as BibTeX to a path typed into an input box, via
+  `App::export_bibtex` calling the same `bibtex::export` the CLI's own
+  `ferref export` uses — legacy syntax only, no TUI equivalent of
+  `--biblatex`. Unlike merge/delete, this doesn't clear `marked` afterward:
+  export doesn't consume or change the entries, so the same set can still
+  be filed into a collection right after.
+- `c` (the existing single-entry "file into collection" key) becomes a bulk
+  operation when entries are marked: every marked id gets added
+  (`add_entry_to_collection`, idempotent) to whichever collection is
+  picked, rather than toggling the one selected entry's membership.
+  Deliberately add-only, not a toggle, since there's no single well-defined
+  membership state for a mixed set — `Mode::Picker`'s `member` set starts
+  empty in this mode and a row only flips to `[x]` once the set has
+  actually been filed into it this session. With nothing marked, `c` is
+  exactly what it always was.
+
 ---
 
 ## Roadmap (not yet scoped)

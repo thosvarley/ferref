@@ -198,6 +198,22 @@ fn handle_normal_key(app: &mut App, conn: &Connection, code: KeyCode, modifiers:
         KeyCode::Char('o') if matches!(app.focus, Focus::Entries | Focus::Details) => {
             app.open_selected();
         }
+        // Export the marked set (or just the selected entry, with nothing
+        // marked) as BibTeX. Doesn't touch `app.marked` -- export doesn't
+        // consume the set the way merge/delete's confirm does, so the same
+        // marks can still be filed into a collection afterward.
+        KeyCode::Char('x')
+            if matches!(app.focus, Focus::Entries | Focus::Details) && !app.view.is_empty() =>
+        {
+            let ids = if app.marked.is_empty() {
+                app.selected_entry().and_then(|e| e.id).into_iter().collect()
+            } else {
+                app.marked.clone()
+            };
+            if !ids.is_empty() {
+                app.mode = Mode::Input(InputKind::ExportPath { ids }, "export.bib".to_string());
+            }
+        }
         // Toggles the current row into the merge marks. Insertion order
         // matters (first marked survives a merge, second is folded in and
         // deleted) -- see App::toggle_mark.
@@ -271,6 +287,10 @@ fn handle_input_key(app: &mut App, conn: &Connection, code: KeyCode) {
                         selected: return_selected,
                     };
                 }
+                InputKind::ExportPath { ids } => {
+                    app.export_bibtex(&ids, buffer.trim());
+                    app.mode = Mode::Normal;
+                }
             }
         }
         KeyCode::Esc => {
@@ -280,7 +300,7 @@ fn handle_input_key(app: &mut App, conn: &Connection, code: KeyCode) {
                     app.rebuild_view();
                     app.mode = Mode::Normal;
                 }
-                InputKind::NewCollection => {
+                InputKind::NewCollection | InputKind::ExportPath { .. } => {
                     app.mode = Mode::Normal;
                 }
                 // Esc on a field edit backs out to the field picker without
@@ -314,6 +334,7 @@ fn handle_picker_key(app: &mut App, conn: &Connection, code: KeyCode) {
         mut selected,
         mut member,
         entry_id,
+        bulk,
     } = mode
     else {
         app.mode = mode;
@@ -321,7 +342,10 @@ fn handle_picker_key(app: &mut App, conn: &Connection, code: KeyCode) {
     };
 
     match code {
-        KeyCode::Char('q') | KeyCode::Esc => return, // app.mode is already Normal
+        KeyCode::Char('q') | KeyCode::Esc => {
+            app.marked.clear();
+            return; // app.mode is already Normal
+        }
         KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
         KeyCode::Down | KeyCode::Char('j') => {
             if selected + 1 < rows.len() {
@@ -329,27 +353,52 @@ fn handle_picker_key(app: &mut App, conn: &Connection, code: KeyCode) {
             }
         }
         KeyCode::Enter => {
-            let (_, collection_id, _) = rows[selected];
-            let is_member = member.contains(&collection_id);
-            let result = if is_member {
-                db::remove_entry_from_collection(conn, collection_id, entry_id)
-            } else {
-                db::add_entry_to_collection(conn, collection_id, entry_id)
-            };
-            match result {
-                Ok(_) => {
-                    if is_member {
-                        member.remove(&collection_id);
-                    } else {
-                        member.insert(collection_id);
-                    }
-                    // Membership changed a collection's entry_count; the
-                    // tree pane's counts need to catch up.
-                    if let Err(e) = app.reload_tree_counts(conn) {
-                        app.error = Some(e);
+            let (_, collection_id, collection_name) = rows[selected].clone();
+            if let Some(ids) = &bulk {
+                let mut filed = 0usize;
+                let mut err = None;
+                for &id in ids {
+                    match db::add_entry_to_collection(conn, collection_id, id) {
+                        Ok(changed) => filed += changed as usize,
+                        Err(e) => err = Some(e.to_string()),
                     }
                 }
-                Err(e) => app.error = Some(e.to_string()),
+                match err {
+                    Some(e) => app.error = Some(e),
+                    None => {
+                        member.insert(collection_id); // flips to [x]: confirms this row was filed into
+                        app.error = Some(format!(
+                            "Filed {filed} of {} marked entr{} into '{collection_name}'",
+                            ids.len(),
+                            if ids.len() == 1 { "y" } else { "ies" }
+                        ));
+                    }
+                }
+                if let Err(e) = app.reload_tree_counts(conn) {
+                    app.error = Some(e);
+                }
+            } else {
+                let is_member = member.contains(&collection_id);
+                let result = if is_member {
+                    db::remove_entry_from_collection(conn, collection_id, entry_id)
+                } else {
+                    db::add_entry_to_collection(conn, collection_id, entry_id)
+                };
+                match result {
+                    Ok(_) => {
+                        if is_member {
+                            member.remove(&collection_id);
+                        } else {
+                            member.insert(collection_id);
+                        }
+                        // Membership changed a collection's entry_count; the
+                        // tree pane's counts need to catch up.
+                        if let Err(e) = app.reload_tree_counts(conn) {
+                            app.error = Some(e);
+                        }
+                    }
+                    Err(e) => app.error = Some(e.to_string()),
+                }
             }
         }
         _ => {}
@@ -360,6 +409,7 @@ fn handle_picker_key(app: &mut App, conn: &Connection, code: KeyCode) {
         selected,
         member,
         entry_id,
+        bulk,
     };
 }
 
@@ -614,6 +664,13 @@ enum Mode {
         selected: usize,
         member: HashSet<i64>,
         entry_id: i64,
+        // Set when opened with marked entries (see App::open_picker):
+        // Enter files every id here into the chosen collection, add-only,
+        // instead of toggling `entry_id`'s own membership. `member` stays
+        // empty in this mode -- there's no single well-defined checked
+        // state for a mixed set, so a row only flips to `[x]` once this
+        // session has actually filed the set into it.
+        bulk: Option<Vec<i64>>,
     },
     // The ":" palette (Edit/Fetch/Merge/Delete), scoped to one entry.
     Command { entry_id: i64 },
@@ -649,6 +706,9 @@ enum InputKind {
         field: EditField,
         return_selected: usize,
     },
+    // "x": the output path for a BibTeX export of `ids` (the marked set,
+    // or just the selected entry when nothing's marked).
+    ExportPath { ids: Vec<i64> },
 }
 
 #[derive(Clone, Copy)]
@@ -959,12 +1019,22 @@ impl App {
         }
     }
 
-    // Opens the collection picker for the currently selected entry. Uses
-    // collection_tree directly (not the tree pane's rows) since there's
-    // nothing to file a paper into "All Papers" -- that's not a collection.
+    // Opens the collection picker. Uses collection_tree directly (not the
+    // tree pane's rows) since there's nothing to file a paper into "All
+    // Papers" -- that's not a collection.
+    //
+    // With entries marked, this becomes a bulk-file operation over the
+    // whole marked set (add-only, no per-entry toggle -- see Mode::Picker's
+    // `bulk` field); otherwise it's the original single-entry toggle over
+    // whichever entry is selected.
     fn open_picker(&mut self, conn: &Connection) {
-        let Some(entry_id) = self.selected_entry().and_then(|e| e.id) else {
-            return;
+        let bulk = (!self.marked.is_empty()).then(|| self.marked.clone());
+        let entry_id = match &bulk {
+            Some(ids) => ids[0],
+            None => match self.selected_entry().and_then(|e| e.id) {
+                Some(id) => id,
+                None => return,
+            },
         };
 
         let tree = match db::collection_tree(conn) {
@@ -979,11 +1049,18 @@ impl App {
             return;
         }
 
-        let member: HashSet<i64> = match db::collections_for_entry(conn, entry_id) {
-            Ok(v) => v.into_iter().collect(),
-            Err(e) => {
-                self.error = Some(e.to_string());
-                return;
+        // Bulk mode starts with nothing checked: there's no single
+        // well-defined membership state for a mixed set of entries, so a
+        // row only flips to [x] once this session actually files into it.
+        let member: HashSet<i64> = if bulk.is_some() {
+            HashSet::new()
+        } else {
+            match db::collections_for_entry(conn, entry_id) {
+                Ok(v) => v.into_iter().collect(),
+                Err(e) => {
+                    self.error = Some(e.to_string());
+                    return;
+                }
             }
         };
 
@@ -997,6 +1074,7 @@ impl App {
             selected: 0,
             member,
             entry_id,
+            bulk,
         };
     }
 
@@ -1062,6 +1140,33 @@ impl App {
                 }
             }
             Err(e) => self.error = Some(crate::db_error("update entry", e)),
+        }
+    }
+
+    // "x": writes a BibTeX file for exactly `ids` (the marked set, or the
+    // single selected entry) -- a subset of the library, unlike `ferref
+    // export` which always writes everything. Legacy BibTeX only, matching
+    // that command's own default; --biblatex has no TUI equivalent, same as
+    // Fetch has no --email flag here.
+    fn export_bibtex(&mut self, ids: &[i64], path: &str) {
+        if path.is_empty() {
+            self.error = Some("export path cannot be empty".to_string());
+            return;
+        }
+        let selected: Vec<Entry> = ids
+            .iter()
+            .filter_map(|id| self.entries.iter().find(|e| e.id == Some(*id)).cloned())
+            .collect();
+        let bibtex_str = crate::bibtex::export(&selected, false);
+        match std::fs::write(path, &bibtex_str) {
+            Ok(()) => {
+                self.error = Some(format!(
+                    "Exported {} entr{} to '{path}'",
+                    selected.len(),
+                    if selected.len() == 1 { "y" } else { "ies" }
+                ));
+            }
+            Err(e) => self.error = Some(format!("failed to write '{path}': {e}")),
         }
     }
 
@@ -1564,8 +1669,9 @@ fn draw(frame: &mut Frame, app: &App) {
             rows,
             selected,
             member,
+            bulk,
             ..
-        } => draw_picker(frame, area, rows, *selected, member),
+        } => draw_picker(frame, area, rows, *selected, member, bulk.as_deref().map(<[_]>::len)),
         Mode::Command { entry_id } => draw_command(frame, area, app, *entry_id),
         Mode::FieldPicker { entry_id, selected } => {
             draw_field_picker(frame, area, app, *entry_id, *selected)
@@ -1839,7 +1945,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             Mode::Input(InputKind::EditField { field, .. }, buffer) => {
                 format!(" {}: {buffer}", field.label())
             }
-            Mode::Picker { .. } => " Enter toggle \u{b7} jk move \u{b7} Esc/q close".to_string(),
+            Mode::Input(InputKind::ExportPath { ids }, buffer) => {
+                format!(" Export {} entr{} to: {buffer}", ids.len(), if ids.len() == 1 { "y" } else { "ies" })
+            }
+            Mode::Picker { bulk: None, .. } => {
+                " Enter toggle \u{b7} jk move \u{b7} Esc/q close".to_string()
+            }
+            Mode::Picker { bulk: Some(_), .. } => {
+                " Enter file marked \u{b7} jk move \u{b7} Esc/q close".to_string()
+            }
             Mode::Command { .. } => {
                 " e edit \u{b7} f fetch \u{b7} m merge \u{b7} d delete \u{b7} Esc close".to_string()
             }
@@ -1870,6 +1984,7 @@ fn draw_picker(
     rows: &[(usize, i64, String)],
     selected: usize,
     member: &HashSet<i64>,
+    bulk_count: Option<usize>,
 ) {
     let width = frame_area.width.saturating_sub(6).clamp(10, 60);
     let height = ((rows.len() as u16) + 2)
@@ -1893,8 +2008,12 @@ fn draw_picker(
     let mut state = ListState::default();
     state.select(Some(selected));
 
+    let title = match bulk_count {
+        Some(n) => format!("File {n} marked into…"),
+        None => "File into…".to_string(),
+    };
     let list = List::new(items)
-        .block(Block::default().title("File into…").borders(Borders::ALL))
+        .block(Block::default().title(title).borders(Borders::ALL))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(list, popup, &mut state);
 }
