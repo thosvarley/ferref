@@ -1154,11 +1154,14 @@ impl App {
     }
 
     fn confirm_merge(&mut self, keep_id: i64, drop_id: i64) {
+        // Titles truncated (not the cite_key, which is short by convention)
+        // so a long title plus the trailing "y/n" can't wrap the confirm
+        // box past one line and push the actual prompt off screen.
         let title_of = |id: i64| {
             self.entries
                 .iter()
                 .find(|e| e.id == Some(id))
-                .map(|e| e.title.clone())
+                .map(|e| truncate_display(&e.title, 20))
                 .unwrap_or_default()
         };
         self.mode = Mode::Confirm {
@@ -1173,7 +1176,11 @@ impl App {
             return;
         };
         self.mode = Mode::Confirm {
-            message: format!("Delete '{}' [{}]? y/n", entry.title, entry.cite_key),
+            message: format!(
+                "Delete '{}' [{}]? y/n",
+                truncate_display(&entry.title, 20),
+                entry.cite_key
+            ),
             action: PendingAction::Delete { entry_id },
         };
     }
@@ -2037,8 +2044,12 @@ fn draw_confirm(frame: &mut Frame, frame_area: Rect, message: &str) {
     let popup = Rect { x, y, width, height };
 
     frame.render_widget(Clear, popup);
+    // Same cyan accent as the ':' palette (see draw_command) -- a
+    // destructive/mutating confirmation should pop at least as much as the
+    // menu that led to it, not read as plain text.
+    let accent = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
     let para = Paragraph::new(message.to_string())
-        .block(Block::default().borders(Borders::ALL))
+        .block(Block::default().borders(Borders::ALL).border_style(accent))
         .wrap(Wrap { trim: true });
     frame.render_widget(para, popup);
 }
