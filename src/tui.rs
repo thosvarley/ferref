@@ -2082,6 +2082,10 @@ fn draw_picker(
 
     frame.render_widget(Clear, popup);
 
+    // Cyan-bold on every floating window's border/title -- see DESIGN.md's
+    // Phase 16 addendum: a standing rule, not a per-popup choice.
+    let accent = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+
     let items: Vec<ListItem> = rows
         .iter()
         .map(|(depth, id, name)| {
@@ -2099,7 +2103,13 @@ fn draw_picker(
         None => "File into…".to_string(),
     };
     let list = List::new(items)
-        .block(Block::default().title(title).borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(accent)
+                .title_style(accent),
+        )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(list, popup, &mut state);
 }
@@ -2258,6 +2268,10 @@ fn draw_field_picker(frame: &mut Frame, frame_area: Rect, app: &App, entry_id: i
 
     frame.render_widget(Clear, popup);
 
+    // Cyan-bold on every floating window's border/title -- see DESIGN.md's
+    // Phase 16 addendum: a standing rule, not a per-popup choice.
+    let accent = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+
     let value_width = (width as usize).saturating_sub(14);
     let items: Vec<ListItem> = EditField::ALL
         .iter()
@@ -2271,7 +2285,13 @@ fn draw_field_picker(frame: &mut Frame, frame_area: Rect, app: &App, entry_id: i
     state.select(Some(selected));
 
     let list = List::new(items)
-        .block(Block::default().title("Edit field").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title("Edit field")
+                .borders(Borders::ALL)
+                .border_style(accent)
+                .title_style(accent),
+        )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(list, popup, &mut state);
 }
@@ -2297,6 +2317,10 @@ fn draw_entry_picker(
     let popup = Rect { x, y, width, height };
 
     frame.render_widget(Clear, popup);
+
+    // Cyan-bold on every floating window's border/title -- see DESIGN.md's
+    // Phase 16 addendum: a standing rule, not a per-popup choice.
+    let accent = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 
     let text_width = (width as usize).saturating_sub(2);
     let items: Vec<ListItem> = rows
@@ -2324,7 +2348,13 @@ fn draw_entry_picker(
         format!("{base_title} /{filter}")
     };
     let list = List::new(items)
-        .block(Block::default().title(title).borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(accent)
+                .title_style(accent),
+        )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(list, popup, &mut state);
 }

@@ -1058,6 +1058,23 @@ reusing marks without introducing a new selection mechanism:
   clamp, ~30 columns, reachable only on a terminal already at `MIN_WIDTH`
   where every pane is already cramped).
 
+**Design spec: every floating window is cyan.** By the time the palette,
+confirm, and help popups existed, they'd each independently picked up the
+same `Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)` accent
+(`pane_block`'s pre-existing "focused pane" style, reused rather than
+inventing a second one) on their border and title — but three others
+(`draw_picker`, the collection-membership popup; `draw_field_picker`,
+Edit's field list; `draw_entry_picker`, Merge's fold-in picker) were built
+earlier in the same phase and never got it, so half the popups popped and
+half didn't. This is now a standing rule, not a per-popup judgment call:
+**any floating window drawn over the three main panes — a popup, a picker,
+a menu, a confirmation, an overlay — uses the cyan-bold accent on its
+border and title, unconditionally, with no unaccented floating window as
+an exception.** A future popup that skips this is a bug, not a style
+choice; check it into new code the same day it's added; a new subagent
+briefed on TUI work should be pointed at this line, not left to notice the
+pattern from reading five draw functions.
+
 ---
 
 ## Phase 17 — `ferref doctor`
