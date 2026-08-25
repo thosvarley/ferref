@@ -2003,7 +2003,8 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &App) {
         .view
         .iter()
         .map(|&i| &app.entries[i])
-        .map(|e| {
+        .enumerate()
+        .map(|(i, e)| {
             // A colored marker in a leading column, not just the selection
             // highlight -- a mark must stay visible after the cursor moves
             // off the row, which REVERSED alone wouldn't show.
@@ -2012,6 +2013,16 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &App) {
                 Cell::from("\u{25cf}").style(Style::default().fg(Color::Yellow))
             } else {
                 Cell::from(" ")
+            };
+            // Zebra striping: without it every row is one undifferentiated
+            // wall of text and it's not obvious where one entry ends and
+            // the next begins. DIM rather than a fixed bg color, so the
+            // stripe is relative to whatever the terminal's own palette is
+            // and doesn't need a guess at what the background actually is.
+            let row_style = if i % 2 == 1 {
+                Style::default().add_modifier(Modifier::DIM)
+            } else {
+                Style::default()
             };
             Row::new(vec![
                 mark_cell,
@@ -2023,6 +2034,7 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &App) {
                 sep_cell(),
                 Cell::from(truncate_display(e.journal.as_deref().unwrap_or(""), 14)),
             ])
+            .style(row_style)
         })
         .collect();
 
