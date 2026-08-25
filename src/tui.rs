@@ -1,8 +1,11 @@
-// Terminal UI over the same SQLite file the CLI writes. It can file papers
-// into collections and create new collections; it cannot edit or delete an
-// entry, delete a collection, rename anything, or tag -- those stay
-// CLI-only, so a mis-keypress here can misfile a paper but can't destroy
-// data.
+// Terminal UI over the same SQLite file the CLI writes. Sorts, searches,
+// files papers into collections, edits fields, fetches PDFs, tags/untags,
+// deletes and merges entries -- singly or, with entries marked, in bulk --
+// and copies an entry's link to the system clipboard. Mutating and
+// destructive actions live behind the ":" command palette and (for
+// delete/merge) a confirm prompt, so they're deliberate rather than a
+// stray keypress. Deleting or renaming a collection, and creating a new
+// entry, stay CLI-only.
 //
 // Data is fetched only when state changes (on load, on a collection
 // selection change, on a sort/filter edit, or on manual reload) and cached
@@ -198,6 +201,9 @@ fn handle_normal_key(app: &mut App, conn: &Connection, code: KeyCode, modifiers:
         KeyCode::Char('c') if app.focus == Focus::Entries => app.open_picker(conn),
         KeyCode::Char('o') if matches!(app.focus, Focus::Entries | Focus::Details) => {
             app.open_selected();
+        }
+        KeyCode::Char('y') if matches!(app.focus, Focus::Entries | Focus::Details) => {
+            app.copy_url();
         }
         // Export the marked set (or just the selected entry, with nothing
         // marked) as BibTeX. Doesn't touch `app.marked` -- export doesn't
@@ -933,6 +939,17 @@ struct App {
     // keypress, then cleared by handle_key.
     error: Option<String>,
     should_quit: bool,
+
+    // "y"'s clipboard handle, created once and held for the app's whole
+    // lifetime -- not per-copy. arboard's X11 backend serves the clipboard
+    // from a background thread owned by this handle; a Clipboard created
+    // and dropped inside one keypress hands the data off to a system
+    // clipboard manager on drop, which silently loses it if no manager is
+    // running (verified directly: exactly this shape of bug, caught before
+    // shipping -- see DESIGN.md's Phase 18). None if creation failed (no
+    // display, unsupported platform, ...); "y" reports that as an error
+    // rather than panicking or retrying every keypress.
+    clipboard: Option<arboard::Clipboard>,
 }
 
 impl App {
@@ -955,6 +972,7 @@ impl App {
             mode: Mode::Normal,
             error: None,
             should_quit: false,
+            clipboard: arboard::Clipboard::new().ok(),
         };
         app.rebuild_view();
         Ok(app)
@@ -1124,6 +1142,32 @@ impl App {
                 return;
             }
         }
+    }
+
+    // "y": copies the selected entry's link to the system clipboard.
+    // Single-entry only -- a clipboard holds one string, and there's no
+    // obviously correct joined form for a marked set nobody asked for.
+    //
+    // Reuses `self.clipboard` rather than creating a fresh `Clipboard` here:
+    // a `Clipboard` created and dropped within one call hands the data off
+    // to a system clipboard manager on drop (arboard's X11 backend), which
+    // silently loses it when no manager is running -- confirmed directly,
+    // this was the first shape of this method and it copied nothing.
+    fn copy_url(&mut self) {
+        let Some(entry) = self.selected_entry() else {
+            return;
+        };
+        let Some(url) = url_for_entry(entry) else {
+            self.error = Some(format!("'{}' has no URL or DOI to copy", entry.cite_key));
+            return;
+        };
+        self.error = Some(match &mut self.clipboard {
+            None => "no clipboard available on this system".to_string(),
+            Some(cb) => match cb.set_text(&url) {
+                Ok(()) => format!("Copied {url}"),
+                Err(e) => format!("failed to copy to clipboard: {e}"),
+            },
+        });
     }
 
     fn toggle_mark(&mut self) {
@@ -1590,6 +1634,17 @@ fn clamp_selection(selected: usize, len: usize) -> usize {
     } else {
         selected.min(len - 1)
     }
+}
+
+// "y"'s link resolution: the entry's own url if it has one, else its DOI
+// turned into a real, resolvable link (not just the bare identifier), else
+// nothing to copy. Pure and DB-free so it's testable without a live
+// clipboard -- see App::copy_url for the actual arboard call.
+fn url_for_entry(entry: &Entry) -> Option<String> {
+    if let Some(url) = &entry.url {
+        return Some(url.clone());
+    }
+    entry.doi.as_ref().map(|doi| format!("https://doi.org/{doi}"))
 }
 
 // Case-insensitive substring match across every field a user would plausibly
@@ -2145,6 +2200,7 @@ fn draw_help(frame: &mut Frame, frame_area: Rect) {
                 ("c", "file into collection (bulk if marked)"),
                 ("x", "export marked as BibTeX"),
                 ("o", "open attachment"),
+                ("y", "copy url (or DOI link) to clipboard"),
             ],
         ),
         (
@@ -2468,6 +2524,18 @@ mod tests {
     }
 
     #[test]
+    fn url_for_entry_prefers_url_then_falls_back_to_doi_then_nothing() {
+        let mut e = mk_entry("Paper", "Smith", Some(2020), "");
+        assert_eq!(url_for_entry(&e), None);
+
+        e.doi = Some("10.1000/xyz".to_string());
+        assert_eq!(url_for_entry(&e), Some("https://doi.org/10.1000/xyz".to_string()));
+
+        e.url = Some("https://example.com/paper".to_string());
+        assert_eq!(url_for_entry(&e), Some("https://example.com/paper".to_string()));
+    }
+
+    #[test]
     fn matches_filter_hits_every_searchable_field_case_insensitively() {
         let mut e = mk_entry("Deep Learning", "Smith", Some(2020), "Nature");
         e.cite_key = "smith2020".to_string();
@@ -2537,6 +2605,7 @@ mod tests {
             mode: Mode::Normal,
             error: None,
             should_quit: false,
+            clipboard: None,
         };
         app.rebuild_view();
         assert_eq!(app.table_selected, 1);

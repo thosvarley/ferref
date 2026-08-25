@@ -1116,6 +1116,107 @@ one function, small enough to just write."
 
 ---
 
+## Phase 18 — TUI: copy URL to clipboard
+
+Motivated directly: sharing a reference casually ("here, read this") is far
+more often a pasted link than a `.bib` file, and until now that meant
+leaving the TUI to hunt down the URL by hand. `y` (vim's yank, alongside the
+`j`/`k`/`g`/`G`/`h`/`l` already borrowed from vim) copies the selected
+entry's link to the system clipboard: `entry.url` if set, else
+`https://doi.org/<doi>` if a DOI is on record (a real, resolvable link, not
+just an identifier), else a footer error — nothing silently copies an empty
+string. Single-entry only, not a bulk-marks action like `x`/`t`/`u`: a
+clipboard holds one string, and "copy 3 URLs" has no obviously correct
+joined form nobody asked for.
+
+**New dependency: `arboard`, text-only** (`default-features = false` — the
+default `image-data` feature pulls in a full image-decoding stack: `image`,
+`png`, `tiff`, `zune-jpeg`, `moxcms`, none of which this ever needs. Without
+it, the added tree is ~8 crates, no C build steps). The naive alternative —
+shell out to `xclip`/`xsel`/`wl-copy`, picking one by checking `$DISPLAY` /
+`$WAYLAND_DISPLAY` — looks like a one-liner but isn't one: three different
+binaries with three different argument shapes, a missing-binary case to
+detect and report per platform, and X11's actual clipboard protocol
+requires *something* to keep serving the selection after the setting
+process's stdin write returns — which is exactly the kind of platform
+subtlety `arboard` exists to get right once rather than everyone
+re-discovering by hand (this project's own precedent: `ratatui`/`crossterm`
+over hand-rolled ANSI, ditto).
+
+**Verified directly, not assumed from the docs**, since it changes the
+design: a standalone program that calls `arboard::Clipboard::new()?.set_text(url)`
+and exits immediately leaves the X11 clipboard **empty** the moment the
+process is gone (`xsel -b` confirmed empty right after exit) — X11's
+selection-ownership model needs *something* alive to answer a paste
+request, and a one-shot CLI process is gone before anything asks. This is
+exactly *not* the shape a CLI one-shot `ferref copy <cite_key>` would have,
+so this phase is TUI-only, on purpose: the process stays up until the user
+quits, which is easily long enough for a paste to happen, where a CLI
+mirror would need the "outlive an X11 paste" problem solved (daemonizing,
+or documenting an unreliable command) for a feature whose whole point is
+"quick, casual, while already looking at the paper" — the TUI already is
+that context.
+
+**A second thing verified directly, and initially gotten wrong: staying
+alive isn't automatic just because the *process* is long-lived — the
+*`Clipboard` value* has to be, too.** The first version of `copy_url`
+created a fresh `arboard::Clipboard` on every `y` press, set the text, and
+let it drop at the end of the function — exactly mirroring how the rest of
+this codebase treats short-lived resources (open a file, use it, drop it).
+Tested end to end inside the real TUI, over a real X11 session: **the
+clipboard came back empty** immediately after `y`, even with the TUI still
+running. The cause, found by reading `arboard`'s X11 `Drop` impl rather
+than guessing: dropping the last owning `Clipboard` hands the data off to
+a running X11 clipboard manager so it survives past that point — which
+means a `Clipboard` that's created and dropped within one keypress *always*
+takes that hand-off path, and on a session with no clipboard manager
+running (confirmed: this project's dev environment has none), the hand-off
+has nothing to talk to and the data is silently gone — indistinguishable
+from the one-shot-CLI failure mode this design was supposed to have
+already ruled out. Fixed by holding one `arboard::Clipboard` in `App` for
+the whole TUI session (`App::clipboard: Option<arboard::Clipboard>`,
+created once in `App::load`, `None` if creation fails) and reusing it on
+every `y` — confirmed by the same live test, `xsel -b` now reads the value
+back correctly while the TUI keeps running. The lesson for next time this
+question comes up: "the process is still alive" is not the same claim as
+"the thing serving the data is still alive," and only one of those is true
+by construction.
+
+**Wayland scope, left as a known limitation.** `arboard`'s optional
+`wayland-data-control` feature adds native (non-XWayland) Wayland clipboard
+support, auto-selected when `$WAYLAND_DISPLAY` is set — but pulls in
+`wl-clipboard-rs` and the `wayland-client`/`wayland-protocols`/`wayland-scanner`
+stack (~25 more crates, including a build-time `cc`/`pkg-config` step to
+link system Wayland libraries), just to cover compositors that don't run
+XWayland. Not enabled: the plain X11 path (via `x11rb`, pure Rust, no
+system linking) already covers XWayland, which is what the large majority
+of desktop Wayland sessions still run for X11-app compatibility — this
+project's own dev environment included, where `DISPLAY` was set alongside
+`WAYLAND_DISPLAY` and the X11-only build worked correctly. A user on a
+Wayland compositor with no XWayland at all gets a clipboard error instead
+of a silent no-op; revisit if that turns out to matter in practice.
+
+**Pure logic split out for the one part that's actually testable without a
+live clipboard**: `fn url_for_entry(entry: &Entry) -> Option<String>`
+resolution (url, then DOI-as-URL, then nothing) is a pure function with a
+real `#[test]` (all three branches). The `arboard` call itself is a thin,
+untested wrapper, same as `open_selected`'s call to the system opener —
+external-process/external-system I/O isn't something a unit test should be
+faking, and this is exactly the class of bug ("the mechanism is correct in
+isolation, the way it's called from here is not") that a mocked clipboard
+couldn't have caught anyway — only the live end-to-end test that actually
+caught it could.
+
+Delegation: **no / no**. Small on paper (one keybinding, one pure
+resolution function, one crate's two-call API) — but the one subtlety
+worth flagging for next time a similarly "small" phase gets judged this
+way: small isn't the same as safe-to-skip-testing. This phase shipped a
+real, silent bug on the first pass despite being simple, and only a live
+test surfaced it — the size of a change and the odds it hides a genuine
+platform gotcha aren't the same axis.
+
+---
+
 ## Roadmap (not yet scoped)
 
 Ideas worth doing sometime, deliberately not designed in detail yet — see
@@ -1147,7 +1248,7 @@ one yet.
 
 ## Order of work
 
-Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
+Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17 → 18. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
 
 ---
 
@@ -1175,6 +1276,7 @@ Which phases get farmed out to a `coder` subagent, and which get an
 | 15 — `search --text` (FTS5-trigram) | **yes** | **yes** | Real schema migration (virtual table, sync triggers, backfill), not a one-clause extension. A trigger that silently fails to fire is exactly the "review earns its keep on silent failures" case. |
 | 16 — TUI editing, fetch, delete, merge | **yes** | **yes** | Biggest TUI grind yet (five new modes), plus two silent-failure traps: attachment-filename collision on merge (same class as Phase 12's `attach` race) and a blocking network call inside the render loop that must not corrupt terminal state on failure. |
 | 17 — `ferref doctor` | no | no | One join query plus a CLI command, no migration, no new trust boundary. Same shape as Phase 4. |
+| 18 — TUI copy to clipboard | no | no | One keybinding and one pure resolution function, smaller than Phase 6. |
 
 The table is a default, not a rule. The reasoning behind it, which outlives the
 table if the phases change:
