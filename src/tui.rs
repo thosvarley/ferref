@@ -1153,6 +1153,13 @@ impl App {
     // to a system clipboard manager on drop (arboard's X11 backend), which
     // silently loses it when no manager is running -- confirmed directly,
     // this was the first shape of this method and it copied nothing.
+    //
+    // `self.clipboard` is `None` when `arboard` found no local
+    // display-server clipboard to talk to at all -- a plain SSH session to
+    // a headless machine, the case that actually matters for this project
+    // (see DESIGN.md's Phase 18 addendum). There, `copy_via_osc52` asks the
+    // *local* terminal emulator on the other end of the connection to grab
+    // the text directly, which needs no display server on this end.
     fn copy_url(&mut self) {
         let Some(entry) = self.selected_entry() else {
             return;
@@ -1162,10 +1169,13 @@ impl App {
             return;
         };
         self.error = Some(match &mut self.clipboard {
-            None => "no clipboard available on this system".to_string(),
             Some(cb) => match cb.set_text(&url) {
                 Ok(()) => format!("Copied {url}"),
                 Err(e) => format!("failed to copy to clipboard: {e}"),
+            },
+            None => match copy_via_osc52(&url) {
+                Ok(()) => format!("Sent {url} to your terminal's clipboard (OSC 52)"),
+                Err(e) => format!("no system clipboard, and {e}"),
             },
         });
     }
@@ -1645,6 +1655,29 @@ fn url_for_entry(entry: &Entry) -> Option<String> {
         return Some(url.clone());
     }
     entry.doi.as_ref().map(|doi| format!("https://doi.org/{doi}"))
+}
+
+// OSC 52 clipboard-set escape sequence: `ESC ] 52 ; c ; <base64> BEL`.
+// Understood by most terminal emulators still in wide use for SSH work
+// (iTerm2, kitty, foot, WezTerm, Windows Terminal; tmux passes it through
+// when `set-clipboard` is enabled) -- and, critically, works with *no*
+// display server on this end at all, unlike `arboard`, because it asks the
+// terminal emulator running on the user's own machine to grab the text,
+// not this machine's (possibly nonexistent) clipboard. A terminal that
+// doesn't understand OSC 52 simply discards it, so this can't corrupt the
+// screen -- but nothing acks a successful paste either, so unlike a real
+// clipboard API's `Result`, "the bytes went out" is the only thing this
+// function can actually promise.
+fn copy_via_osc52(text: &str) -> Result<(), String> {
+    use base64::Engine;
+    use std::io::Write;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let mut stdout = std::io::stdout();
+    stdout
+        .write_all(format!("\x1b]52;c;{encoded}\x07").as_bytes())
+        .and_then(|()| stdout.flush())
+        .map_err(|e| format!("failed to write the OSC 52 escape sequence: {e}"))
 }
 
 // Case-insensitive substring match across every field a user would plausibly

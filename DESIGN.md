@@ -1182,19 +1182,33 @@ question comes up: "the process is still alive" is not the same claim as
 "the thing serving the data is still alive," and only one of those is true
 by construction.
 
-**Wayland scope, left as a known limitation.** `arboard`'s optional
-`wayland-data-control` feature adds native (non-XWayland) Wayland clipboard
-support, auto-selected when `$WAYLAND_DISPLAY` is set — but pulls in
-`wl-clipboard-rs` and the `wayland-client`/`wayland-protocols`/`wayland-scanner`
-stack (~25 more crates, including a build-time `cc`/`pkg-config` step to
-link system Wayland libraries), just to cover compositors that don't run
-XWayland. Not enabled: the plain X11 path (via `x11rb`, pure Rust, no
-system linking) already covers XWayland, which is what the large majority
-of desktop Wayland sessions still run for X11-app compatibility — this
-project's own dev environment included, where `DISPLAY` was set alongside
-`WAYLAND_DISPLAY` and the X11-only build worked correctly. A user on a
-Wayland compositor with no XWayland at all gets a clipboard error instead
-of a silent no-op; revisit if that turns out to matter in practice.
+**Wayland: the "XWayland already covers it" reasoning above was wrong,
+verified directly, and fixed.** The original plan shipped X11-only
+(`arboard` without `wayland-data-control`) on the theory that XWayland's
+compatibility X server would cover a Wayland desktop too. Tested directly
+against this project's own dev environment (a genuine Wayland session —
+`XDG_SESSION_TYPE=wayland`, `loginctl` agrees — with XWayland also
+running, hence `$DISPLAY` being set too, which is what made the original
+theory look plausible): writing through the X11-only build, `xsel -b`
+(X11) read the value back correctly, but `wl-paste` (the native Wayland
+clipboard protocol) came back **empty**. XWayland provides an X server for
+X11 *clients* to run under Wayland; it does not bridge the X11 `CLIPBOARD`
+selection to Wayland's separate `wl_data_device`/data-control clipboard —
+they're different protocols, and nothing syncs them by default. So the
+X11-only build silently failed for any native-Wayland application (a
+growing share of the desktop, not a narrow edge case) — exactly the
+scenario a real user of this project actually runs day to day.
+
+Fixed by enabling `wayland-data-control` after all, accepting the ~25-crate
+/ `cc`+`pkg-config` cost the original reasoning was trying to avoid: with
+it, `arboard` auto-detects `$WAYLAND_DISPLAY` and uses the native Wayland
+protocol (`wl-clipboard-rs`) instead of X11 when present, confirmed by the
+same live test — `wl-paste` now reads the value back correctly (and, as a
+direct consequence of auto-detection now preferring Wayland, `xsel -b` no
+longer does on this session, which is the correct trade for an actual
+Wayland desktop). The lesson: "the compatibility layer covers it" is a
+claim to verify against the actual target protocol, not just against
+whether the naive tool (`xsel`, an X11 tool) happens to still work.
 
 **Pure logic split out for the one part that's actually testable without a
 live clipboard**: `fn url_for_entry(entry: &Entry) -> Option<String>`
@@ -1206,6 +1220,32 @@ faking, and this is exactly the class of bug ("the mechanism is correct in
 isolation, the way it's called from here is not") that a mocked clipboard
 couldn't have caught anyway — only the live end-to-end test that actually
 caught it could.
+
+**Follow-on: OSC 52 fallback for a headless remote session.** The
+Wayland-vs-X11 gap above is about which local display-server clipboard
+`arboard` talks to — but a plain SSH session to a remote machine (the
+concrete case: a text-only login node on an HPC cluster) has no display
+server at all, local or otherwise, and no `arboard` feature flag changes
+that. `App::clipboard` being `None` in that case now falls back to
+`copy_via_osc52`, which writes the standard `ESC ] 52 ; c ; <base64> BEL`
+clipboard-set escape sequence directly to stdout (verified byte-for-byte
+against the spec in a scratch build) — this asks the *local* terminal
+emulator on the user's own end of the SSH connection to grab the text,
+bypassing the remote machine's clipboard (or lack of one) entirely.
+Supported by most terminals still in real use for this kind of work
+(iTerm2, kitty, foot, WezTerm, Windows Terminal; tmux relays it when
+`set-clipboard` is on) and harmless on ones that don't — an unrecognized
+OSC sequence is silently discarded by a compliant terminal, not printed as
+garbage. `base64` is added as a direct dependency for this (already
+present twice over as a transitive dependency via other crates, so this
+adds zero new transitive weight — just makes an existing capability
+callable rather than reaching for `arboard` or hand-rolling encoding).
+
+Deliberately reported differently from a real clipboard write: OSC 52 has
+no acknowledgement channel, so "Sent ... (OSC 52)" rather than "Copied ..."
+— the function can only promise the bytes went out, not that anything on
+the other end understood them, which is a real, honest difference from
+`arboard::Clipboard::set_text`'s actual success/failure `Result`.
 
 Delegation: **no / no**. Small on paper (one keybinding, one pure
 resolution function, one crate's two-call API) — but the one subtlety
