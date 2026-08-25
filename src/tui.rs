@@ -443,6 +443,7 @@ fn handle_entry_picker_key(app: &mut App, code: KeyCode) {
     let mode = std::mem::replace(&mut app.mode, Mode::Normal);
     let Mode::EntryPicker {
         keep_id,
+        within,
         mut filter,
         mut rows,
         mut selected,
@@ -465,12 +466,12 @@ fn handle_entry_picker_key(app: &mut App, code: KeyCode) {
         }
         KeyCode::Backspace => {
             filter.pop();
-            rows = app.entry_picker_rows(keep_id, &filter);
+            rows = app.entry_picker_rows(keep_id, &filter, within.as_deref());
             selected = 0;
         }
         KeyCode::Char(c) => {
             filter.push(c);
-            rows = app.entry_picker_rows(keep_id, &filter);
+            rows = app.entry_picker_rows(keep_id, &filter, within.as_deref());
             selected = 0;
         }
         KeyCode::Enter => {
@@ -484,6 +485,7 @@ fn handle_entry_picker_key(app: &mut App, code: KeyCode) {
 
     app.mode = Mode::EntryPicker {
         keep_id,
+        within,
         filter,
         rows,
         selected,
@@ -617,11 +619,14 @@ enum Mode {
     Command { entry_id: i64 },
     // Edit's field-name list, opened by ":" -> "e".
     FieldPicker { entry_id: i64, selected: usize },
-    // Merge's fold-in-entry picker, opened by ":" -> "m" when fewer than two
-    // entries are marked. `keep_id` is fixed for the picker's lifetime;
-    // `rows` are indices into `App::entries` matching `filter`.
+    // Merge's fold-in-entry picker, opened by ":" -> "m". `keep_id` is fixed
+    // for the picker's lifetime; `rows` are indices into `App::entries`
+    // matching `filter`. `within`, when set (3+ marked -- see MergePlan),
+    // restricts candidates to that marked subset instead of the whole
+    // library.
     EntryPicker {
         keep_id: i64,
+        within: Option<Vec<i64>>,
         filter: String,
         rows: Vec<usize>,
         selected: usize,
@@ -773,19 +778,23 @@ impl EditField {
 #[derive(Debug, PartialEq)]
 enum MergePlan {
     // 0 or 1 marked: the selected entry (carried here) is the keeper: open
-    // a picker to choose what folds into it.
+    // a picker, over the whole library, to choose what folds into it.
     PickDrop(i64),
     // Exactly 2 marked: order already decides keep/drop.
     Pair(i64, i64),
-    // 3+ marked: out of scope for one merge.
-    TooMany,
+    // 3+ marked: the first-marked entry is the keeper, and the picker's
+    // candidates are narrowed to the rest of the marked set (not the whole
+    // library) -- marking is how you say "these are the ones I actually
+    // mean," so a merge started from a marked subset shouldn't fall back to
+    // searching everything.
+    PickDropWithin(i64, Vec<i64>),
 }
 
 fn plan_merge(marked: &[i64], selected_id: Option<i64>) -> Option<MergePlan> {
     match marked.len() {
         0 | 1 => selected_id.map(MergePlan::PickDrop),
         2 => Some(MergePlan::Pair(marked[0], marked[1])),
-        _ => Some(MergePlan::TooMany),
+        _ => Some(MergePlan::PickDropWithin(marked[0], marked[1..].to_vec())),
     }
 }
 
@@ -1104,11 +1113,16 @@ impl App {
     // Builds the rows for the merge entry-picker: every entry except
     // `keep_id` itself, narrowed by `matches_filter` (the same
     // case-insensitive substring match "/" search uses).
-    fn entry_picker_rows(&self, keep_id: i64, filter: &str) -> Vec<usize> {
+    // `within`, when given, restricts candidates to that id set (e.g. a
+    // marked subset) instead of the whole library -- see MergePlan.
+    fn entry_picker_rows(&self, keep_id: i64, filter: &str, within: Option<&[i64]>) -> Vec<usize> {
         let needle = filter.to_lowercase();
         (0..self.entries.len())
             .filter(|&i| {
-                self.entries[i].id != Some(keep_id) && matches_filter(&self.entries[i], &needle)
+                let id = self.entries[i].id;
+                id != Some(keep_id)
+                    && within.is_none_or(|ids| id.is_some_and(|id| ids.contains(&id)))
+                    && matches_filter(&self.entries[i], &needle)
             })
             .collect()
     }
@@ -1119,14 +1133,21 @@ impl App {
             Some(MergePlan::PickDrop(keep_id)) => {
                 self.mode = Mode::EntryPicker {
                     keep_id,
+                    within: None,
                     filter: String::new(),
-                    rows: self.entry_picker_rows(keep_id, ""),
+                    rows: self.entry_picker_rows(keep_id, "", None),
                     selected: 0,
                 };
             }
             Some(MergePlan::Pair(keep_id, drop_id)) => self.confirm_merge(keep_id, drop_id),
-            Some(MergePlan::TooMany) => {
-                self.error = Some("merge only supports two entries at a time".to_string());
+            Some(MergePlan::PickDropWithin(keep_id, candidates)) => {
+                self.mode = Mode::EntryPicker {
+                    keep_id,
+                    rows: self.entry_picker_rows(keep_id, "", Some(&candidates)),
+                    within: Some(candidates),
+                    filter: String::new(),
+                    selected: 0,
+                };
             }
             None => {}
         }
@@ -1546,8 +1567,9 @@ fn draw(frame: &mut Frame, app: &App) {
             filter,
             rows,
             selected,
+            within,
             ..
-        } => draw_entry_picker(frame, area, app, filter, rows, *selected),
+        } => draw_entry_picker(frame, area, app, filter, rows, *selected, within.is_some()),
         Mode::Confirm { message, .. } => draw_confirm(frame, area, message),
         Mode::Normal | Mode::Input(..) => {}
     }
@@ -1887,13 +1909,30 @@ fn draw_command(frame: &mut Frame, frame_area: Rect, app: &App, entry_id: i64) {
     let popup = Rect { x, y, width, height };
 
     frame.render_widget(Clear, popup);
+    // Cyan is this codebase's existing "active/focused" accent (see
+    // pane_block), reused here so the palette visibly pops against the
+    // plain-bordered popups (field/entry pickers, confirm) instead of
+    // reading as identical text on a default-styled box.
+    let accent = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let hotkey = |key: &'static str, label: &'static str| {
+        ListItem::new(Line::from(vec![
+            Span::styled(key, accent),
+            Span::raw(format!("  {label}")),
+        ]))
+    };
     let items = vec![
-        ListItem::new("e  Edit field"),
-        ListItem::new("f  Fetch PDF"),
-        ListItem::new("m  Merge"),
-        ListItem::new("d  Delete"),
+        hotkey("e", "Edit field"),
+        hotkey("f", "Fetch PDF"),
+        hotkey("m", "Merge"),
+        hotkey("d", "Delete"),
     ];
-    let list = List::new(items).block(Block::default().title(cite_key.to_string()).borders(Borders::ALL));
+    let list = List::new(items).block(
+        Block::default()
+            .title(cite_key.to_string())
+            .borders(Borders::ALL)
+            .border_style(accent)
+            .title_style(accent),
+    );
     frame.render_widget(list, popup);
 }
 
@@ -1942,6 +1981,7 @@ fn draw_entry_picker(
     filter: &str,
     rows: &[usize],
     selected: usize,
+    within_marked: bool,
 ) {
     let width = frame_area.width.saturating_sub(6).clamp(20, 70);
     let height = ((rows.len() as u16) + 2)
@@ -1968,10 +2008,15 @@ fn draw_entry_picker(
         state.select(Some(selected));
     }
 
-    let title = if filter.is_empty() {
-        "Merge into…".to_string()
+    let base_title = if within_marked {
+        "Merge into… (marked)"
     } else {
-        format!("Merge into… /{filter}")
+        "Merge into…"
+    };
+    let title = if filter.is_empty() {
+        base_title.to_string()
+    } else {
+        format!("{base_title} /{filter}")
     };
     let list = List::new(items)
         .block(Block::default().title(title).borders(Borders::ALL))
@@ -2212,7 +2257,10 @@ mod tests {
         assert_eq!(plan_merge(&[], None), None);
         // Exactly 2: order decides keep/drop, no picker needed.
         assert_eq!(plan_merge(&[1, 2], Some(9)), Some(MergePlan::Pair(1, 2)));
-        // 3+: out of scope for one merge.
-        assert_eq!(plan_merge(&[1, 2, 3], Some(9)), Some(MergePlan::TooMany));
+        // 3+: first-marked keeps, picker is scoped to the rest of the marks.
+        assert_eq!(
+            plan_merge(&[1, 2, 3], Some(9)),
+            Some(MergePlan::PickDropWithin(1, vec![2, 3]))
+        );
     }
 }
