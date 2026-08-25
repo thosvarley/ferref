@@ -240,11 +240,19 @@ pub enum Command {
         #[command(subcommand)]
         command: CollectionCommand,
     },
+    /// Report attachments whose stored path no longer resolves on disk --
+    /// moved or deleted files, or a hand-edited DB row pointing nowhere.
+    /// Read-only: nothing is fixed or removed, just listed. Exits 1 if any
+    /// are found, 0 otherwise, so it's usable as a health-check script.
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
     /// Browse the library in a three-pane terminal UI (collections, entries,
-    /// details). Sorts, searches, creates collections and files papers into
-    /// them; editing, deleting and tagging stay CLI-only. There is no --json
-    /// here because it isn't a data-printing command, it's an interactive
-    /// screen.
+    /// details): sorts, searches, edits fields, fetches PDFs, deletes and
+    /// merges entries, tags/untags, and files papers into collections --
+    /// singly or, with entries marked, in bulk. There is no --json here
+    /// because it isn't a data-printing command, it's an interactive screen.
     Tui,
 }
 

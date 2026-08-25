@@ -104,6 +104,7 @@ fn handle_key(
         Mode::FieldPicker { .. } => handle_field_picker_key(app, code),
         Mode::EntryPicker { .. } => handle_entry_picker_key(app, code),
         Mode::Confirm { .. } => handle_confirm_key(app, conn, code),
+        Mode::Help => app.mode = Mode::Normal, // any key closes it
     }
 }
 
@@ -205,15 +206,12 @@ fn handle_normal_key(app: &mut App, conn: &Connection, code: KeyCode, modifiers:
         KeyCode::Char('x')
             if matches!(app.focus, Focus::Entries | Focus::Details) && !app.view.is_empty() =>
         {
-            let ids = if app.marked.is_empty() {
-                app.selected_entry().and_then(|e| e.id).into_iter().collect()
-            } else {
-                app.marked.clone()
-            };
-            if !ids.is_empty() {
+            if let Some(entry_id) = app.selected_entry().and_then(|e| e.id) {
+                let ids = app.bulk_targets(entry_id);
                 app.mode = Mode::Input(InputKind::ExportPath { ids }, "export.bib".to_string());
             }
         }
+        KeyCode::Char('?') => app.mode = Mode::Help,
         // Toggles the current row into the merge marks. Insertion order
         // matters (first marked survives a merge, second is folded in and
         // deleted) -- see App::toggle_mark.
@@ -291,6 +289,10 @@ fn handle_input_key(app: &mut App, conn: &Connection, code: KeyCode) {
                     app.export_bibtex(&ids, buffer.trim());
                     app.mode = Mode::Normal;
                 }
+                InputKind::Tag { ids, add } => {
+                    app.apply_tag(conn, &ids, buffer.trim(), add);
+                    app.mode = Mode::Normal;
+                }
             }
         }
         KeyCode::Esc => {
@@ -300,7 +302,7 @@ fn handle_input_key(app: &mut App, conn: &Connection, code: KeyCode) {
                     app.rebuild_view();
                     app.mode = Mode::Normal;
                 }
-                InputKind::NewCollection | InputKind::ExportPath { .. } => {
+                InputKind::NewCollection | InputKind::ExportPath { .. } | InputKind::Tag { .. } => {
                     app.mode = Mode::Normal;
                 }
                 // Esc on a field edit backs out to the field picker without
@@ -438,6 +440,14 @@ fn handle_command_key(
         KeyCode::Char('f') => app.fetch_selected(conn, terminal, entry_id),
         KeyCode::Char('m') => app.begin_merge(entry_id),
         KeyCode::Char('d') => app.begin_delete(entry_id),
+        KeyCode::Char('t') => {
+            let ids = app.bulk_targets(entry_id);
+            app.mode = Mode::Input(InputKind::Tag { ids, add: true }, String::new());
+        }
+        KeyCode::Char('u') => {
+            let ids = app.bulk_targets(entry_id);
+            app.mode = Mode::Input(InputKind::Tag { ids, add: false }, String::new());
+        }
         _ => app.mode = Mode::Command { entry_id },
     }
 }
@@ -691,6 +701,9 @@ enum Mode {
     // Delete/merge confirmation. An enum of pending actions (rather than a
     // boxed closure) since there are exactly two call sites.
     Confirm { message: String, action: PendingAction },
+    // "?": the full keymap reference. Static content, so no fields -- any
+    // key closes it.
+    Help,
 }
 
 enum InputKind {
@@ -709,6 +722,10 @@ enum InputKind {
     // "x": the output path for a BibTeX export of `ids` (the marked set,
     // or just the selected entry when nothing's marked).
     ExportPath { ids: Vec<i64> },
+    // ":" -> "t"/"u": the tag name to add to (add: true) or remove from
+    // (add: false) every id in `ids` -- same marked-or-selected target rule
+    // as export.
+    Tag { ids: Vec<i64>, add: bool },
 }
 
 #[derive(Clone, Copy)]
@@ -1000,6 +1017,17 @@ impl App {
         self.view.get(self.table_selected).map(|&i| &self.entries[i])
     }
 
+    // The target set for a bulk action (export, tag/untag): the marked
+    // entries, or just `entry_id` alone with nothing marked. Same rule
+    // `open_picker`'s bulk-file mode uses.
+    fn bulk_targets(&self, entry_id: i64) -> Vec<i64> {
+        if self.marked.is_empty() {
+            vec![entry_id]
+        } else {
+            self.marked.clone()
+        }
+    }
+
     // Creates a collection under `parent` (None = root, same as "All
     // Papers" selected) and reloads so the tree's rows/counts pick it up.
     // A DB error is shown on the footer rather than propagated -- a bad
@@ -1168,6 +1196,54 @@ impl App {
             }
             Err(e) => self.error = Some(format!("failed to write '{path}': {e}")),
         }
+    }
+
+    // ":" -> "t"/"u": adds (add: true) or removes (add: false) `tag` for
+    // every id in `ids`, via the same db::add_tag/remove_tag `ferref
+    // tag`/`untag` use -- both already idempotent, so a mixed set (some
+    // already tagged, some not) is not an error.
+    fn apply_tag(&mut self, conn: &Connection, ids: &[i64], tag: &str, add: bool) {
+        if tag.is_empty() {
+            self.error = Some("tag name cannot be empty".to_string());
+            return;
+        }
+        let cite_keys: Vec<String> = ids
+            .iter()
+            .filter_map(|id| self.entries.iter().find(|e| e.id == Some(*id)).map(|e| e.cite_key.clone()))
+            .collect();
+
+        let mut changed = 0usize;
+        for cite_key in &cite_keys {
+            let result = if add {
+                db::add_tag(conn, cite_key, tag)
+            } else {
+                db::remove_tag(conn, cite_key, tag)
+            };
+            match result {
+                Ok(did_change) => changed += did_change as usize,
+                Err(e) => {
+                    self.error = Some(e.to_string());
+                    return;
+                }
+            }
+        }
+
+        // Entry.tags is loaded once at reload time -- refresh every touched
+        // entry so DETAILS (and "/" search, which matches on tags) don't
+        // show stale tags until the next full reload.
+        for &id in ids {
+            if let Err(e) = self.refresh_entry(conn, id) {
+                self.error = Some(e);
+                return;
+            }
+        }
+
+        let verb = if add { "Tagged" } else { "Untagged" };
+        self.error = Some(format!(
+            "{verb} {changed} of {} entr{} with '{tag}'",
+            cite_keys.len(),
+            if cite_keys.len() == 1 { "y" } else { "ies" }
+        ));
     }
 
     // Fetch (":" -> "f"): the Unpaywall round-trip and PDF download block
@@ -1684,6 +1760,7 @@ fn draw(frame: &mut Frame, app: &App) {
             ..
         } => draw_entry_picker(frame, area, app, filter, rows, *selected, within.is_some()),
         Mode::Confirm { message, .. } => draw_confirm(frame, area, message),
+        Mode::Help => draw_help(frame, area),
         Mode::Normal | Mode::Input(..) => {}
     }
 }
@@ -1948,6 +2025,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             Mode::Input(InputKind::ExportPath { ids }, buffer) => {
                 format!(" Export {} entr{} to: {buffer}", ids.len(), if ids.len() == 1 { "y" } else { "ies" })
             }
+            Mode::Input(InputKind::Tag { ids, add }, buffer) => {
+                format!(
+                    " {} {} entr{}: {buffer}",
+                    if *add { "Tag" } else { "Untag" },
+                    ids.len(),
+                    if ids.len() == 1 { "y" } else { "ies" }
+                )
+            }
             Mode::Picker { bulk: None, .. } => {
                 " Enter toggle \u{b7} jk move \u{b7} Esc/q close".to_string()
             }
@@ -1955,7 +2040,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 " Enter file marked \u{b7} jk move \u{b7} Esc/q close".to_string()
             }
             Mode::Command { .. } => {
-                " e edit \u{b7} f fetch \u{b7} m merge \u{b7} d delete \u{b7} Esc close".to_string()
+                " e edit \u{b7} f fetch \u{b7} m merge \u{b7} d delete \u{b7} t tag \u{b7} \
+                 u untag \u{b7} Esc close"
+                    .to_string()
             }
             Mode::FieldPicker { .. } => " Enter edit \u{b7} jk move \u{b7} Esc back".to_string(),
             Mode::EntryPicker { .. } => {
@@ -1963,12 +2050,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                     .to_string()
             }
             Mode::Confirm { message, .. } => format!(" {message}"),
+            Mode::Help => " Esc/q/any key: close".to_string(),
             Mode::Normal if !app.filter.is_empty() => format!(" filter: {}", app.filter),
-            Mode::Normal => {
-                " Tab pane \u{b7} jk move \u{b7} / search \u{b7} s sort \u{b7} n new \u{b7} \
-                 c file \u{b7} o open \u{b7} space mark \u{b7} : cmd \u{b7} r reload \u{b7} q quit"
-                    .to_string()
-            }
+            // The full keymap lived here as one long line that grew with
+            // every new feature; it's behind "?" now instead (draw_help).
+            Mode::Normal => " ?  help \u{b7} q quit".to_string(),
         }
     };
     let footer = Paragraph::new(text);
@@ -2018,6 +2104,97 @@ fn draw_picker(
     frame.render_stateful_widget(list, popup, &mut state);
 }
 
+// "?": the full keymap, grouped the way the footer hints used to be spread
+// across modes -- one place to look instead of memorizing which mode shows
+// which fragment. Static content (no App fields needed); Clone::clone would
+// be free here anyway since it's all &'static str.
+fn draw_help(frame: &mut Frame, frame_area: Rect) {
+    const GROUPS: &[(&str, &[(&str, &str)])] = &[
+        (
+            "Navigate",
+            &[
+                ("Tab / BackTab", "switch pane"),
+                ("j/k, \u{2191}\u{2193}", "move"),
+                ("g / G", "top / bottom"),
+                ("Ctrl-d / Ctrl-u", "half page"),
+                ("h / l", "fold/unfold (tree) \u{b7} switch pane"),
+            ],
+        ),
+        (
+            "Find & sort",
+            &[
+                ("/", "search (Esc clears)"),
+                ("s / S", "sort column / reverse"),
+            ],
+        ),
+        (
+            "Entries",
+            &[
+                ("Space", "mark for merge/bulk actions"),
+                (":", "command palette (opens its own menu)"),
+                ("c", "file into collection (bulk if marked)"),
+                ("x", "export marked as BibTeX"),
+                ("o", "open attachment"),
+            ],
+        ),
+        (
+            "Collections",
+            &[("n", "new (sub)collection")],
+        ),
+        (
+            "Other",
+            &[("r", "reload"), ("q", "quit"), ("?", "this screen")],
+        ),
+    ];
+
+    let width = frame_area.width.saturating_sub(6).clamp(30, 74);
+    // ponytail: assumes every row fits on one line at this width, which is
+    // true at the 74-col cap but not proven down at the 30-col floor (a
+    // long description could wrap and get clipped by the fixed height
+    // below) -- only matters on a terminal already at MIN_WIDTH, where
+    // every pane is cramped anyway. Wrap-aware height math if that turns
+    // out to matter in practice.
+    let line_count: u16 = GROUPS
+        .iter()
+        .map(|(_, rows)| rows.len() as u16 + 1) // +1 for the group heading
+        .sum();
+    let height = (line_count + 2).min(frame_area.height.saturating_sub(2)).max(3);
+    let x = frame_area.x + frame_area.width.saturating_sub(width) / 2;
+    let y = frame_area.y + frame_area.height.saturating_sub(height) / 2;
+    let popup = Rect { x, y, width, height };
+
+    frame.render_widget(Clear, popup);
+
+    let accent = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let key_width = GROUPS
+        .iter()
+        .flat_map(|(_, rows)| rows.iter().map(|(k, _)| k.len()))
+        .max()
+        .unwrap_or(0);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (heading, rows) in GROUPS {
+        lines.push(Line::from(Span::styled(*heading, accent)));
+        for (key, desc) in *rows {
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {key:<key_width$}  ")),
+                Span::raw(*desc),
+            ]));
+        }
+    }
+
+    let para = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title("Keymap")
+                .borders(Borders::ALL)
+                .border_style(accent)
+                .title_style(accent),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(para, popup);
+}
+
 // The ":" palette -- a small fixed list, titled with the scoped entry's
 // cite_key so it's clear which paper the four actions apply to.
 fn draw_command(frame: &mut Frame, frame_area: Rect, app: &App, entry_id: i64) {
@@ -2029,7 +2206,7 @@ fn draw_command(frame: &mut Frame, frame_area: Rect, app: &App, entry_id: i64) {
         .unwrap_or("");
 
     let width = 26u16.min(frame_area.width.saturating_sub(4)).max(12);
-    let height = 6u16.min(frame_area.height.saturating_sub(4)).max(3);
+    let height = 8u16.min(frame_area.height.saturating_sub(4)).max(3);
     let x = frame_area.x + frame_area.width.saturating_sub(width) / 2;
     let y = frame_area.y + frame_area.height.saturating_sub(height) / 2;
     let popup = Rect { x, y, width, height };
@@ -2051,6 +2228,8 @@ fn draw_command(frame: &mut Frame, frame_area: Rect, app: &App, entry_id: i64) {
         hotkey("f", "Fetch PDF"),
         hotkey("m", "Merge"),
         hotkey("d", "Delete"),
+        hotkey("t", "Tag"),
+        hotkey("u", "Untag"),
     ];
     let list = List::new(items).block(
         Block::default()

@@ -57,6 +57,13 @@ All fifteen phases are complete.
 - `edit` cannot clear a field back to `null`, or empty an author list — flags are
   only applied when passed, and there's no "unset" sentinel. Workaround is `rm` +
   `add`. Worth revisiting when something actually needs to retract a field.
+  This is CLI-specific: the TUI's Edit (`:` -> `e`, Phase 16) has no such gap
+  for any optional field or the author list — an empty input box clears it
+  (`None`, or an empty `Vec`), since a text box naturally represents
+  "nothing typed" where a CLI flag can't distinguish "not passed" from
+  "passed as empty." Title is the one exception, in both places: it's
+  `NOT NULL` in the schema, so an empty edit is rejected rather than
+  clearing it.
 - `edit` has no `--type`, so `entry_type` is fixed at creation.
 - `cite_key` is not renameable; `update_entry` looks entries up by it. This is
   also why a second Zhou 2020 becomes `zhou2020b` and never `zhou2020a` — the
@@ -124,8 +131,10 @@ All fifteen phases are complete.
   the DB rows but never the attachment files in `./pdfs/` — they're orphaned
   on disk, not cleaned up. True since `rm` shipped in Phase 1; Phase 16 makes
   it easier to hit casually, since `:d` in the TUI is one confirm away rather
-  than a deliberate CLI invocation. `ferref doctor` (Roadmap) is the natural
-  place to eventually report — and offer to clean up — orphans like these.
+  than a deliberate CLI invocation. `ferref doctor` (Phase 17) checks the
+  opposite direction — a DB row pointing at a file that's gone — not this
+  one; it's the natural place to eventually report these too, once it also
+  scans `./pdfs/` for files with no matching row.
 
 BibTeX round trips (Phase 3) lose two things, both inherent to the target format
 rather than fixable in our mapping:
@@ -1006,7 +1015,7 @@ reproduces the exact missing-file case.
 
 **Follow-on: two more bulk actions over the marked set.** After the phase
 shipped, marking turned out to be useful for more than merge — the same
-"these are the ones I mean" primitive now backs two more actions, both
+"these are the ones I mean" primitive now backs several more actions, all
 reusing marks without introducing a new selection mechanism:
 
 - `x` exports the marked entries (or, with nothing marked, just the
@@ -1025,6 +1034,68 @@ reusing marks without introducing a new selection mechanism:
   empty in this mode and a row only flips to `[x]` once the set has
   actually been filed into it this session. With nothing marked, `c` is
   exactly what it always was.
+- `:` gains `t`/`u` — tag/untag every id in the same marked-or-selected
+  target set (`App::bulk_targets`, the small helper `x` and `t`/`u` both
+  call), via the same `db::add_tag`/`remove_tag` the CLI's `tag`/`untag`
+  already use. Both are idempotent server-side, so a mixed set (some
+  already tagged, some not) is never an error. This is the one place the
+  Phase 16 write-up's "tagging stays out of scope" line gets revisited —
+  worth it once bulk actions over marks already existed for export and
+  filing; single-entry tag management is still CLI-only.
+- `?` replaces the Normal-mode footer's keymap line, which had grown a
+  clause every time a feature landed here, with a full-screen reference
+  (`draw_help`) grouped by Navigate / Find & sort / Entries / Collections /
+  Other. Any key closes it. One real bug caught building it, worth keeping
+  as a lesson: the popup's height was computed by counting *logical* rows
+  (one per keybinding), not accounting for a long description wrapping
+  inside the popup's fixed width — the `:` row's original text (listing
+  every palette hotkey) wrapped to two lines on a real 120-column terminal,
+  and the fixed-height box silently clipped the last entry off the bottom.
+  Fixed by shortening that one line (it was redundant anyway — `:` shows
+  its own hotkeys when opened) rather than making the height calculation
+  wrap-aware; a `ponytail:`-style comment in `draw_help` names the
+  remaining ceiling (a long line could still wrap at the popup's narrowest
+  clamp, ~30 columns, reachable only on a terminal already at `MIN_WIDTH`
+  where every pane is already cramped).
+
+---
+
+## Phase 17 — `ferref doctor`
+
+Scoped and built directly off the Roadmap bullet this section replaces:
+attachment paths are absolute and stored at attach time (`db.rs`'s known
+limitations), so moving the library directory, or hand-editing a row to
+point somewhere that never existed, leaves a dangling reference nothing
+previously reported. `doctor` is a read-only scan: `db::all_attachment_paths`
+(one query, `entries JOIN attachments`, not one query per entry — same
+shape as `all_attachment_text_lengths`) pairs every attachment's cite_key
+with its stored path; the CLI checks each with `Path::is_file` and reports
+the ones that fail. `--json` gets `{"checked": N, "broken": [{"cite_key",
+"path"}, ...]}`; plain text lists `cite_key: path` per broken row, or "All N
+attachments resolve." if none. Exits 1 if anything's broken, 0 otherwise, so
+it's usable as a health-check script (`ferref doctor || alert-someone`).
+
+No `--fix` yet, per the original Roadmap note — re-pointing a path needs a
+human to say what it should point to instead (there's no way to infer a
+moved file's new location), and dropping the row outright is a data-loss
+decision that shouldn't be a flag's default behavior. Report first, decide
+later whether a fix mode earns its keep.
+
+Note the direction: `doctor` catches a DB row pointing at a file that
+isn't there. It does *not* catch the opposite — a file sitting in `./pdfs/`
+that no DB row references any more, which is what `delete_entry` and
+merge's dropped entry currently leave behind (see the known-limitations
+entry on orphaned attachment files). Symmetric coverage (scanning `./pdfs/`
+for files with no matching row) is a natural follow-on once this direction
+has been useful for a while, not built here since it's a different query
+shape (filesystem-driven instead of DB-driven) and a different set of
+false-positive risks (a file mid-copy, a library sharing `./pdfs/` with
+something else).
+
+Delegation: **no / no**. One new DB query (a straightforward join, not a
+migration) and a CLI command with no CLI framework precedent to get wrong —
+smaller and lower-risk than Phase 10/5's shape, closer to Phase 4's "extends
+one function, small enough to just write."
 
 ---
 
@@ -1048,11 +1119,6 @@ one yet.
   command (`ferref similar <cite_key>`) or a `search` mode; and whether
   storing vectors still fits "it's just one SQLite file" or needs its own
   store. Big lift, correctly not for now.
-- **`ferref doctor`** — scan attachment paths against the filesystem and
-  report ones that no longer resolve. Motivated by the existing limitation
-  that attachment paths are absolute and don't move with the library.
-  Read-only report to start; a `--fix` that offers to re-point or drop dead
-  rows is a separate question once the report itself exists.
 
 ## Explicit non-goals for v1
 
@@ -1064,7 +1130,7 @@ one yet.
 
 ## Order of work
 
-Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
+Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
 
 ---
 
@@ -1091,6 +1157,7 @@ Which phases get farmed out to a `coder` subagent, and which get an
 | 14 — Fixed library location + `install.sh` | no | no | Small, mechanical, same env-var-then-`$HOME` pattern `config.rs` already has. `install.sh` is an install script, not a trust boundary in the running program. |
 | 15 — `search --text` (FTS5-trigram) | **yes** | **yes** | Real schema migration (virtual table, sync triggers, backfill), not a one-clause extension. A trigger that silently fails to fire is exactly the "review earns its keep on silent failures" case. |
 | 16 — TUI editing, fetch, delete, merge | **yes** | **yes** | Biggest TUI grind yet (five new modes), plus two silent-failure traps: attachment-filename collision on merge (same class as Phase 12's `attach` race) and a blocking network call inside the render loop that must not corrupt terminal state on failure. |
+| 17 — `ferref doctor` | no | no | One join query plus a CLI command, no migration, no new trust boundary. Same shape as Phase 4. |
 
 The table is a default, not a rule. The reasoning behind it, which outlives the
 table if the phases change:

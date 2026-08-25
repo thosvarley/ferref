@@ -501,6 +501,8 @@ fn main() {
 
         Command::Collection { command } => dispatch_collection(&conn, command),
 
+        Command::Doctor { json } => cmd_doctor(&conn, json),
+
         Command::Tui => {
             if let Err(e) = tui::run(&conn) {
                 die(&e);
@@ -844,6 +846,51 @@ fn cmd_fetch(
             }
         }
     }
+
+// Roadmap item, scoped here: a read-only scan for attachment paths that no
+// longer resolve on disk (a moved/deleted file, or a hand-edited DB row --
+// the database is hand-editable by design, so this is a real, reachable
+// state, not just a defensive check). Doesn't touch the filesystem beyond
+// `Path::is_file`, and doesn't offer to fix anything -- that's future work
+// once the report itself has been useful for a while.
+fn cmd_doctor(conn: &rusqlite::Connection, json: bool) {
+    let attachments = match db::all_attachment_paths(conn) {
+        Ok(a) => a,
+        Err(e) => die(&format!("failed to list attachments: {e}")),
+    };
+
+    let broken: Vec<(&String, &String)> = attachments
+        .iter()
+        .filter(|(_, path)| !std::path::Path::new(path).is_file())
+        .map(|(cite_key, path)| (cite_key, path))
+        .collect();
+
+    if json {
+        let out = serde_json::json!({
+            "checked": attachments.len(),
+            "broken": broken
+                .iter()
+                .map(|(cite_key, path)| serde_json::json!({ "cite_key": cite_key, "path": path }))
+                .collect::<Vec<_>>(),
+        });
+        emit_json(&out);
+    } else if broken.is_empty() {
+        emit(&format!("All {} attachments resolve.", attachments.len()));
+    } else {
+        emit(&format!(
+            "{} of {} attachments do not resolve on disk:",
+            broken.len(),
+            attachments.len()
+        ));
+        for (cite_key, path) in &broken {
+            emit(&format!("  {cite_key}: {path}"));
+        }
+    }
+
+    if !broken.is_empty() {
+        std::process::exit(1);
+    }
+}
 
 fn dispatch_collection(conn: &rusqlite::Connection, command: cli::CollectionCommand) {
     use cli::CollectionCommand;

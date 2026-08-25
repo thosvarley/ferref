@@ -463,6 +463,22 @@ pub fn all_attachment_text_lengths(conn: &Connection) -> Result<HashMap<i64, Vec
     Ok(out)
 }
 
+// Every attachment's owning cite_key and stored path, for `ferref doctor`
+// (Roadmap: "scan attachment paths against the filesystem and report ones
+// that no longer resolve"). One query, not one per entry -- same reasoning
+// as all_attachment_text_lengths. Read-only: doctor doesn't touch the
+// filesystem existence check here, that's the caller's job, so this stays
+// pure DB access with no I/O to mock in a test.
+pub fn all_attachment_paths(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT entries.cite_key, attachments.path FROM attachments \
+         JOIN entries ON entries.id = attachments.entry_id \
+         ORDER BY entries.cite_key, attachments.id",
+    )?;
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect()
+}
+
 // Single place tag names are normalized, so writes (add_tag/remove_tag) and
 // reads (the `tag` filter in list_entries) can't disagree about what counts
 // as the same tag. Rejects empty-after-trim rather than writing it, for the
@@ -2094,6 +2110,29 @@ mod tests {
         let all = all_attachment_text_lengths(&conn).unwrap();
         assert_eq!(all[&id], vec![Some(5), None]);
         assert_eq!(all[&other_id], vec![None]);
+    }
+
+    #[test]
+    fn all_attachment_paths_pairs_each_path_with_its_owning_cite_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        seed(&conn, "k", "T", 2020, "Doe", "Jane");
+        seed(&conn, "other", "Other", 2021, "Roe", "Jan");
+
+        attach(&conn, "k", "/tmp/a.pdf").unwrap();
+        attach(&conn, "k", "/tmp/b.pdf").unwrap();
+        attach(&conn, "other", "/tmp/c.pdf").unwrap();
+
+        let mut all = all_attachment_paths(&conn).unwrap();
+        all.sort();
+        assert_eq!(
+            all,
+            vec![
+                ("k".to_string(), "/tmp/a.pdf".to_string()),
+                ("k".to_string(), "/tmp/b.pdf".to_string()),
+                ("other".to_string(), "/tmp/c.pdf".to_string()),
+            ]
+        );
     }
 
     // The realistic regression for the backfill guard: nothing today stops a
