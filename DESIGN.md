@@ -9,6 +9,18 @@ do. The contrast with Zotero isn't CLI-vs-GUI, it's "opaque app-owned
 datastore" vs. "plain SQLite file + scriptable CLI that any script or model
 pipeline can hit directly."
 
+Scientific literature is a shared resource, and the two things that actually
+use a ferref library — a human, and an AI agent — are meant to use it
+*together*, not as two separate modes bolted onto one database. That means
+ferref has two front ends, not one primary and one afterthought: the CLI/JSON
+surface for scripting and agent use, and the TUI for a human sitting at the
+keyboard, and both are held to the same bar — well-designed, low-friction,
+worth actually using — rather than one being "the real interface" and the
+other a compatibility shim. A phase that improves the TUI's usability is
+exactly as in-scope as one that adds a `--json` field; see the delegation
+table's own phase list, where the TUI phases (11, 12, 16, 18) got exactly
+as much design and review attention as the data-layer ones.
+
 Design principles that follow from that, and constrain every phase below:
 
 - **Open data.** The DB is a plain SQLite file. No proprietary blob formats.
@@ -25,6 +37,11 @@ Design principles that follow from that, and constrain every phase below:
   embeddings, graphs, or analysis results against ferref entries. Don't
   redesign these casually once other tools depend on them.
 - UI is CLI now, TUI later, never a GUI — out of scope, not deferred.
+- **Both front ends are first-class.** A rough edge in the TUI (an
+  unreadable field, a keybinding that's one accidental press from
+  destructive, a popup that doesn't visually pop) is a real bug, not
+  cosmetic polish to get to eventually — the same standard `--json`
+  correctness gets on the CLI side.
 - The code should be written in a **modular** and largely **functional**
   form. Keeping things modular should aid in maintenance and debuggging. 
 
