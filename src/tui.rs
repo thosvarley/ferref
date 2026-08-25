@@ -100,15 +100,28 @@ fn handle_key(
     // activity.
     app.status = None;
 
-    match app.mode {
+    // Every mode past Normal carries data a handler needs to own (a text
+    // buffer, a picker's rows, ...), so it has to come out of `app.mode`
+    // before a handler can touch it -- one mem::replace here, rather than
+    // one per handler each re-deriving "and put it back if this wasn't
+    // really my variant" (which can't actually happen: this match already
+    // established which variant it is).
+    match std::mem::replace(&mut app.mode, Mode::Normal) {
         Mode::Normal => handle_normal_key(app, conn, code, modifiers),
-        Mode::Input(..) => handle_input_key(app, conn, code),
-        Mode::Picker { .. } => handle_picker_key(app, conn, code),
-        Mode::Command { .. } => handle_command_key(app, conn, terminal, code),
-        Mode::FieldPicker { .. } => handle_field_picker_key(app, code),
-        Mode::EntryPicker { .. } => handle_entry_picker_key(app, code),
-        Mode::Confirm { .. } => handle_confirm_key(app, conn, code),
-        Mode::Help => app.mode = Mode::Normal, // any key closes it
+        Mode::Input(kind, buffer) => handle_input_key(app, conn, code, kind, buffer),
+        Mode::Picker { rows, selected, member, entry_id, bulk } => {
+            handle_picker_key(app, conn, code, rows, selected, member, entry_id, bulk)
+        }
+        Mode::Command { entry_id } => handle_command_key(app, conn, terminal, code, entry_id),
+        Mode::FieldPicker { entry_id, selected } => {
+            handle_field_picker_key(app, code, entry_id, selected)
+        }
+        Mode::EntryPicker { keep_id, within, filter, rows, selected } => {
+            handle_entry_picker_key(app, code, keep_id, within, filter, rows, selected)
+        }
+        Mode::Confirm { action, .. } => handle_confirm_key(app, conn, code, action),
+        // any key closes it; app.mode is already Normal from the replace above
+        Mode::Help => {}
     }
 }
 
@@ -236,20 +249,11 @@ fn handle_normal_key(app: &mut App, conn: &Connection, code: KeyCode, modifiers:
     }
 }
 
-// Owns the buffer for the duration of the key: mem::replace pulls it out of
-// `app.mode` so the match arms below can freely call back into `app`
+// `kind`/`buffer` come in owned (handle_key already took them out of
+// app.mode) so the match arms below can freely call back into `app`
 // (reload, rebuild_view) without fighting the borrow checker over a field
 // that's simultaneously borrowed and being written back to.
-fn handle_input_key(app: &mut App, conn: &Connection, code: KeyCode) {
-    let mode = std::mem::replace(&mut app.mode, Mode::Normal);
-    let (kind, mut buffer) = match mode {
-        Mode::Input(kind, buffer) => (kind, buffer),
-        other => {
-            app.mode = other;
-            return;
-        }
-    };
-
+fn handle_input_key(app: &mut App, conn: &Connection, code: KeyCode, kind: InputKind, mut buffer: String) {
     match code {
         KeyCode::Char(c) => {
             buffer.push(c);
@@ -333,23 +337,20 @@ fn handle_input_key(app: &mut App, conn: &Connection, code: KeyCode) {
     }
 }
 
-// Same ownership move as handle_input_key, and for the same reason: a
-// toggle needs to call back into `app` (reload_tree_counts) while updating
-// the picker's own state.
-fn handle_picker_key(app: &mut App, conn: &Connection, code: KeyCode) {
-    let mode = std::mem::replace(&mut app.mode, Mode::Normal);
-    let Mode::Picker {
-        rows,
-        mut selected,
-        mut member,
-        entry_id,
-        bulk,
-    } = mode
-    else {
-        app.mode = mode;
-        return;
-    };
-
+// One parameter per Mode::Picker field (handle_key already took ownership
+// of them out of app.mode before calling this) plus the entry-relevant
+// context Enter needs.
+#[allow(clippy::too_many_arguments)]
+fn handle_picker_key(
+    app: &mut App,
+    conn: &Connection,
+    code: KeyCode,
+    rows: Vec<(usize, i64, String)>,
+    mut selected: usize,
+    mut member: HashSet<i64>,
+    entry_id: i64,
+    bulk: Option<Vec<i64>>,
+) {
     match code {
         KeyCode::Char('q') | KeyCode::Esc => {
             app.marked.clear();
@@ -429,13 +430,8 @@ fn handle_command_key(
     conn: &Connection,
     terminal: &mut ratatui::DefaultTerminal,
     code: KeyCode,
+    entry_id: i64,
 ) {
-    let mode = std::mem::replace(&mut app.mode, Mode::Normal);
-    let Mode::Command { entry_id } = mode else {
-        app.mode = mode;
-        return;
-    };
-
     match code {
         KeyCode::Esc => {} // app.mode is already Normal
         KeyCode::Char('e') => {
@@ -461,17 +457,7 @@ fn handle_command_key(
 
 // Edit's field-name picker. Enter opens Mode::Input pre-filled with the
 // field's current value; Esc backs out to Normal.
-fn handle_field_picker_key(app: &mut App, code: KeyCode) {
-    let mode = std::mem::replace(&mut app.mode, Mode::Normal);
-    let Mode::FieldPicker {
-        entry_id,
-        mut selected,
-    } = mode
-    else {
-        app.mode = mode;
-        return;
-    };
-
+fn handle_field_picker_key(app: &mut App, code: KeyCode, entry_id: i64, mut selected: usize) {
     match code {
         KeyCode::Esc => {} // app.mode is already Normal
         KeyCode::Up | KeyCode::Char('k') => {
@@ -506,20 +492,15 @@ fn handle_field_picker_key(app: &mut App, code: KeyCode) {
 // Merge's fold-in-entry picker: types narrow `filter`, Up/Down move the
 // selection (not j/k -- both are ordinary letters someone might filter by,
 // and this picker has a live text box the collection picker doesn't).
-fn handle_entry_picker_key(app: &mut App, code: KeyCode) {
-    let mode = std::mem::replace(&mut app.mode, Mode::Normal);
-    let Mode::EntryPicker {
-        keep_id,
-        within,
-        mut filter,
-        mut rows,
-        mut selected,
-    } = mode
-    else {
-        app.mode = mode;
-        return;
-    };
-
+fn handle_entry_picker_key(
+    app: &mut App,
+    code: KeyCode,
+    keep_id: i64,
+    within: Option<Vec<i64>>,
+    mut filter: String,
+    mut rows: Vec<usize>,
+    mut selected: usize,
+) {
     match code {
         KeyCode::Esc => {
             app.marked.clear();
@@ -561,13 +542,7 @@ fn handle_entry_picker_key(app: &mut App, code: KeyCode) {
 
 // Delete/Merge confirm: any key but 'y' cancels. Marks are cleared either
 // way, per DESIGN.md's Phase 16 merge rule.
-fn handle_confirm_key(app: &mut App, conn: &Connection, code: KeyCode) {
-    let mode = std::mem::replace(&mut app.mode, Mode::Normal);
-    let Mode::Confirm { action, .. } = mode else {
-        app.mode = mode;
-        return;
-    };
-
+fn handle_confirm_key(app: &mut App, conn: &Connection, code: KeyCode, action: PendingAction) {
     if code != KeyCode::Char('y') {
         app.marked.clear();
         return; // app.mode is already Normal
