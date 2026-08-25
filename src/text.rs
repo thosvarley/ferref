@@ -4,9 +4,9 @@
 // input is an arbitrary file on disk, and the child process it spawns must
 // not be able to hang, blow up memory, or leak its own stderr into ours.
 
-use std::sync::mpsc::{self, Receiver};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 const EXTRACT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -40,7 +40,10 @@ pub fn extract_text(path: &Path) -> Result<String, String> {
     }
 
     if !path.exists() {
-        return Err(format!("cannot extract text: {} does not exist", path.display()));
+        return Err(format!(
+            "cannot extract text: {} does not exist",
+            path.display()
+        ));
     }
 
     let deadline = Instant::now() + EXTRACT_TIMEOUT;
@@ -64,8 +67,14 @@ pub fn extract_text(path: &Path) -> Result<String, String> {
     //
     // Channels rather than JoinHandle::join(), because a join can't be given a
     // deadline -- see the drain below for why that matters.
-    let stdout_rx = drain(child.stdout.take().expect("stdout was piped"), MAX_TEXT_BYTES + 1);
-    let stderr_rx = drain(child.stderr.take().expect("stderr was piped"), MAX_STDERR_BYTES);
+    let stdout_rx = drain(
+        child.stdout.take().expect("stdout was piped"),
+        MAX_TEXT_BYTES + 1,
+    );
+    let stderr_rx = drain(
+        child.stderr.take().expect("stderr was piped"),
+        MAX_STDERR_BYTES,
+    );
 
     let timed_out = |child: &mut Child, what: &str| {
         kill_process_group(child);
@@ -208,8 +217,14 @@ mod tests {
     // without either: the three input-validation guards.
     #[test]
     fn rejects_bad_inputs_before_spawning_pdftotext() {
-        assert!(extract_text(Path::new("/tmp/notes.txt")).is_err(), "non-PDF extension");
-        assert!(extract_text(Path::new("relative.pdf")).is_err(), "relative path");
+        assert!(
+            extract_text(Path::new("/tmp/notes.txt")).is_err(),
+            "non-PDF extension"
+        );
+        assert!(
+            extract_text(Path::new("relative.pdf")).is_err(),
+            "relative path"
+        );
         assert!(
             extract_text(Path::new("/definitely/not/a/real/path/x.pdf")).is_err(),
             "missing file"
@@ -225,7 +240,13 @@ mod tests {
         // would land inside the 2-byte 'é' -- must round down instead of
         // panicking or corrupting the string.
         let truncated = truncate_to_char_boundary("héllo".to_string(), 3);
-        assert!(truncated.starts_with('h'), "must not slice through a multibyte char");
-        assert!(truncated.contains("exceeded 0MB"), "message must reflect the actual limit passed in, not a hardcoded one: {truncated}");
+        assert!(
+            truncated.starts_with('h'),
+            "must not slice through a multibyte char"
+        );
+        assert!(
+            truncated.contains("exceeded 0MB"),
+            "message must reflect the actual limit passed in, not a hardcoded one: {truncated}"
+        );
     }
 }

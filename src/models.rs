@@ -29,13 +29,13 @@ pub struct Entry {
     // We use Option<i64> for id because new entries don't have an ID yet
     // i64 is a 64-bit integer (matches SQLite's INTEGER type)
     pub id: Option<i64>,
-    
+
     // String is Rust's owned string type
     // "Owned" means this struct owns the data and is responsible for cleaning it up
     pub entry_type: String,
     pub cite_key: String,
     pub title: String,
-    
+
     // Vec<T> is a "vector" - a growable array/list
     // Vec<Author> means "a list of Author structs"
     pub authors: Vec<Author>,
@@ -45,7 +45,7 @@ pub struct Entry {
     // Optional fields use Option<T>
     // i32 is a 32-bit integer (good enough for years)
     pub year: Option<i32>,
-    
+
     // Option<String> means "might be Some(string) or None"
     pub journal: Option<String>,
     pub volume: Option<String>,
@@ -54,7 +54,7 @@ pub struct Entry {
     pub url: Option<String>,
     #[serde(rename = "abstract")]
     pub abstract_text: Option<String>,
-    
+
     // Timestamps stored as Unix epoch (seconds since Jan 1, 1970)
     // i64 can hold very large numbers
     pub date_added: i64,
@@ -75,14 +75,10 @@ impl Entry {
     // 'new' is a Rust convention for constructor functions
     // This is an "associated function" (called with Entry::new, not entry.new)
     // It takes parameters and returns a new Entry
-    pub fn new(
-        entry_type: String,
-        cite_key: String,
-        title: String,
-    ) -> Self {
+    pub fn new(entry_type: String, cite_key: String, title: String) -> Self {
         // Self refers to Entry (the type we're implementing for)
         // This creates and returns a new Entry with sensible defaults
-        
+
         // Unix timestamp in seconds (SQLite uses signed integers)
         let now = now();
 
@@ -90,11 +86,11 @@ impl Entry {
         // If a field name matches a variable name, you can use shorthand
         // 'title' is short for 'title: title'
         Self {
-            id: None,  // No ID yet - will be assigned by database
+            id: None, // No ID yet - will be assigned by database
             entry_type,
             cite_key,
             title,
-            authors: Vec::new(),  // Empty vector of authors
+            authors: Vec::new(), // Empty vector of authors
             tags: Vec::new(),
             attachments: Vec::new(),
             year: None,
@@ -108,7 +104,7 @@ impl Entry {
             date_modified: now,
         }
     }
-    
+
     // A regular method (takes &self, so called on an instance)
     // &self means "borrow the instance, don't take ownership"
     // This lets us use the Entry after calling this method

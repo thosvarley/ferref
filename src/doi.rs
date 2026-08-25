@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use std::net::{IpAddr, ToSocketAddrs};
 
-use ureq::http::Uri;
 use ureq::Agent;
+use ureq::http::Uri;
 
 use crate::models::{Author, Entry};
 
@@ -95,7 +95,9 @@ fn validate_doi(doi: &str) -> Result<(), String> {
         return Err(format!("refusing to look up DOI with path segments: {doi}"));
     }
     if !doi.starts_with("10.") {
-        return Err(format!("'{doi}' is not a DOI (they all start with \"10.\")"));
+        return Err(format!(
+            "'{doi}' is not a DOI (they all start with \"10.\")"
+        ));
     }
     Ok(())
 }
@@ -489,7 +491,9 @@ fn fetch_guarded(
         return Ok((body, current));
     }
 
-    Err(format!("{what}: too many redirects (limit {MAX_REDIRECTS})"))
+    Err(format!(
+        "{what}: too many redirects (limit {MAX_REDIRECTS})"
+    ))
 }
 
 // Accepts only http(s) URLs whose host resolves entirely to public addresses.
@@ -506,7 +510,9 @@ fn validate_url(url: &str) -> Result<Uri, String> {
     let host = uri
         .host()
         .ok_or_else(|| format!("refusing to fetch URL with no host: {url}"))?;
-    let port = uri.port_u16().unwrap_or(if scheme == "https" { 443 } else { 80 });
+    let port = uri
+        .port_u16()
+        .unwrap_or(if scheme == "https" { 443 } else { 80 });
 
     // A host with no resolvable address is a hard error rather than a pass:
     // "can't tell" must not mean "allow".
@@ -592,11 +598,13 @@ fn resolve_location(base: &Uri, location: &str) -> Result<String, String> {
         // (map_or(1, ...) here would slice out of bounds on a truly empty
         // base_path, which .unwrap_or("/") avoids).
         let base_path = base.path();
-        let dir = base_path.rfind('/').map(|i| &base_path[..=i]).unwrap_or("/");
+        let dir = base_path
+            .rfind('/')
+            .map(|i| &base_path[..=i])
+            .unwrap_or("/");
         Ok(format!("{scheme}://{authority}{dir}{location}"))
     }
 }
-
 
 // Minimal RFC 3986 percent-encoding for a DOI or email dropped into a URL
 // path/query. `/` is left literal: a DOI's prefix/suffix separator, which
@@ -660,7 +668,10 @@ fn parse_crossref(json: &str) -> Result<Entry, String> {
         .get("message")
         .ok_or_else(|| "Crossref response missing 'message'".to_string())?;
 
-    let doi = message.get("DOI").and_then(|d| d.as_str()).map(str::to_string);
+    let doi = message
+        .get("DOI")
+        .and_then(|d| d.as_str())
+        .map(str::to_string);
 
     // title/container-title are arrays; take the first element, tolerating
     // an empty array or a missing field entirely.
@@ -679,9 +690,15 @@ fn parse_crossref(json: &str) -> Result<Entry, String> {
         .and_then(|t| t.as_str())
         .map(str::to_string);
 
-    let volume = message.get("volume").and_then(|v| v.as_str()).map(str::to_string);
+    let volume = message
+        .get("volume")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     // "page", not "pages", in Crossref's schema.
-    let pages = message.get("page").and_then(|v| v.as_str()).map(str::to_string);
+    let pages = message
+        .get("page")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
 
     let entry_type = map_entry_type(message.get("type").and_then(|t| t.as_str()).unwrap_or(""));
 
@@ -1000,7 +1017,10 @@ mod tests {
         assert_eq!(m.year, Some(1957));
         assert_eq!(m.doi.as_deref(), Some("10.1103/PhysRev.106.620"));
         // Relative citation_pdf_url is resolved against the page.
-        assert_eq!(m.pdf_url.as_deref(), Some("https://example.org/pdf/106-620.pdf"));
+        assert_eq!(
+            m.pdf_url.as_deref(),
+            Some("https://example.org/pdf/106-620.pdf")
+        );
     }
 
     // A page with none of the tags must come back empty rather than
@@ -1008,7 +1028,10 @@ mod tests {
     // isn't supported" message correct.
     #[test]
     fn a_page_without_citation_tags_yields_nothing() {
-        assert_eq!(meta_of("<html><body>no meta here</body></html>"), PageMetadata::default());
+        assert_eq!(
+            meta_of("<html><body>no meta here</body></html>"),
+            PageMetadata::default()
+        );
         // `data-content` must not be read as `content`.
         let m = meta_of(r#"<meta name="citation_title" data-content="wrong" content="right">"#);
         assert_eq!(m.title.as_deref(), Some("right"));
@@ -1073,7 +1096,10 @@ mod tests {
     fn html_entities_in_content_are_unescaped() {
         assert_eq!(unescape_html("a &amp; b"), "a & b");
         assert_eq!(unescape_html("&lt;i&gt;x&lt;/i&gt;"), "<i>x</i>");
-        assert_eq!(unescape_html("Don&#39;t &#x2014; stop"), "Don't \u{2014} stop");
+        assert_eq!(
+            unescape_html("Don&#39;t &#x2014; stop"),
+            "Don't \u{2014} stop"
+        );
         // Unknown and malformed entities are left exactly as written.
         assert_eq!(unescape_html("100&nbsp;% &amp"), "100&nbsp;% &amp");
     }
@@ -1111,8 +1137,15 @@ mod tests {
     // input and must never reach an HTTP client.
     #[test]
     fn download_pdf_rejects_non_http_schemes() {
-        for bad in ["file:///etc/passwd", "ftp://example.com/x.pdf", "javascript:alert(1)"] {
-            assert!(download_pdf(bad).is_err(), "expected {bad:?} to be rejected");
+        for bad in [
+            "file:///etc/passwd",
+            "ftp://example.com/x.pdf",
+            "javascript:alert(1)",
+        ] {
+            assert!(
+                download_pdf(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
         }
     }
 

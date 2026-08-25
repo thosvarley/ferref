@@ -310,7 +310,6 @@ pub enum CollectionCommand {
     },
 }
 
-
 // "Last, First" -> Author. Splits on the first comma only (names can contain
 // more); no comma means the whole string is the last name.
 //

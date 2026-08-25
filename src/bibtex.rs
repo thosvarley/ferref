@@ -46,7 +46,11 @@ pub fn export(entries: &[Entry], biblatex_syntax: bool) -> String {
 
 fn from_biblatex(e: &BibEntry) -> Entry {
     let entry_type = entry_type_to_string(&e.entry_type);
-    let title = e.title().ok().map(|c| c.format_verbatim()).unwrap_or_default();
+    let title = e
+        .title()
+        .ok()
+        .map(|c| c.format_verbatim())
+        .unwrap_or_default();
 
     let mut entry = Entry::new(entry_type, e.key.clone(), title);
 
@@ -164,7 +168,12 @@ fn to_biblatex(entry: &Entry) -> BibEntry {
 
     if let Some(year) = entry.year {
         e.set_date(PermissiveType::Typed(Date {
-            value: DateValue::At(Datetime { year, month: None, day: None, time: None }),
+            value: DateValue::At(Datetime {
+                year,
+                month: None,
+                day: None,
+                time: None,
+            }),
             uncertain: false,
             approximate: false,
         }));
@@ -374,12 +383,21 @@ mod tests {
         // Legacy BibTeX has no @online, so it downgrades -- expected, and why
         // the flag exists.
         let legacy = export(std::slice::from_ref(&entry), false);
-        assert!(legacy.contains("@misc{"), "legacy BibTeX should downgrade: {legacy}");
-        assert!(legacy.contains("keywords"), "keywords should still be written: {legacy}");
+        assert!(
+            legacy.contains("@misc{"),
+            "legacy BibTeX should downgrade: {legacy}"
+        );
+        assert!(
+            legacy.contains("keywords"),
+            "keywords should still be written: {legacy}"
+        );
 
         // BibLaTeX keeps it.
         let modern = export(std::slice::from_ref(&entry), true);
-        assert!(modern.contains("@online{"), "BibLaTeX should keep @online: {modern}");
+        assert!(
+            modern.contains("@online{"),
+            "BibLaTeX should keep @online: {modern}"
+        );
 
         // Tags round-trip through `keywords`, in order, either way.
         for exported in [legacy, modern] {

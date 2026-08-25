@@ -1,14 +1,14 @@
 // This imports the rusqlite library's Connection type
 // Connection represents a connection to a SQLite database file
 use rusqlite::types::Value;
-use rusqlite::{params_from_iter, Connection, OptionalExtension, Result, Row};
+use rusqlite::{Connection, OptionalExtension, Result, Row, params_from_iter};
 
 // This imports the Path type from Rust's standard library
 // Path is used for working with file system paths
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::models::{now, Attachment, Author, Entry};
+use crate::models::{Attachment, Author, Entry, now};
 
 // Shared DDL for both init_db and the in-memory test connection.
 // PRAGMA foreign_keys is per-connection in SQLite, so it's set here too —
@@ -147,7 +147,10 @@ fn create_schema(conn: &Connection) -> Result<()> {
         // populate/repair an external-content table: it re-scans every row
         // of the content table itself, NULLs included, so it can't disagree
         // with what the triggers already assume.
-        conn.execute("INSERT INTO attachments_fts(attachments_fts) VALUES('rebuild')", [])?;
+        conn.execute(
+            "INSERT INTO attachments_fts(attachments_fts) VALUES('rebuild')",
+            [],
+        )?;
     }
 
     Ok(())
@@ -441,8 +444,8 @@ pub fn attachments_for_cite_key(conn: &Connection, cite_key: &str) -> Result<Vec
 // the same way attachments_for_entry orders Entry.attachments (by id), so
 // callers can zip the two positionally without storing the path twice.
 pub fn all_attachment_text_lengths(conn: &Connection) -> Result<HashMap<i64, Vec<Option<i64>>>> {
-    let mut stmt = conn
-        .prepare("SELECT entry_id, length(full_text) FROM attachments ORDER BY entry_id, id")?;
+    let mut stmt =
+        conn.prepare("SELECT entry_id, length(full_text) FROM attachments ORDER BY entry_id, id")?;
     let mut out: HashMap<i64, Vec<Option<i64>>> = HashMap::new();
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
@@ -494,8 +497,9 @@ fn attach_tag(conn: &Connection, entry_id: i64, name: &str) -> Result<bool> {
     // last_insert_rowid() is unsafe to rely on after INSERT OR IGNORE -- it's
     // stale when the insert was ignored -- so the id is looked up explicitly.
     conn.execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", [name])?;
-    let tag_id: i64 =
-        conn.query_row("SELECT id FROM tags WHERE name = ?1", [name], |row| row.get(0))?;
+    let tag_id: i64 = conn.query_row("SELECT id FROM tags WHERE name = ?1", [name], |row| {
+        row.get(0)
+    })?;
 
     conn.execute(
         "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)",
@@ -729,7 +733,11 @@ pub fn all_collections(conn: &Connection) -> Result<Vec<Collection>> {
 // Idempotent: returns whether membership actually changed. The id-based
 // core the TUI calls directly (it already holds the collection id from the
 // tree, never a path).
-pub fn add_entry_to_collection(conn: &Connection, collection_id: i64, entry_id: i64) -> Result<bool> {
+pub fn add_entry_to_collection(
+    conn: &Connection,
+    collection_id: i64,
+    entry_id: i64,
+) -> Result<bool> {
     conn.execute(
         "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id) VALUES (?1, ?2)",
         rusqlite::params![collection_id, entry_id],
@@ -738,7 +746,11 @@ pub fn add_entry_to_collection(conn: &Connection, collection_id: i64, entry_id: 
 }
 
 // Idempotent: Ok(false) if the entry wasn't in the collection.
-pub fn remove_entry_from_collection(conn: &Connection, collection_id: i64, entry_id: i64) -> Result<bool> {
+pub fn remove_entry_from_collection(
+    conn: &Connection,
+    collection_id: i64,
+    entry_id: i64,
+) -> Result<bool> {
     conn.execute(
         "DELETE FROM collection_entries WHERE collection_id = ?1 AND entry_id = ?2",
         rusqlite::params![collection_id, entry_id],
@@ -953,7 +965,11 @@ fn fts5_phrase(s: &str) -> String {
 
 // with_full_text is a projection, not a filter, so it lives as a parameter
 // here rather than on Filter -- see attachments_for_entry's comment.
-pub fn list_entries(conn: &Connection, filter: &Filter, with_full_text: bool) -> Result<Vec<Entry>> {
+pub fn list_entries(
+    conn: &Connection,
+    filter: &Filter,
+    with_full_text: bool,
+) -> Result<Vec<Entry>> {
     let mut clauses: Vec<String> = Vec::new();
     let mut params: Vec<Value> = Vec::new();
 
@@ -1256,8 +1272,8 @@ pub fn merge_entries(conn: &Connection, keep_id: i64, drop_id: i64) -> Result<()
             .collect::<Result<Vec<_>>>()?
     };
 
-    let base =
-        crate::doi::sanitize_filename(&keep_cite_key).map_err(rusqlite::Error::InvalidParameterName)?;
+    let base = crate::doi::sanitize_filename(&keep_cite_key)
+        .map_err(rusqlite::Error::InvalidParameterName)?;
 
     // Renames happen on the filesystem, outside SQLite's transaction, so
     // committing/rolling back the DB rows can't undo them. The DB is
@@ -1382,7 +1398,9 @@ mod tests {
         let id = insert_entry(&conn, &entry).unwrap();
         assert!(id > 0);
 
-        let fetched = get_entry(&conn, "smith2024").unwrap().expect("entry should exist");
+        let fetched = get_entry(&conn, "smith2024")
+            .unwrap()
+            .expect("entry should exist");
 
         assert_eq!(fetched.id, Some(id));
         assert_eq!(fetched.entry_type, entry.entry_type);
@@ -1419,7 +1437,10 @@ mod tests {
         let mut again = Entry::new("article".into(), "zhou2020b".into(), "Second".into());
         again.doi = Some("10.1186/s12859-020-3494-x".into());
         let err = insert_entry(&conn, &again).unwrap_err().to_string();
-        assert!(err.contains("zhou2020"), "message should name the holder: {err}");
+        assert!(
+            err.contains("zhou2020"),
+            "message should name the holder: {err}"
+        );
 
         // DOIs are case-insensitive, so a shouted one is still the same paper.
         again.doi = Some("10.1186/S12859-020-3494-X".into());
@@ -1468,7 +1489,10 @@ mod tests {
         // p1 now sits in both. It is still one paper.
         add_to_collection(&conn, "Phys", "p1").unwrap();
         let counts = recursive_entry_counts(&conn).unwrap();
-        assert_eq!(counts[&phys], 2, "a paper in both parent and child counts once");
+        assert_eq!(
+            counts[&phys], 2,
+            "a paper in both parent and child counts once"
+        );
 
         assert_eq!(count_entries(&conn).unwrap(), 2);
     }
@@ -1528,7 +1552,8 @@ mod tests {
 
         // Backdate so a re-stamped date_modified is detectable without sleeping.
         let stale = entry.date_modified - 1000;
-        conn.execute("UPDATE entries SET date_modified = ?1", [stale]).unwrap();
+        conn.execute("UPDATE entries SET date_modified = ?1", [stale])
+            .unwrap();
 
         let mut edited = get_entry(&conn, "smith2024").unwrap().unwrap();
         assert_eq!(edited.abstract_text.as_deref(), Some("An abstract."));
@@ -1543,9 +1568,17 @@ mod tests {
         assert_eq!(after.authors.len(), 1);
         assert_eq!(after.authors[0].last_name, "Doe");
         assert_eq!(after.authors[0].first_name, None);
-        assert!(after.date_modified > stale, "update_entry must stamp date_modified");
+        assert!(
+            after.date_modified > stale,
+            "update_entry must stamp date_modified"
+        );
 
-        assert_eq!(list_entries(&conn, &Filter::default(), false).unwrap().len(), 1);
+        assert_eq!(
+            list_entries(&conn, &Filter::default(), false)
+                .unwrap()
+                .len(),
+            1
+        );
 
         delete_entry(&conn, "smith2024").unwrap();
         assert!(get_entry(&conn, "smith2024").unwrap().is_none());
@@ -1654,7 +1687,10 @@ mod tests {
         // tag -> get_entry sees it; tagging again is a no-op, no duplicate.
         assert_eq!(add_tag(&conn, "a", "ml").unwrap(), true);
         assert_eq!(add_tag(&conn, "a", "ml").unwrap(), false);
-        assert_eq!(get_entry(&conn, "a").unwrap().unwrap().tags, vec!["ml".to_string()]);
+        assert_eq!(
+            get_entry(&conn, "a").unwrap().unwrap().tags,
+            vec!["ml".to_string()]
+        );
 
         // untag: true, then false the second time.
         assert_eq!(remove_tag(&conn, "a", "ml").unwrap(), true);
@@ -1682,7 +1718,7 @@ mod tests {
         };
         assert_eq!(keys(&conn, &by_tag), ["a", "b"]);
 
-    // delete_entry cascades to entry_tags.
+        // delete_entry cascades to entry_tags.
         delete_entry(&conn, "a").unwrap();
         delete_entry(&conn, "b").unwrap();
         let orphans: i64 = conn
@@ -1766,9 +1802,14 @@ mod tests {
         assert!(has_full_text, "migration must add full_text column");
 
         let path: String = conn
-            .query_row("SELECT path FROM attachments WHERE entry_id = 1", [], |r| r.get(0))
+            .query_row("SELECT path FROM attachments WHERE entry_id = 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert_eq!(path, "/tmp/old.pdf", "migration must preserve existing rows");
+        assert_eq!(
+            path, "/tmp/old.pdf",
+            "migration must preserve existing rows"
+        );
     }
 
     // Regression: set_full_text once matched on `path`, so extracting for one
@@ -1814,7 +1855,10 @@ mod tests {
             .unwrap();
         assert_eq!(count_again, 3, "re-creating must not duplicate rows");
 
-        assert_eq!(collection_by_path(&conn, "Physics/Quantum/Entropy").unwrap(), Some(leaf));
+        assert_eq!(
+            collection_by_path(&conn, "Physics/Quantum/Entropy").unwrap(),
+            Some(leaf)
+        );
         assert_eq!(collection_by_path(&conn, "Physics/Nope").unwrap(), None);
     }
 
@@ -1828,7 +1872,10 @@ mod tests {
 
         let first = create_collection(&conn, "Physics").unwrap();
         let second = create_collection(&conn, "physics").unwrap();
-        assert_eq!(first, second, "case-insensitive root sibling must reuse the row");
+        assert_eq!(
+            first, second,
+            "case-insensitive root sibling must reuse the row"
+        );
 
         let root_count: i64 = conn
             .query_row(
@@ -1857,7 +1904,10 @@ mod tests {
         let parent = create_collection_under(&conn, None, "Physics").unwrap();
         let child = create_collection_under(&conn, Some(parent), "Entropy").unwrap();
         let child_again = create_collection_under(&conn, Some(parent), "entropy").unwrap();
-        assert_eq!(child, child_again, "case-insensitive re-creation must reuse the row");
+        assert_eq!(
+            child, child_again,
+            "case-insensitive re-creation must reuse the row"
+        );
 
         assert!(create_collection_under(&conn, Some(parent), "Has/Slash").is_err());
 
@@ -1869,11 +1919,17 @@ mod tests {
         let entry_id = insert_entry(&conn, &entry).unwrap();
 
         assert!(add_entry_to_collection(&conn, child, entry_id).unwrap());
-        assert!(!add_entry_to_collection(&conn, child, entry_id).unwrap(), "already a member");
+        assert!(
+            !add_entry_to_collection(&conn, child, entry_id).unwrap(),
+            "already a member"
+        );
         assert_eq!(collections_for_entry(&conn, entry_id).unwrap(), vec![child]);
 
         assert!(remove_entry_from_collection(&conn, child, entry_id).unwrap());
-        assert!(!remove_entry_from_collection(&conn, child, entry_id).unwrap(), "already removed");
+        assert!(
+            !remove_entry_from_collection(&conn, child, entry_id).unwrap(),
+            "already removed"
+        );
         assert!(collections_for_entry(&conn, entry_id).unwrap().is_empty());
     }
 
@@ -1898,7 +1954,10 @@ mod tests {
         assert_eq!(add_to_collection(&conn, "Physics", "a").unwrap(), true);
         assert_eq!(add_to_collection(&conn, "Physics", "a").unwrap(), false);
         assert_eq!(remove_from_collection(&conn, "Physics", "a").unwrap(), true);
-        assert_eq!(remove_from_collection(&conn, "Physics", "a").unwrap(), false);
+        assert_eq!(
+            remove_from_collection(&conn, "Physics", "a").unwrap(),
+            false
+        );
 
         assert!(add_to_collection(&conn, "Physics", "nonexistent").is_err());
         assert!(add_to_collection(&conn, "NoSuchCollection", "a").is_err());
@@ -1971,10 +2030,15 @@ mod tests {
         // Regression: a collection whose NAME contains the path separator is
         // unaddressable by path but must still filter correctly by id. The TUI
         // reaches collections this way, and hand-editing the DB can create one.
-        conn.execute("INSERT INTO collections (name, parent_id) VALUES ('A/B', NULL)", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO collections (name, parent_id) VALUES ('A/B', NULL)",
+            [],
+        )
+        .unwrap();
         let slash_id: i64 = conn
-            .query_row("SELECT id FROM collections WHERE name = 'A/B'", [], |r| r.get(0))
+            .query_row("SELECT id FROM collections WHERE name = 'A/B'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         conn.execute(
             "INSERT INTO collection_entries (collection_id, entry_id) \
@@ -2001,11 +2065,18 @@ mod tests {
         let a = create_collection(&conn, "A").unwrap();
         let b = create_collection(&conn, "A/B").unwrap();
         // Make A a child of B -- A's ancestor chain now cycles A -> B -> A.
-        conn.execute("UPDATE collections SET parent_id = ?1 WHERE id = ?2", [b, a])
-            .unwrap();
+        conn.execute(
+            "UPDATE collections SET parent_id = ?1 WHERE id = ?2",
+            [b, a],
+        )
+        .unwrap();
 
         let tree = collection_tree(&conn).unwrap();
-        assert_eq!(tree.len(), 2, "both rows must still be present, just not lost");
+        assert_eq!(
+            tree.len(),
+            2,
+            "both rows must still be present, just not lost"
+        );
 
         let ids: HashSet<i64> = tree.iter().map(|(_, c)| c.id).collect();
         assert!(ids.contains(&a) && ids.contains(&b));
@@ -2068,10 +2139,14 @@ mod tests {
         attach(&conn, "other", "/tmp/c.pdf").unwrap();
 
         let id: i64 = conn
-            .query_row("SELECT id FROM entries WHERE cite_key = 'k'", [], |r| r.get(0))
+            .query_row("SELECT id FROM entries WHERE cite_key = 'k'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let other_id: i64 = conn
-            .query_row("SELECT id FROM entries WHERE cite_key = 'other'", [], |r| r.get(0))
+            .query_row("SELECT id FROM entries WHERE cite_key = 'other'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
 
         let all = all_attachment_text_lengths(&conn).unwrap();
@@ -2166,11 +2241,17 @@ mod tests {
             )
             .optional()
             .unwrap();
-        assert_eq!(matched, Some(att_id), "AFTER UPDATE must resync the row to the new text");
+        assert_eq!(
+            matched,
+            Some(att_id),
+            "AFTER UPDATE must resync the row to the new text"
+        );
 
         delete_entry(&conn, "zhou2020").unwrap(); // cascades to attachments -> AFTER DELETE
 
-        let integrity: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(
             integrity, "ok",
             "a stale or missing fts 'delete' command must not leave the index inconsistent"
@@ -2188,8 +2269,15 @@ mod tests {
         let (att_id, _) = attach(&conn, "a", "/tmp/a.pdf").unwrap();
         set_full_text(&conn, att_id, "This is a paragraph about entropy.").unwrap();
 
-        let filter = Filter { text: Some("raph".into()), ..Default::default() };
-        assert_eq!(keys(&conn, &filter), ["a"], "trigram index must match a mid-word substring");
+        let filter = Filter {
+            text: Some("raph".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            keys(&conn, &filter),
+            ["a"],
+            "trigram index must match a mid-word substring"
+        );
     }
 
     // Empirical, not assumed: a 2-character query is too short to form one
@@ -2207,7 +2295,10 @@ mod tests {
         let (att_id, _) = attach(&conn, "a", "/tmp/a.pdf").unwrap();
         set_full_text(&conn, att_id, "This is a paragraph about entropy.").unwrap();
 
-        let filter = Filter { text: Some("ra".into()), ..Default::default() };
+        let filter = Filter {
+            text: Some("ra".into()),
+            ..Default::default()
+        };
         assert_eq!(
             keys(&conn, &filter),
             ["a"],
@@ -2228,7 +2319,10 @@ mod tests {
         let (att_id, _) = attach(&conn, "a", "/tmp/a.pdf").unwrap();
         set_full_text(&conn, att_id, "She said \"hello world\" to everyone.").unwrap();
 
-        let filter = Filter { text: Some("said \"hello".into()), ..Default::default() };
+        let filter = Filter {
+            text: Some("said \"hello".into()),
+            ..Default::default()
+        };
         assert_eq!(keys(&conn, &filter), ["a"]);
     }
 
@@ -2252,8 +2346,15 @@ mod tests {
         set_full_text(&conn, att_b, "quantum entanglement across channels").unwrap();
         set_full_text(&conn, att_c, "also nothing relevant").unwrap();
 
-        let filter = Filter { text: Some("entanglement".into()), ..Default::default() };
-        assert_eq!(keys(&conn, &filter), ["b"], "only the entry whose own attachment matches");
+        let filter = Filter {
+            text: Some("entanglement".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            keys(&conn, &filter),
+            ["b"],
+            "only the entry whose own attachment matches"
+        );
     }
 
     // A pre-existing library (attachments predating attachments_fts, some
@@ -2321,7 +2422,10 @@ mod tests {
             )
             .unwrap();
         let extract_result = set_full_text(&conn, never_extracted_id, "newly extracted text");
-        assert!(extract_result.is_ok(), "extract after migration: {extract_result:?}");
+        assert!(
+            extract_result.is_ok(),
+            "extract after migration: {extract_result:?}"
+        );
 
         // "ferref rm" on the entry (cascades to both attachments).
         let rm_result = delete_entry(&conn, "a");
@@ -2339,20 +2443,25 @@ mod tests {
     // UPDATE OR IGNORE collision path this test would otherwise never touch.
     #[test]
     fn merge_entries_folds_tags_collections_and_attachments_without_collision() {
-        let dir = std::env::temp_dir().join(format!(
-            "ferref-merge-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("ferref-merge-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let conn = Connection::open_in_memory().unwrap();
         create_schema(&conn).unwrap();
 
-        let mut keep = Entry::new("article".to_string(), "keep2024".to_string(), "Keep".to_string());
+        let mut keep = Entry::new(
+            "article".to_string(),
+            "keep2024".to_string(),
+            "Keep".to_string(),
+        );
         keep.doi = None;
         let keep_id = insert_entry(&conn, &keep).unwrap();
 
-        let mut drop = Entry::new("article".to_string(), "drop2024".to_string(), "Drop".to_string());
+        let mut drop = Entry::new(
+            "article".to_string(),
+            "drop2024".to_string(),
+            "Drop".to_string(),
+        );
         drop.doi = None;
         let drop_id = insert_entry(&conn, &drop).unwrap();
 
@@ -2408,10 +2517,17 @@ mod tests {
             .map(|a| std::fs::read(&a.path).expect("attachment file must exist on disk"))
             .collect();
         contents.sort();
-        assert_eq!(contents, vec![b"drop bytes".to_vec(), b"keep bytes".to_vec()]);
+        assert_eq!(
+            contents,
+            vec![b"drop bytes".to_vec(), b"keep bytes".to_vec()]
+        );
         let paths: std::collections::HashSet<&str> =
             kept.attachments.iter().map(|a| a.path.as_str()).collect();
-        assert_eq!(paths.len(), 2, "attachment paths must be distinct, not one overwriting the other");
+        assert_eq!(
+            paths.len(),
+            2,
+            "attachment paths must be distinct, not one overwriting the other"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2436,9 +2552,17 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         create_schema(&conn).unwrap();
 
-        let keep = Entry::new("article".to_string(), "keep2024".to_string(), "Keep".to_string());
+        let keep = Entry::new(
+            "article".to_string(),
+            "keep2024".to_string(),
+            "Keep".to_string(),
+        );
         let keep_id = insert_entry(&conn, &keep).unwrap();
-        let drop = Entry::new("article".to_string(), "drop2024".to_string(), "Drop".to_string());
+        let drop = Entry::new(
+            "article".to_string(),
+            "drop2024".to_string(),
+            "Drop".to_string(),
+        );
         let drop_id = insert_entry(&conn, &drop).unwrap();
 
         // A real file that will actually get renamed if the pre-flight
@@ -2458,15 +2582,25 @@ mod tests {
         .unwrap();
 
         let err = merge_entries(&conn, keep_id, drop_id);
-        assert!(err.is_err(), "merge must fail when a drop attachment file is missing");
+        assert!(
+            err.is_err(),
+            "merge must fail when a drop attachment file is missing"
+        );
 
         // Nothing moved: the real file is exactly where it started, keep
         // has no attachments, and drop still owns both rows.
         assert!(real_pdf.exists(), "the real file must not have been moved");
         let kept = get_entry(&conn, "keep2024").unwrap().unwrap();
-        assert!(kept.attachments.is_empty(), "keep must gain nothing from a failed merge");
+        assert!(
+            kept.attachments.is_empty(),
+            "keep must gain nothing from a failed merge"
+        );
         let dropped = get_entry(&conn, "drop2024").unwrap().unwrap();
-        assert_eq!(dropped.attachments.len(), 2, "drop must keep both attachment rows");
+        assert_eq!(
+            dropped.attachments.len(),
+            2,
+            "drop must keep both attachment rows"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

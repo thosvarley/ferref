@@ -17,16 +17,15 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::tty::IsTty;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
-    Wrap,
+    Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
 };
-use ratatui::Frame;
 use rusqlite::Connection;
 
 use crate::db::{self, Filter};
@@ -69,8 +68,7 @@ fn event_loop(
                 if key.kind == KeyEventKind::Release {
                     continue;
                 }
-                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
-                {
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     return Ok(());
                 }
                 handle_key(app, conn, terminal, key.code, key.modifiers);
@@ -109,16 +107,24 @@ fn handle_key(
     match std::mem::replace(&mut app.mode, Mode::Normal) {
         Mode::Normal => handle_normal_key(app, conn, code, modifiers),
         Mode::Input(kind, buffer) => handle_input_key(app, conn, code, kind, buffer),
-        Mode::Picker { rows, selected, member, entry_id, bulk } => {
-            handle_picker_key(app, conn, code, rows, selected, member, entry_id, bulk)
-        }
+        Mode::Picker {
+            rows,
+            selected,
+            member,
+            entry_id,
+            bulk,
+        } => handle_picker_key(app, conn, code, rows, selected, member, entry_id, bulk),
         Mode::Command { entry_id } => handle_command_key(app, conn, terminal, code, entry_id),
         Mode::FieldPicker { entry_id, selected } => {
             handle_field_picker_key(app, code, entry_id, selected)
         }
-        Mode::EntryPicker { keep_id, within, filter, rows, selected } => {
-            handle_entry_picker_key(app, code, keep_id, within, filter, rows, selected)
-        }
+        Mode::EntryPicker {
+            keep_id,
+            within,
+            filter,
+            rows,
+            selected,
+        } => handle_entry_picker_key(app, code, keep_id, within, filter, rows, selected),
         Mode::Confirm { action, .. } => handle_confirm_key(app, conn, code, action),
         // any key closes it; app.mode is already Normal from the replace above
         Mode::Help => {}
@@ -253,7 +259,13 @@ fn handle_normal_key(app: &mut App, conn: &Connection, code: KeyCode, modifiers:
 // app.mode) so the match arms below can freely call back into `app`
 // (reload, rebuild_view) without fighting the borrow checker over a field
 // that's simultaneously borrowed and being written back to.
-fn handle_input_key(app: &mut App, conn: &Connection, code: KeyCode, kind: InputKind, mut buffer: String) {
+fn handle_input_key(
+    app: &mut App,
+    conn: &Connection,
+    code: KeyCode,
+    kind: InputKind,
+    mut buffer: String,
+) {
     match code {
         KeyCode::Char(c) => {
             buffer.push(c);
@@ -663,9 +675,14 @@ enum Mode {
         bulk: Option<Vec<i64>>,
     },
     // The ":" palette (Edit/Fetch/Merge/Delete), scoped to one entry.
-    Command { entry_id: i64 },
+    Command {
+        entry_id: i64,
+    },
     // Edit's field-name list, opened by ":" -> "e".
-    FieldPicker { entry_id: i64, selected: usize },
+    FieldPicker {
+        entry_id: i64,
+        selected: usize,
+    },
     // Merge's fold-in-entry picker, opened by ":" -> "m". `keep_id` is fixed
     // for the picker's lifetime; `rows` are indices into `App::entries`
     // matching `filter`. `within`, when set (3+ marked -- see MergePlan),
@@ -680,7 +697,10 @@ enum Mode {
     },
     // Delete/merge confirmation. An enum of pending actions (rather than a
     // boxed closure) since there are exactly two call sites.
-    Confirm { message: String, action: PendingAction },
+    Confirm {
+        message: String,
+        action: PendingAction,
+    },
     // "?": the full keymap reference. Static content, so no fields -- any
     // key closes it.
     Help,
@@ -689,7 +709,9 @@ enum Mode {
 enum InputKind {
     // Carries the filter that was active before '/' was pressed, so Esc can
     // restore it rather than just clearing it.
-    Search { previous: String },
+    Search {
+        previous: String,
+    },
     NewCollection,
     // Edit's value box. `return_selected` is the field picker's row to
     // return to on Enter/Esc, so fixing several fields in one visit doesn't
@@ -701,11 +723,16 @@ enum InputKind {
     },
     // "x": the output path for a BibTeX export of `ids` (the marked set,
     // or just the selected entry when nothing's marked).
-    ExportPath { ids: Vec<i64> },
+    ExportPath {
+        ids: Vec<i64>,
+    },
     // ":" -> "t"/"u": the tag name to add to (add: true) or remove from
     // (add: false) every id in `ids` -- same marked-or-selected target rule
     // as export.
-    Tag { ids: Vec<i64>, add: bool },
+    Tag {
+        ids: Vec<i64>,
+        add: bool,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -797,7 +824,9 @@ impl EditField {
                     )
                 };
             }
-            EditField::Journal => entry.journal = (!trimmed.is_empty()).then(|| trimmed.to_string()),
+            EditField::Journal => {
+                entry.journal = (!trimmed.is_empty()).then(|| trimmed.to_string())
+            }
             EditField::Volume => entry.volume = (!trimmed.is_empty()).then(|| trimmed.to_string()),
             EditField::Pages => entry.pages = (!trimmed.is_empty()).then(|| trimmed.to_string()),
             EditField::Doi => entry.doi = (!trimmed.is_empty()).then(|| trimmed.to_string()),
@@ -999,7 +1028,9 @@ impl App {
     }
 
     fn selected_entry(&self) -> Option<&Entry> {
-        self.view.get(self.table_selected).map(|&i| &self.entries[i])
+        self.view
+            .get(self.table_selected)
+            .map(|&i| &self.entries[i])
     }
 
     // Looks up an entry by id in the already-loaded set -- the id half of
@@ -1309,7 +1340,9 @@ impl App {
                     format!("No open-access copy found for '{cite_key}'")
                 });
             }
-            Ok(crate::FetchOutcome::Downloaded { path, extraction, .. }) => {
+            Ok(crate::FetchOutcome::Downloaded {
+                path, extraction, ..
+            }) => {
                 self.status = Some(match extraction {
                     Ok(chars) => format!("Downloaded '{path}' ({chars} chars extracted)"),
                     Err(e) => format!("Downloaded '{path}', but extraction failed: {e}"),
@@ -1375,7 +1408,11 @@ impl App {
                 .unwrap_or_default()
         };
         self.mode = Mode::Confirm {
-            message: format!("Merge '{}' into '{}'? y/n", title_of(drop_id), title_of(keep_id)),
+            message: format!(
+                "Merge '{}' into '{}'? y/n",
+                title_of(drop_id),
+                title_of(keep_id)
+            ),
             action: PendingAction::Merge { keep_id, drop_id },
         };
     }
@@ -1614,11 +1651,7 @@ fn visible_rows(seq: &[(usize, Option<i64>)], collapsed: &HashSet<Option<i64>>) 
 // Clamps a selection index into a list that may have shrunk (e.g. a reload
 // landed on fewer rows than were selected before). An empty list clamps to 0.
 fn clamp_selection(selected: usize, len: usize) -> usize {
-    if len == 0 {
-        0
-    } else {
-        selected.min(len - 1)
-    }
+    if len == 0 { 0 } else { selected.min(len - 1) }
 }
 
 // "y"'s link resolution: the entry's own url if it has one, else its DOI
@@ -1635,7 +1668,10 @@ fn url_for_entry(entry: &Entry) -> Option<String> {
     if let Some(url) = &entry.url {
         return Some(url.clone());
     }
-    entry.doi.as_ref().map(|doi| format!("https://doi.org/{doi}"))
+    entry
+        .doi
+        .as_ref()
+        .map(|doi| format!("https://doi.org/{doi}"))
 }
 
 // OSC 52 clipboard-set escape sequence: `ESC ] 52 ; c ; <base64> BEL`.
@@ -1712,11 +1748,7 @@ fn cmp_optional<T: Ord>(a: Option<T>, b: Option<T>, desc: bool) -> std::cmp::Ord
         (Some(_), None) => Ordering::Less,
         (Some(x), Some(y)) => {
             let ord = x.cmp(&y);
-            if desc {
-                ord.reverse()
-            } else {
-                ord
-            }
+            if desc { ord.reverse() } else { ord }
         }
     }
 }
@@ -1816,7 +1848,14 @@ fn draw(frame: &mut Frame, app: &App) {
             member,
             bulk,
             ..
-        } => draw_picker(frame, area, rows, *selected, member, bulk.as_deref().map(<[_]>::len)),
+        } => draw_picker(
+            frame,
+            area,
+            rows,
+            *selected,
+            member,
+            bulk.as_deref().map(<[_]>::len),
+        ),
         Mode::Command { entry_id } => draw_command(frame, area, app, *entry_id),
         Mode::FieldPicker { entry_id, selected } => {
             draw_field_picker(frame, area, app, *entry_id, *selected)
@@ -1840,7 +1879,11 @@ fn draw(frame: &mut Frame, app: &App) {
 const FLOAT_ACCENT: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 
 fn pane_block(title: String, focused: bool) -> Block<'static> {
-    let style = if focused { FLOAT_ACCENT } else { Style::default() };
+    let style = if focused {
+        FLOAT_ACCENT
+    } else {
+        Style::default()
+    };
     Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -1872,7 +1915,12 @@ fn floating_window(
 ) -> (Rect, Block<'static>) {
     let x = frame_area.x + frame_area.width.saturating_sub(width) / 2;
     let y = frame_area.y + frame_area.height.saturating_sub(height) / 2;
-    let popup = Rect { x, y, width, height };
+    let popup = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .title(title.into())
@@ -1909,7 +1957,10 @@ fn draw_tree(frame: &mut Frame, area: Rect, app: &App) {
     state.select(visible.iter().position(|&i| i == app.selected_row));
 
     let list = List::new(items)
-        .block(pane_block("COLLECTIONS".to_string(), app.focus == Focus::Collections))
+        .block(pane_block(
+            "COLLECTIONS".to_string(),
+            app.focus == Focus::Collections,
+        ))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(list, area, &mut state);
 }
@@ -1978,7 +2029,11 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &App) {
         state.select(Some(app.table_selected));
     }
 
-    let arrow = if app.sort_desc { '\u{2193}' } else { '\u{2191}' };
+    let arrow = if app.sort_desc {
+        '\u{2193}'
+    } else {
+        '\u{2191}'
+    };
     let mut title = format!("ENTRIES [{} {arrow}]", app.sort_key.label());
     if !app.marked.is_empty() {
         title.push_str(&format!(" ({} marked)", app.marked.len()));
@@ -2097,7 +2152,10 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     let para = Paragraph::new(text)
-        .block(pane_block("DETAILS".to_string(), app.focus == Focus::Details))
+        .block(pane_block(
+            "DETAILS".to_string(),
+            app.focus == Focus::Details,
+        ))
         .wrap(Wrap { trim: false });
     frame.render_widget(para, area);
 }
@@ -2107,10 +2165,11 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &App) {
 // they're typing; then the active filter, so it doesn't silently vanish
 // from view; then the keymap.
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let text = if let Some(status) = &app.status {
-        format!(" {status}")
-    } else {
-        match &app.mode {
+    let text =
+        if let Some(status) = &app.status {
+            format!(" {status}")
+        } else {
+            match &app.mode {
             Mode::Input(InputKind::Search { .. }, buffer) => format!(" /{buffer}"),
             Mode::Input(InputKind::NewCollection, buffer) => {
                 format!(" New collection: {buffer}")
@@ -2152,7 +2211,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             // every new feature; it's behind "?" now instead (draw_help).
             Mode::Normal => " ?  help \u{b7} q quit".to_string(),
         }
-    };
+        };
     let footer = Paragraph::new(text);
     frame.render_widget(footer, area);
 }
@@ -2230,10 +2289,7 @@ fn draw_help(frame: &mut Frame, frame_area: Rect) {
                 ("y", "copy url (or DOI link) to clipboard"),
             ],
         ),
-        (
-            "Collections",
-            &[("n", "new (sub)collection")],
-        ),
+        ("Collections", &[("n", "new (sub)collection")]),
         (
             "Other",
             &[("r", "reload"), ("q", "quit"), ("?", "this screen")],
@@ -2251,7 +2307,9 @@ fn draw_help(frame: &mut Frame, frame_area: Rect) {
         .iter()
         .map(|(_, rows)| rows.len() as u16 + 1) // +1 for the group heading
         .sum();
-    let height = (line_count + 2).min(frame_area.height.saturating_sub(2)).max(3);
+    let height = (line_count + 2)
+        .min(frame_area.height.saturating_sub(2))
+        .max(3);
     let (popup, block) = floating_window(frame, frame_area, width, height, "Keymap");
 
     let key_width = GROUPS
@@ -2271,14 +2329,19 @@ fn draw_help(frame: &mut Frame, frame_area: Rect) {
         }
     }
 
-    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(para, popup);
 }
 
 // The ":" palette -- a small fixed list, titled with the scoped entry's
 // cite_key so it's clear which paper the four actions apply to.
 fn draw_command(frame: &mut Frame, frame_area: Rect, app: &App, entry_id: i64) {
-    let cite_key = app.entry_by_id(entry_id).map(|e| e.cite_key.as_str()).unwrap_or("");
+    let cite_key = app
+        .entry_by_id(entry_id)
+        .map(|e| e.cite_key.as_str())
+        .unwrap_or("");
 
     let width = 26u16.min(frame_area.width.saturating_sub(4)).max(12);
     let height = 8u16.min(frame_area.height.saturating_sub(4)).max(3);
@@ -2303,7 +2366,13 @@ fn draw_command(frame: &mut Frame, frame_area: Rect, app: &App, entry_id: i64) {
 
 // Edit's field-name list: label plus each field's current value, so picking
 // one is informed rather than a guess at what's already there.
-fn draw_field_picker(frame: &mut Frame, frame_area: Rect, app: &App, entry_id: i64, selected: usize) {
+fn draw_field_picker(
+    frame: &mut Frame,
+    frame_area: Rect,
+    app: &App,
+    entry_id: i64,
+    selected: usize,
+) {
     let Some(entry) = app.entry_by_id(entry_id) else {
         return;
     };
@@ -2393,7 +2462,9 @@ fn draw_confirm(frame: &mut Frame, frame_area: Rect, message: &str) {
     // needs to pop, hence going through floating_window at all, but has
     // nothing worth naming in the border.
     let (popup, block) = floating_window(frame, frame_area, width, height, "");
-    let para = Paragraph::new(message.to_string()).block(block).wrap(Wrap { trim: true });
+    let para = Paragraph::new(message.to_string())
+        .block(block)
+        .wrap(Wrap { trim: true });
     frame.render_widget(para, popup);
 }
 
@@ -2411,12 +2482,8 @@ mod tests {
     #[test]
     fn visible_rows_hides_collapsed_subtrees_only() {
         // All Papers -> A -> A/child -> B  (B is a sibling of A, not nested)
-        let seq: Vec<(usize, Option<i64>)> = vec![
-            (0, None),
-            (1, Some(1)),
-            (2, Some(2)),
-            (1, Some(3)),
-        ];
+        let seq: Vec<(usize, Option<i64>)> =
+            vec![(0, None), (1, Some(1)), (2, Some(2)), (1, Some(3))];
 
         let none: HashSet<Option<i64>> = HashSet::new();
         assert_eq!(visible_rows(&seq, &none), vec![0, 1, 2, 3]);
@@ -2438,7 +2505,10 @@ mod tests {
         assert_eq!(truncate_display("hello world", 5), "hell\u{2026}");
         assert_eq!(truncate_display("M\u{fc}ller", 3), "M\u{fc}\u{2026}"); // accented char, 1 column wide
         // CJK characters are 2 columns wide: budget 3 fits exactly one plus ellipsis.
-        assert_eq!(truncate_display("\u{738b}\u{738b}\u{738b}", 3), "\u{738b}\u{2026}");
+        assert_eq!(
+            truncate_display("\u{738b}\u{738b}\u{738b}", 3),
+            "\u{738b}\u{2026}"
+        );
         assert_eq!(truncate_display("hello", 1), "\u{2026}");
         assert_eq!(truncate_display("hello", 0), "");
     }
@@ -2509,10 +2579,16 @@ mod tests {
         assert_eq!(url_for_entry(&e), None);
 
         e.doi = Some("10.1000/xyz".to_string());
-        assert_eq!(url_for_entry(&e), Some("https://doi.org/10.1000/xyz".to_string()));
+        assert_eq!(
+            url_for_entry(&e),
+            Some("https://doi.org/10.1000/xyz".to_string())
+        );
 
         e.url = Some("https://example.com/paper".to_string());
-        assert_eq!(url_for_entry(&e), Some("https://example.com/paper".to_string()));
+        assert_eq!(
+            url_for_entry(&e),
+            Some("https://example.com/paper".to_string())
+        );
     }
 
     #[test]
@@ -2544,7 +2620,11 @@ mod tests {
 
         let mut view: Vec<usize> = vec![0, 1, 2];
         sort_view(&entries, &mut view, SortKey::Year, true);
-        assert_eq!(view, vec![2, 0, 1], "descending: 2021, 2019, then still-missing-last");
+        assert_eq!(
+            view,
+            vec![2, 0, 1],
+            "descending: 2021, 2019, then still-missing-last"
+        );
     }
 
     #[test]

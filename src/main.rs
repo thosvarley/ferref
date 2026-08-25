@@ -46,8 +46,20 @@ fn main() {
             abstract_text,
             json,
         } => cmd_add(
-            &conn, entry_type, cite_key, title, authors, year, journal, volume, pages, doi,
-            from_url, url, abstract_text, json,
+            &conn,
+            entry_type,
+            cite_key,
+            title,
+            authors,
+            year,
+            journal,
+            volume,
+            pages,
+            doi,
+            from_url,
+            url,
+            abstract_text,
+            json,
         ),
 
         Command::List {
@@ -321,9 +333,12 @@ fn main() {
             }
         }
 
-        Command::Attach { cite_key, path, extract, json } => {
-            cmd_attach(&conn, cite_key, path, extract, json)
-        }
+        Command::Attach {
+            cite_key,
+            path,
+            extract,
+            json,
+        } => cmd_attach(&conn, cite_key, path, extract, json),
 
         Command::Extract { cite_key, json } => cmd_extract(&conn, cite_key, json),
 
@@ -377,7 +392,11 @@ fn main() {
             }
         }
 
-        Command::Fetch { cite_key, email, json } => cmd_fetch(&conn, cite_key, email, json),
+        Command::Fetch {
+            cite_key,
+            email,
+            json,
+        } => cmd_fetch(&conn, cite_key, email, json),
 
         Command::Collection { command } => dispatch_collection(&conn, command),
 
@@ -394,7 +413,11 @@ fn main() {
 // An explicit --key always wins; otherwise derive one from the entry (first
 // author's last name + year, e.g. "kucsko2013") the way both the DOI and
 // --from-url paths in cmd_add need to, identically.
-fn resolve_cite_key(conn: &rusqlite::Connection, explicit: Option<String>, entry: &Entry) -> String {
+fn resolve_cite_key(
+    conn: &rusqlite::Connection,
+    explicit: Option<String>,
+    entry: &Entry,
+) -> String {
     match explicit {
         Some(key) => key,
         None => match derive_cite_key(conn, entry) {
@@ -544,184 +567,183 @@ fn cmd_attach(
     extract: bool,
     json: bool,
 ) {
-        let source = match cli::resolve_attachment_path(&path) {
-            Ok(p) => p,
-            Err(e) => die(&e),
-        };
-        let (resolved, copied) =
-            match copy_into_library(conn, &cite_key, Path::new(&source)) {
-                Ok(pair) => pair,
-                Err(e) => die(&e),
-            };
-        let (attachment_id, changed) = match db::attach(conn, &cite_key, &resolved) {
-            Ok(pair) => pair,
-            Err(e) => {
-                // Same rule as `fetch`: don't leave a copy in pdfs/ that
-                // nothing in the library points at. Only remove what this
-                // run wrote.
-                if copied {
-                    let _ = std::fs::remove_file(&resolved);
-                }
-                die(&entry_error(&cite_key, "attach file", e))
+    let source = match cli::resolve_attachment_path(&path) {
+        Ok(p) => p,
+        Err(e) => die(&e),
+    };
+    let (resolved, copied) = match copy_into_library(conn, &cite_key, Path::new(&source)) {
+        Ok(pair) => pair,
+        Err(e) => die(&e),
+    };
+    let (attachment_id, changed) = match db::attach(conn, &cite_key, &resolved) {
+        Ok(pair) => pair,
+        Err(e) => {
+            // Same rule as `fetch`: don't leave a copy in pdfs/ that
+            // nothing in the library points at. Only remove what this
+            // run wrote.
+            if copied {
+                let _ = std::fs::remove_file(&resolved);
             }
-        };
-
-        // Extraction is independent of the attach: the path resolved (it
-        // exists), which is all `attach` promises. The attach row is
-        // committed above regardless of whether pdftotext can read it.
-        let extraction: Option<Result<usize, String>> = if extract {
-            Some(
-                text::extract_text(Path::new(&resolved))
-                    .and_then(|extracted| save_extracted(conn, attachment_id, &extracted)),
-            )
-        } else {
-            None
-        };
-
-        if json {
-            let mut out = serde_json::json!({
-                "cite_key": cite_key,
-                "path": resolved,
-                "source": source,
-                "changed": changed,
-            });
-            if let Some(result) = &extraction {
-                out["extracted"] = serde_json::json!(result.is_ok());
-                match result {
-                    Ok(chars) => out["chars"] = serde_json::json!(chars),
-                    Err(e) => out["extract_error"] = serde_json::json!(e),
-                }
-            }
-            emit_json(&out);
-        } else if changed {
-            emit(&format!("Attached '{resolved}' to '{cite_key}'"));
-        } else {
-            emit(&format!("'{cite_key}' already has '{resolved}'"));
+            die(&entry_error(&cite_key, "attach file", e))
         }
+    };
 
-        if let Some(Err(e)) = &extraction {
-            eprintln!("Warning: extraction failed for '{resolved}': {e}");
-            std::process::exit(1);
-        } else if let Some(Ok(chars)) = &extraction {
-            if !json {
-                emit(&format!("Extracted {chars} characters from '{resolved}'"));
+    // Extraction is independent of the attach: the path resolved (it
+    // exists), which is all `attach` promises. The attach row is
+    // committed above regardless of whether pdftotext can read it.
+    let extraction: Option<Result<usize, String>> = if extract {
+        Some(
+            text::extract_text(Path::new(&resolved))
+                .and_then(|extracted| save_extracted(conn, attachment_id, &extracted)),
+        )
+    } else {
+        None
+    };
+
+    if json {
+        let mut out = serde_json::json!({
+            "cite_key": cite_key,
+            "path": resolved,
+            "source": source,
+            "changed": changed,
+        });
+        if let Some(result) = &extraction {
+            out["extracted"] = serde_json::json!(result.is_ok());
+            match result {
+                Ok(chars) => out["chars"] = serde_json::json!(chars),
+                Err(e) => out["extract_error"] = serde_json::json!(e),
             }
+        }
+        emit_json(&out);
+    } else if changed {
+        emit(&format!("Attached '{resolved}' to '{cite_key}'"));
+    } else {
+        emit(&format!("'{cite_key}' already has '{resolved}'"));
+    }
+
+    if let Some(Err(e)) = &extraction {
+        eprintln!("Warning: extraction failed for '{resolved}': {e}");
+        std::process::exit(1);
+    } else if let Some(Ok(chars)) = &extraction {
+        if !json {
+            emit(&format!("Extracted {chars} characters from '{resolved}'"));
         }
     }
+}
 
 fn cmd_extract(conn: &rusqlite::Connection, cite_key: String, json: bool) {
-        let attachments = match db::attachments_for_cite_key(conn, &cite_key) {
-            Ok(a) => a,
-            Err(e) => die(&entry_error(&cite_key, "extract text", e)),
-        };
-        if attachments.is_empty() {
-            die(&format!("'{cite_key}' has no attachments"));
-        }
+    let attachments = match db::attachments_for_cite_key(conn, &cite_key) {
+        Ok(a) => a,
+        Err(e) => die(&entry_error(&cite_key, "extract text", e)),
+    };
+    if attachments.is_empty() {
+        die(&format!("'{cite_key}' has no attachments"));
+    }
 
-        // Per-attachment failures don't abort the rest -- collect every
-        // result and report them all.
-        let results: Vec<(String, Result<usize, String>)> = attachments
-            .into_iter()
-            .map(|(id, path)| {
-                let result = text::extract_text(Path::new(&path))
-                    .and_then(|extracted| save_extracted(conn, id, &extracted));
-                (path, result)
+    // Per-attachment failures don't abort the rest -- collect every
+    // result and report them all.
+    let results: Vec<(String, Result<usize, String>)> = attachments
+        .into_iter()
+        .map(|(id, path)| {
+            let result = text::extract_text(Path::new(&path))
+                .and_then(|extracted| save_extracted(conn, id, &extracted));
+            (path, result)
+        })
+        .collect();
+
+    let any_failed = results.iter().any(|(_, r)| r.is_err());
+
+    if json {
+        let attachments: Vec<_> = results
+            .iter()
+            .map(|(path, result)| match result {
+                Ok(chars) => serde_json::json!({
+                    "path": path,
+                    "extracted": true,
+                    "chars": chars,
+                }),
+                Err(e) => serde_json::json!({
+                    "path": path,
+                    "extracted": false,
+                    "error": e,
+                }),
             })
             .collect();
-
-        let any_failed = results.iter().any(|(_, r)| r.is_err());
-
-        if json {
-            let attachments: Vec<_> = results
-                .iter()
-                .map(|(path, result)| match result {
-                    Ok(chars) => serde_json::json!({
-                        "path": path,
-                        "extracted": true,
-                        "chars": chars,
-                    }),
-                    Err(e) => serde_json::json!({
-                        "path": path,
-                        "extracted": false,
-                        "error": e,
-                    }),
-                })
-                .collect();
-            let out = serde_json::json!({
-                "cite_key": cite_key,
-                "attachments": attachments,
-            });
-            emit_json(&out);
-        } else {
-            for (path, result) in &results {
-                match result {
-                    Ok(chars) => emit(&format!("Extracted {chars} characters from '{path}'")),
-                    Err(e) => emit(&format!("Failed to extract '{path}': {e}")),
-                }
+        let out = serde_json::json!({
+            "cite_key": cite_key,
+            "attachments": attachments,
+        });
+        emit_json(&out);
+    } else {
+        for (path, result) in &results {
+            match result {
+                Ok(chars) => emit(&format!("Extracted {chars} characters from '{path}'")),
+                Err(e) => emit(&format!("Failed to extract '{path}': {e}")),
             }
         }
-
-        if any_failed {
-            std::process::exit(1);
-        }
     }
+
+    if any_failed {
+        std::process::exit(1);
+    }
+}
 
 fn cmd_import(conn: &rusqlite::Connection, path: PathBuf, json: bool) {
-        let entries = match bibtex::import(&path) {
-            Ok(e) => e,
-            Err(e) => die(&format!("failed to import '{}': {e}", path.display())),
-        };
+    let entries = match bibtex::import(&path) {
+        Ok(e) => e,
+        Err(e) => die(&format!("failed to import '{}': {e}", path.display())),
+    };
 
-        let mut imported = Vec::new();
-        let mut skipped = Vec::new();
-        let mut rejected: Vec<(String, String)> = Vec::new();
+    let mut imported = Vec::new();
+    let mut skipped = Vec::new();
+    let mut rejected: Vec<(String, String)> = Vec::new();
 
-        for entry in &entries {
-            match db::insert_entry(conn, entry) {
-                Ok(_) => imported.push(entry.cite_key.clone()),
-                Err(e) => {
-                    // Already-held rows are the only expected failure
-                    // mode; anything else is bad data.
-                    if is_duplicate(&e) {
-                        skipped.push(entry.cite_key.clone());
-                    } else {
-                        rejected.push((entry.cite_key.clone(), e.to_string()));
-                    }
+    for entry in &entries {
+        match db::insert_entry(conn, entry) {
+            Ok(_) => imported.push(entry.cite_key.clone()),
+            Err(e) => {
+                // Already-held rows are the only expected failure
+                // mode; anything else is bad data.
+                if is_duplicate(&e) {
+                    skipped.push(entry.cite_key.clone());
+                } else {
+                    rejected.push((entry.cite_key.clone(), e.to_string()));
                 }
             }
         }
-
-        // Skips are non-fatal by design, so re-importing a file you
-        // already hold is a successful no-op. Only genuine bad data is a
-        // failure -- keying the exit code off `imported` instead would
-        // make 2 duplicates exit 1 while 1 duplicate + 1 new exits 0.
-        let failed = !rejected.is_empty();
-
-        if json {
-            let out = serde_json::json!({
-                "imported": imported.len(),
-                "skipped": skipped.len(),
-                "rejected": rejected.len(),
-                "skipped_keys": skipped,
-                "rejected_keys": rejected
-                    .iter()
-                    .map(|(k, r)| serde_json::json!({ "cite_key": k, "reason": r }))
-                    .collect::<Vec<_>>(),
-            });
-            emit_json(&out);
-        } else {
-            emit(&format!(
-                "imported {}, skipped {} (already in the library), rejected {} (bad data)",
-                imported.len(),
-                skipped.len(),
-                rejected.len()
-            ));
-        }
-
-        if failed {
-            std::process::exit(1);
-        }
     }
+
+    // Skips are non-fatal by design, so re-importing a file you
+    // already hold is a successful no-op. Only genuine bad data is a
+    // failure -- keying the exit code off `imported` instead would
+    // make 2 duplicates exit 1 while 1 duplicate + 1 new exits 0.
+    let failed = !rejected.is_empty();
+
+    if json {
+        let out = serde_json::json!({
+            "imported": imported.len(),
+            "skipped": skipped.len(),
+            "rejected": rejected.len(),
+            "skipped_keys": skipped,
+            "rejected_keys": rejected
+                .iter()
+                .map(|(k, r)| serde_json::json!({ "cite_key": k, "reason": r }))
+                .collect::<Vec<_>>(),
+        });
+        emit_json(&out);
+    } else {
+        emit(&format!(
+            "imported {}, skipped {} (already in the library), rejected {} (bad data)",
+            imported.len(),
+            skipped.len(),
+            rejected.len()
+        ));
+    }
+
+    if failed {
+        std::process::exit(1);
+    }
+}
 
 // What happened when trying to fetch an open-access PDF for an entry via
 // Unpaywall. `doi` rides along in both branches since every caller reports
@@ -732,7 +754,10 @@ enum FetchOutcome {
     // with no direct PDF link -- `is_oa` is what tells those two apart, and
     // callers must not conflate them (telling someone their OA paper isn't
     // OA sends them looking for the wrong thing).
-    NoPdfFound { doi: String, is_oa: bool },
+    NoPdfFound {
+        doi: String,
+        is_oa: bool,
+    },
     // A PDF was landed at `path` (or was already there, per
     // `already_present`) and attached as `attachment_id`. Extraction is a
     // separate, partial step -- a failed extraction still leaves the
@@ -790,8 +815,8 @@ fn fetch_pdf_for_entry(
 
     // Partial failure: the attachment persists even if extraction fails --
     // same rule as `attach --extract` (Phase 7).
-    let extraction: Result<usize, String> =
-        text::extract_text(&abs_path).and_then(|extracted| save_extracted(conn, attachment_id, &extracted));
+    let extraction: Result<usize, String> = text::extract_text(&abs_path)
+        .and_then(|extracted| save_extracted(conn, attachment_id, &extracted));
 
     Ok(FetchOutcome::Downloaded {
         doi: doi_value,
@@ -802,75 +827,70 @@ fn fetch_pdf_for_entry(
     })
 }
 
-fn cmd_fetch(
-    conn: &rusqlite::Connection,
-    cite_key: String,
-    email: Option<String>,
-    json: bool,
-) {
-        let outcome = match fetch_pdf_for_entry(conn, &cite_key, email) {
-            Ok(o) => o,
-            Err(e) => die(&e),
-        };
+fn cmd_fetch(conn: &rusqlite::Connection, cite_key: String, email: Option<String>, json: bool) {
+    let outcome = match fetch_pdf_for_entry(conn, &cite_key, email) {
+        Ok(o) => o,
+        Err(e) => die(&e),
+    };
 
-        match outcome {
-            FetchOutcome::NoPdfFound { doi, is_oa } => {
-                if json {
-                    let out = serde_json::json!({
-                        "cite_key": cite_key,
-                        "doi": doi,
-                        "oa_found": false,
-                        "is_oa": is_oa,
-                    });
-                    emit_json(&out);
-                } else if is_oa {
-                    emit(&format!(
-                        "'{cite_key}' (DOI {doi}) is open access, but Unpaywall \
+    match outcome {
+        FetchOutcome::NoPdfFound { doi, is_oa } => {
+            if json {
+                let out = serde_json::json!({
+                    "cite_key": cite_key,
+                    "doi": doi,
+                    "oa_found": false,
+                    "is_oa": is_oa,
+                });
+                emit_json(&out);
+            } else if is_oa {
+                emit(&format!(
+                    "'{cite_key}' (DOI {doi}) is open access, but Unpaywall \
                          has no direct PDF link for it -- only landing pages"
-                    ));
-                } else {
-                    emit(&format!(
-                        "No open-access copy found for '{cite_key}' (DOI {doi})"
-                    ));
+                ));
+            } else {
+                emit(&format!(
+                    "No open-access copy found for '{cite_key}' (DOI {doi})"
+                ));
+            }
+        }
+        FetchOutcome::Downloaded {
+            doi,
+            path,
+            already_present,
+            extraction,
+            ..
+        } => {
+            if json {
+                let mut out = serde_json::json!({
+                    "cite_key": cite_key,
+                    "doi": doi,
+                    "oa_found": true,
+                    "path": path,
+                    "already_present": already_present,
+                    "extracted": extraction.is_ok(),
+                });
+                match &extraction {
+                    Ok(chars) => out["chars"] = serde_json::json!(chars),
+                    Err(e) => out["extract_error"] = serde_json::json!(e),
+                }
+                emit_json(&out);
+            } else {
+                emit(&format!(
+                    "Downloaded open-access PDF for '{cite_key}' to '{path}'"
+                ));
+                match &extraction {
+                    Ok(chars) => emit(&format!("Extracted {chars} characters from '{path}'")),
+                    Err(e) => emit(&format!("Warning: extraction failed for '{path}': {e}")),
                 }
             }
-            FetchOutcome::Downloaded {
-                doi,
-                path,
-                already_present,
-                extraction,
-                ..
-            } => {
-                if json {
-                    let mut out = serde_json::json!({
-                        "cite_key": cite_key,
-                        "doi": doi,
-                        "oa_found": true,
-                        "path": path,
-                        "already_present": already_present,
-                        "extracted": extraction.is_ok(),
-                    });
-                    match &extraction {
-                        Ok(chars) => out["chars"] = serde_json::json!(chars),
-                        Err(e) => out["extract_error"] = serde_json::json!(e),
-                    }
-                    emit_json(&out);
-                } else {
-                    emit(&format!(
-                        "Downloaded open-access PDF for '{cite_key}' to '{path}'"
-                    ));
-                    match &extraction {
-                        Ok(chars) => emit(&format!("Extracted {chars} characters from '{path}'")),
-                        Err(e) => emit(&format!("Warning: extraction failed for '{path}': {e}")),
-                    }
-                }
 
-                if extraction.is_err() {
-                    std::process::exit(1);
-                }
+            if extraction.is_err() {
+                std::process::exit(1);
             }
         }
     }
+}
 
 // Roadmap item, scoped here: a read-only scan for attachment paths that no
 // longer resolve on disk (a moved/deleted file, or a hand-edited DB row --
@@ -960,54 +980,74 @@ fn dispatch_collection(conn: &rusqlite::Connection, command: cli::CollectionComm
                 emit_json(&rows);
             } else {
                 for (depth, c) in &tree {
-                    emit(&format!("{}{} ({})", "  ".repeat(*depth), c.name, c.entry_count));
+                    emit(&format!(
+                        "{}{} ({})",
+                        "  ".repeat(*depth),
+                        c.name,
+                        c.entry_count
+                    ));
                 }
             }
         }
 
-        CollectionCommand::Add { path, cite_key, json } => {
-            match db::add_to_collection(conn, &path, &cite_key) {
-                Ok(changed) => {
-                    if json {
-                        let out = serde_json::json!({
-                            "path": path,
-                            "cite_key": cite_key,
-                            "changed": changed,
-                        });
-                        emit_json(&out);
-                    } else if changed {
-                        emit(&format!("Added '{cite_key}' to '{path}'"));
-                    } else {
-                        emit(&format!("'{cite_key}' is already in '{path}'"));
-                    }
-                }
-                Err(e) => die(&collection_entry_error(&cite_key, "add entry to collection", e)),
-            }
-        }
-
-        CollectionCommand::Rm { path, cite_key, json } => {
-            match db::remove_from_collection(conn, &path, &cite_key) {
-                Ok(changed) => {
-                    if json {
-                        let out = serde_json::json!({
-                            "path": path,
-                            "cite_key": cite_key,
-                            "changed": changed,
-                        });
-                        emit_json(&out);
-                    } else if changed {
-                        emit(&format!("Removed '{cite_key}' from '{path}'"));
-                    } else {
-                        emit(&format!("'{cite_key}' was not in '{path}'"));
-                    }
-                }
-                Err(e) => {
-                    die(&collection_entry_error(&cite_key, "remove entry from collection", e))
+        CollectionCommand::Add {
+            path,
+            cite_key,
+            json,
+        } => match db::add_to_collection(conn, &path, &cite_key) {
+            Ok(changed) => {
+                if json {
+                    let out = serde_json::json!({
+                        "path": path,
+                        "cite_key": cite_key,
+                        "changed": changed,
+                    });
+                    emit_json(&out);
+                } else if changed {
+                    emit(&format!("Added '{cite_key}' to '{path}'"));
+                } else {
+                    emit(&format!("'{cite_key}' is already in '{path}'"));
                 }
             }
-        }
+            Err(e) => die(&collection_entry_error(
+                &cite_key,
+                "add entry to collection",
+                e,
+            )),
+        },
 
-        CollectionCommand::Mv { path, parent, root, json } => {
+        CollectionCommand::Rm {
+            path,
+            cite_key,
+            json,
+        } => match db::remove_from_collection(conn, &path, &cite_key) {
+            Ok(changed) => {
+                if json {
+                    let out = serde_json::json!({
+                        "path": path,
+                        "cite_key": cite_key,
+                        "changed": changed,
+                    });
+                    emit_json(&out);
+                } else if changed {
+                    emit(&format!("Removed '{cite_key}' from '{path}'"));
+                } else {
+                    emit(&format!("'{cite_key}' was not in '{path}'"));
+                }
+            }
+            Err(e) => die(&collection_entry_error(
+                &cite_key,
+                "remove entry from collection",
+                e,
+            )),
+        },
+
+        CollectionCommand::Mv {
+            path,
+            parent,
+            root,
+            json,
+        } => {
             let new_parent = match (parent, root) {
                 (Some(p), false) => Some(p),
                 (None, true) => None,
@@ -1248,9 +1288,12 @@ fn land_downloaded_pdf(
         e
     };
 
-    let abs = target
-        .canonicalize()
-        .map_err(|e| cleanup(format!("failed to resolve saved PDF path '{}': {e}", target.display())))?;
+    let abs = target.canonicalize().map_err(|e| {
+        cleanup(format!(
+            "failed to resolve saved PDF path '{}': {e}",
+            target.display()
+        ))
+    })?;
     let path_str = abs
         .to_str()
         .ok_or_else(|| cleanup(format!("path {} is not valid UTF-8", abs.display())))?
@@ -1344,11 +1387,19 @@ fn pick_target(
 // (attach/fetch's "is this already mine?" policy) do that check themselves
 // before ever getting here; this only ever hands back a name nothing existed
 // at a moment ago.
-pub(crate) fn claim_free_name(dir: &Path, base: &str, ext: &str) -> std::io::Result<std::path::PathBuf> {
+pub(crate) fn claim_free_name(
+    dir: &Path,
+    base: &str,
+    ext: &str,
+) -> std::io::Result<std::path::PathBuf> {
     const MAX_ATTEMPTS: u32 = 50;
     for n in 1..=MAX_ATTEMPTS {
         let candidate = nth_candidate_name(dir, base, ext, n);
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
             Ok(_) => return Ok(candidate),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -1404,8 +1455,7 @@ fn copy_into_library(
     // O_EXCL (create_new) makes the claim atomic, so a loser sees the name
     // taken and moves to the next one instead of overwriting.
     for _ in 0..8 {
-        let (target, already_there) =
-            pdf_target(conn, cite_key, &dir, &base, &ext, Some(source))?;
+        let (target, already_there) = pdf_target(conn, cite_key, &dir, &base, &ext, Some(source))?;
         if already_there {
             return stored_path(&target, false);
         }
@@ -1473,7 +1523,11 @@ fn resolve_collection_filter(conn: &rusqlite::Connection, path: Option<String>) 
 // A zero row count means the attachment row is gone (a concurrent `rm`, say).
 // Reporting that as a successful extraction would tell a script it has text in
 // the DB when nothing was written, so it's an error.
-fn save_extracted(conn: &rusqlite::Connection, attachment_id: i64, text: &str) -> Result<usize, String> {
+fn save_extracted(
+    conn: &rusqlite::Connection,
+    attachment_id: i64,
+    text: &str,
+) -> Result<usize, String> {
     match db::set_full_text(conn, attachment_id, text) {
         Ok(0) => Err("attachment row no longer exists; nothing was saved".to_string()),
         Ok(_) => Ok(text.chars().count()),
@@ -1695,7 +1749,11 @@ fn find_snippets(
 // could in principle disagree), or whose attachment lookup itself fails
 // (shouldn't happen either -- the entry came from this same connection a
 // moment ago), is skipped rather than shown empty or panicking.
-fn text_search_results(conn: &rusqlite::Connection, entries: &[Entry], query: &str) -> Vec<TextSearchResult> {
+fn text_search_results(
+    conn: &rusqlite::Connection,
+    entries: &[Entry],
+    query: &str,
+) -> Vec<TextSearchResult> {
     entries
         .iter()
         .filter_map(|entry| {
@@ -1782,8 +1840,7 @@ mod tests {
         let mine = vec![target.canonicalize().unwrap().to_str().unwrap().to_string()];
 
         // Same file again: reuse the copy already in place.
-        let (again, present) =
-            pick_target(&dir, "smith2024", "pdf", &mine, Some(&paper)).unwrap();
+        let (again, present) = pick_target(&dir, "smith2024", "pdf", &mine, Some(&paper)).unwrap();
         assert_eq!(again, target);
         assert!(present);
 
@@ -1834,7 +1891,11 @@ mod tests {
         let text = "needle needle needle needle needle";
         let (snippets, count) = find_snippets(text, "needle", 3, 2);
         assert_eq!(count, 5, "every non-overlapping occurrence must be counted");
-        assert_eq!(snippets.len(), 2, "only max_matches snippets are actually built");
+        assert_eq!(
+            snippets.len(),
+            2,
+            "only max_matches snippets are actually built"
+        );
     }
 
     #[test]
