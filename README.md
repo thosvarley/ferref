@@ -28,6 +28,19 @@ Builds the release binary, installs it to `~/.local/bin`, and creates the
 library directory (`~/.ferref` by default, override with `FERREF_HOME`).
 Re-run any time to pick up a new build.
 
+### Nix / NixOS
+
+A flake is included — no Rust toolchain or `pdftotext` needed up front, both
+are pulled in as build/runtime dependencies automatically.
+
+```sh
+nix run github:thosvarley/ferref            # try it without installing
+nix profile install github:thosvarley/ferref # install into your profile
+```
+
+Or add it as a flake input to your own system config and reference
+`ferref.packages.${system}.default`.
+
 ## Quick look
 
 ```console
