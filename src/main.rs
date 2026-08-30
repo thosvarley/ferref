@@ -375,8 +375,21 @@ fn main() {
 
         Command::Import { path, json } => cmd_import(&conn, path, json),
 
-        Command::Export { out, biblatex } => {
-            let entries = match db::list_entries(&conn, &db::Filter::default(), false) {
+        Command::Export {
+            out,
+            biblatex,
+            collection,
+            recursive,
+        } => {
+            let entries = match db::list_entries(
+                &conn,
+                &db::Filter {
+                    collection_id: resolve_collection_filter(&conn, collection),
+                    recursive,
+                    ..Default::default()
+                },
+                false,
+            ) {
                 Ok(e) => e,
                 Err(e) => die(&format!("failed to list entries: {e}")),
             };

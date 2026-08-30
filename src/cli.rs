@@ -199,7 +199,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Export all entries as BibTeX. Prints to stdout unless --out is given.
+    /// Export entries as BibTeX. Prints to stdout unless --out is given.
     /// No --json here: the output format is BibTeX by definition, not a
     /// choice of representation, so the usual --json rule doesn't apply.
     Export {
@@ -211,6 +211,13 @@ pub enum Command {
         /// `year`/`journal`. Use it if your document loads `biblatex`.
         #[arg(long)]
         biblatex: bool,
+        /// Restrict to entries filed in this collection (slash-separated
+        /// path, e.g. "Physics/Entropy"). Omit to export the whole library.
+        #[arg(long)]
+        collection: Option<String>,
+        /// With --collection, also include entries in descendant collections
+        #[arg(long)]
+        recursive: bool,
     },
     /// Look up an open-access PDF for an entry's DOI via Unpaywall, and
     /// attach + extract it if one exists. No OA copy found is a normal
