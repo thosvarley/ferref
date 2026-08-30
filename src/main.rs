@@ -772,19 +772,12 @@ enum FetchOutcome {
         is_oa: bool,
     },
     // A PDF was landed at `path` (or was already there, per
-    // `already_present`) and attached as `attachment_id`. Extraction is a
-    // separate, partial step -- a failed extraction still leaves the
-    // attachment in place, so it travels inside `Ok` rather than failing the
-    // whole fetch.
+    // `already_present`). Extraction is a separate, partial step -- a failed
+    // extraction still leaves the attachment in place, so it travels inside
+    // `Ok` rather than failing the whole fetch.
     Downloaded {
         doi: String,
         path: String,
-        // Carried per the design brief for future consumers (e.g. a TUI
-        // "re-extract" action); neither cmd_fetch nor the TUI's fetch
-        // handler reads it today, so it stays here rather than being
-        // dropped only to be re-derived later.
-        #[allow(dead_code)]
-        attachment_id: i64,
         already_present: bool,
         extraction: Result<usize, String>,
     },
@@ -834,7 +827,6 @@ fn fetch_pdf_for_entry(
     Ok(FetchOutcome::Downloaded {
         doi: doi_value,
         path: path_str,
-        attachment_id,
         already_present,
         extraction,
     })
@@ -872,7 +864,6 @@ fn cmd_fetch(conn: &rusqlite::Connection, cite_key: String, email: Option<String
             path,
             already_present,
             extraction,
-            ..
         } => {
             if json {
                 let mut out = serde_json::json!({
