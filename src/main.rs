@@ -573,22 +573,22 @@ fn cmd_add(
     }
 }
 
-fn cmd_attach(
+struct AttachOutcome {
+    path: String,
+    source: String,
+    changed: bool,
+    extraction: Option<Result<usize, String>>,
+}
+
+fn attach_path_for_entry(
     conn: &rusqlite::Connection,
-    cite_key: String,
-    path: PathBuf,
+    cite_key: &str,
+    path: &Path,
     extract: bool,
-    json: bool,
-) {
-    let source = match cli::resolve_attachment_path(&path) {
-        Ok(p) => p,
-        Err(e) => die(&e),
-    };
-    let (resolved, copied) = match copy_into_library(conn, &cite_key, Path::new(&source)) {
-        Ok(pair) => pair,
-        Err(e) => die(&e),
-    };
-    let (attachment_id, changed) = match db::attach(conn, &cite_key, &resolved) {
+) -> Result<AttachOutcome, String> {
+    let source = cli::resolve_attachment_path(path)?;
+    let (resolved, copied) = copy_into_library(conn, cite_key, Path::new(&source))?;
+    let (attachment_id, changed) = match db::attach(conn, cite_key, &resolved) {
         Ok(pair) => pair,
         Err(e) => {
             // Same rule as `fetch`: don't leave a copy in pdfs/ that
@@ -597,7 +597,7 @@ fn cmd_attach(
             if copied {
                 let _ = std::fs::remove_file(&resolved);
             }
-            die(&friendly(Some(&cite_key), "attach file", e))
+            return Err(friendly(Some(cite_key), "attach file", e));
         }
     };
 
@@ -612,6 +612,32 @@ fn cmd_attach(
     } else {
         None
     };
+
+    Ok(AttachOutcome {
+        path: resolved,
+        source,
+        changed,
+        extraction,
+    })
+}
+
+fn cmd_attach(
+    conn: &rusqlite::Connection,
+    cite_key: String,
+    path: PathBuf,
+    extract: bool,
+    json: bool,
+) {
+    let outcome = match attach_path_for_entry(conn, &cite_key, &path, extract) {
+        Ok(o) => o,
+        Err(e) => die(&e),
+    };
+    let AttachOutcome {
+        path: resolved,
+        source,
+        changed,
+        extraction,
+    } = outcome;
 
     if json {
         let mut out = serde_json::json!({
@@ -758,36 +784,45 @@ fn cmd_import(conn: &rusqlite::Connection, path: PathBuf, json: bool) {
     }
 }
 
-// What happened when trying to fetch an open-access PDF for an entry via
-// Unpaywall. `doi` rides along in both branches since every caller reports
-// it regardless of outcome, and `fetch_pdf_for_entry` is the only place that
-// looked it up.
+// What happened when trying to fetch an open-access PDF for an entry.
+// Unpaywall is tried first (it's the one source with a real legal-OA
+// determination); if it comes up empty, four pattern-derived sources
+// (arXiv, bioRxiv, OSF, preprints.org) are tried in that fixed order. `doi`
+// rides along in both branches since every caller reports it regardless of
+// outcome, and `fetch_pdf_for_entry` is the only place that looked it up.
 enum FetchOutcome {
-    // Unpaywall was queried; either the paper isn't OA at all, or it's OA
-    // with no direct PDF link -- `is_oa` is what tells those two apart, and
-    // callers must not conflate them (telling someone their OA paper isn't
-    // OA sends them looking for the wrong thing).
+    // No source produced a PDF URL. `is_oa` is Unpaywall's own
+    // determination -- `Some(true)` means OA with no direct PDF link,
+    // `Some(false)` means not OA, `None` means Unpaywall itself errored
+    // (no longer fatal to the whole fetch, unlike before this phase).
+    // `attempted` lists every source that was tried and came up empty or
+    // failed, in the order tried, so a wrong guess is visible rather than
+    // silently indistinguishable from "no PDF anywhere".
     NoPdfFound {
         doi: String,
-        is_oa: bool,
+        is_oa: Option<bool>,
+        attempted: Vec<String>,
     },
     // A PDF was landed at `path` (or was already there, per
-    // `already_present`). Extraction is a separate, partial step -- a failed
-    // extraction still leaves the attachment in place, so it travels inside
-    // `Ok` rather than failing the whole fetch.
+    // `already_present`) from `source`. Extraction is a separate, partial
+    // step -- a failed extraction still leaves the attachment in place, so
+    // it travels inside `Ok` rather than failing the whole fetch.
     Downloaded {
         doi: String,
         path: String,
         already_present: bool,
         extraction: Result<usize, String>,
+        source: &'static str,
     },
 }
 
 // The actual work of `fetch`: DOI lookup on the entry, email resolution,
-// Unpaywall query, download+land+extract. Pulled out of cmd_fetch so the TUI
-// can call it too without dying on failure -- every error path here returns
-// Err instead of calling die()/process::exit, which cmd_fetch alone still
-// does, at the same messages it always has.
+// then Unpaywall followed by the four pattern-derived sources (arXiv,
+// bioRxiv, OSF, preprints.org), download+land+extract on whichever candidate
+// is found first. Pulled out of cmd_fetch so the TUI can call it too without
+// dying on failure -- every error path here returns Err instead of calling
+// die()/process::exit, which cmd_fetch alone still does, at the same
+// messages it always has.
 fn fetch_pdf_for_entry(
     conn: &rusqlite::Connection,
     cite_key: &str,
@@ -805,14 +840,55 @@ fn fetch_pdf_for_entry(
 
     let resolved_email = config::resolve_email(email)?;
 
-    let oa = doi::fetch_oa_pdf_url(&doi_value, &resolved_email)
-        .map_err(|e| format!("failed to query Unpaywall: {e}"))?;
+    let mut attempted: Vec<String> = Vec::new();
+    let mut is_oa: Option<bool> = None;
+    let mut found: Option<(String, &'static str)> = None;
+
+    // Unpaywall first, unchanged priority. A failure here is recorded, not
+    // fatal -- the four pattern-derived sources still get tried.
+    match doi::fetch_oa_pdf_url(&doi_value, &resolved_email) {
+        Ok(oa) => {
+            is_oa = Some(oa.is_oa);
+            match oa.pdf_url {
+                Some(url) => found = Some((url, "Unpaywall")),
+                None => attempted.push("Unpaywall".to_string()),
+            }
+        }
+        Err(e) => attempted.push(format!("Unpaywall (error: {e})")),
+    }
+
+    if found.is_none() {
+        match doi::arxiv_pdf_url(&doi_value) {
+            Some(url) => found = Some((url, "arXiv")),
+            None => attempted.push("arXiv".to_string()),
+        }
+    }
+    if found.is_none() {
+        match doi::biorxiv_pdf_url(&doi_value) {
+            Ok(Some(url)) => found = Some((url, "bioRxiv")),
+            Ok(None) => attempted.push("bioRxiv".to_string()),
+            Err(e) => attempted.push(format!("bioRxiv (error: {e})")),
+        }
+    }
+    if found.is_none() {
+        match doi::osf_pdf_url(&doi_value) {
+            Some(url) => found = Some((url, "OSF")),
+            None => attempted.push("OSF".to_string()),
+        }
+    }
+    if found.is_none() {
+        match doi::preprints_org_pdf_url(&doi_value) {
+            Some(url) => found = Some((url, "preprints.org")),
+            None => attempted.push("preprints.org".to_string()),
+        }
+    }
 
     // Having no PDF to fetch is a normal, legitimate answer, not an error.
-    let Some(pdf_url) = oa.pdf_url else {
+    let Some((pdf_url, source)) = found else {
         return Ok(FetchOutcome::NoPdfFound {
             doi: doi_value,
-            is_oa: oa.is_oa,
+            is_oa,
+            attempted,
         });
     };
 
@@ -829,6 +905,7 @@ fn fetch_pdf_for_entry(
         path: path_str,
         already_present,
         extraction,
+        source,
     })
 }
 
@@ -839,24 +916,35 @@ fn cmd_fetch(conn: &rusqlite::Connection, cite_key: String, email: Option<String
     };
 
     match outcome {
-        FetchOutcome::NoPdfFound { doi, is_oa } => {
+        FetchOutcome::NoPdfFound {
+            doi,
+            is_oa,
+            attempted,
+        } => {
             if json {
                 let out = serde_json::json!({
                     "cite_key": cite_key,
                     "doi": doi,
                     "oa_found": false,
                     "is_oa": is_oa,
+                    "attempted": attempted,
                 });
                 emit_json(&out);
-            } else if is_oa {
-                emit(&format!(
-                    "'{cite_key}' (DOI {doi}) is open access, but Unpaywall \
-                         has no direct PDF link for it -- only landing pages"
-                ));
             } else {
-                emit(&format!(
-                    "No open-access copy found for '{cite_key}' (DOI {doi})"
-                ));
+                let tried = attempted.join(", ");
+                match is_oa {
+                    Some(true) => emit(&format!(
+                        "'{cite_key}' (DOI {doi}) is open access, but no direct PDF link \
+                             was found (tried: {tried})"
+                    )),
+                    Some(false) => emit(&format!(
+                        "No open-access copy found for '{cite_key}' (DOI {doi}) (tried: {tried})"
+                    )),
+                    None => emit(&format!(
+                        "Could not determine open-access status for '{cite_key}' (DOI {doi}); \
+                             no PDF found from other sources either (tried: {tried})"
+                    )),
+                }
             }
         }
         FetchOutcome::Downloaded {
@@ -864,12 +952,14 @@ fn cmd_fetch(conn: &rusqlite::Connection, cite_key: String, email: Option<String
             path,
             already_present,
             extraction,
+            source,
         } => {
             if json {
                 let mut out = serde_json::json!({
                     "cite_key": cite_key,
                     "doi": doi,
                     "oa_found": true,
+                    "source": source,
                     "path": path,
                     "already_present": already_present,
                     "extracted": extraction.is_ok(),
@@ -881,7 +971,7 @@ fn cmd_fetch(conn: &rusqlite::Connection, cite_key: String, email: Option<String
                 emit_json(&out);
             } else {
                 emit(&format!(
-                    "Downloaded open-access PDF for '{cite_key}' to '{path}'"
+                    "Downloaded open-access PDF for '{cite_key}' from {source} to '{path}'"
                 ));
                 match &extraction {
                     Ok(chars) => emit(&format!("Extracted {chars} characters from '{path}'")),

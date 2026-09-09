@@ -62,7 +62,7 @@ All fifteen phases are complete.
 - `src/db.rs` — schema + `insert_entry`/`get_entry`/`list_entries`/`update_entry`/`delete_entry`, all free functions over `&Connection`. `update_entry` stamps `date_modified` itself so callers can't forget. `list_entries` takes a `Filter`; an all-`None` filter matches everything, so `list` and `search` are one query. `add_tag`/`remove_tag` are idempotent and report whether anything changed; `normalize_tag` (trim + lowercase) is the single point both writes and the `tag` filter go through. `attach` copies the file into `./pdfs/` under the same `<cite_key>.<ext>` scheme `fetch` uses, and stores the copy's path, so a library is one directory of papers. The name is claimed with `O_EXCL`, not by checking whether it exists first — two concurrent attaches to one cite_key otherwise lose a file 23% of the time, each reporting success.
 - `src/bibtex.rs` — `import`/`export` over the `biblatex` crate, plus the `biblatex::Entry` ↔ `models::Entry` mapping.
 - `src/text.rs` — `extract_text` over `pdftotext`. The project's trust boundary: bounded memory (the drain keeps the first 10MB and discards the rest rather than buffering it all), a 30s deadline covering *both* the child wait and the pipe drain, and a process-group kill so a wrapper script's descendants can't outlive us.
-- `src/doi.rs` — Crossref metadata + Unpaywall OA lookup over `ureq`. The network trust boundary: every request goes through `fetch_guarded`, which follows redirects by hand so each hop's scheme and resolved IP are revalidated, with capped reads and a `%PDF` magic-byte check before anything is written.
+- `src/doi.rs` — Crossref metadata + Unpaywall OA lookup over `ureq`. The network trust boundary: every request goes through `fetch_guarded`, which follows redirects by hand so each hop's scheme and resolved IP are revalidated, with capped reads and a `%PDF` magic-byte check before anything is written. `fetch` (Phase 19) falls back past Unpaywall to four more OA sources when it comes up empty — arXiv/OSF/preprints.org are pure DOI-pattern-to-URL resolvers, bioRxiv/medRxiv is one JSON API call — all landing on the same `download_pdf` trust boundary as Unpaywall's own URL.
 - `src/config.rs` — reads one key (`email`) from `~/.config/ferref/config.toml`. Deliberately a line reader, not TOML, and not a settings system.
 - Collections (Phase 10) nest; tags (Phase 5) don't. A tag describes a paper, a collection is where it lives. `collection_tree` is the single traversal, and it terminates on a cyclic `parent_id` graph because the DB is hand-editable by design.
 - `src/tui.rs` — three-pane TUI over ratatui. Blocking `event::read()`, DB queried only on state change, and `Filter` addressed by collection **id** rather than path. Sorts, filters, creates collections and files papers into them (Phase 12); everything else is still CLI-only.
@@ -1274,6 +1274,240 @@ platform gotcha aren't the same axis.
 
 ---
 
+## Phase 19 — Multi-source OA fetch: arXiv, bioRxiv, OSF, preprints.org
+
+`fetch` has only ever asked Unpaywall for an open-access PDF
+(`doi::fetch_oa_pdf_url`, wired through `main.rs::fetch_pdf_for_entry`).
+Unpaywall's coverage is Crossref-driven, so it regularly comes up empty for
+DOIs registered elsewhere — most notably arXiv's own DataCite-registered
+DOIs (`10.48550/arXiv.*`), which Crossref/Unpaywall generally don't index
+at all. This phase adds four more sources: arXiv, bioRxiv/medRxiv, OSF.io
+preprints (and every OSF-hosted preprint server — PsyArXiv, SocArXiv,
+EdArXiv, ...), and preprints.org. All four are public preprint servers
+with no access control on their PDFs, so this stays inside the existing
+non-goal boundary ("no paywall circumvention") — the same shape as
+Unpaywall or `add --from-url`: an ordinary request, revalidated by the
+existing SSRF guard, with the existing `%PDF` magic-byte check as the
+final backstop against landing garbage. No new dependency.
+
+Three of the four new sources are derivable straight from the DOI's own
+structure (pure string parsing, no network call); bioRxiv/medRxiv is not —
+its DOI doesn't encode the version needed to build a PDF URL, so it needs
+one JSON API call, reusing `doi.rs`'s existing `fetch_guarded`/`get_json`
+SSRF-checked infrastructure. That's the real trust-boundary/correctness
+risk in this phase; the other three carry the same class of risk
+`sanitize_filename` already guards against — a wrong guess must fail
+loudly, not silently write somewhere unexpected.
+
+**Pure DOI-pattern resolvers**, all `fn(&str) -> Option<String>`, `None`
+meaning "this DOI isn't from that source" (the normal case, not an error):
+
+- `arxiv_pdf_url` — DOI prefix `10.48550/arXiv.` (case-insensitive match
+  on the `arXiv.` label). Everything after it is the arXiv id verbatim,
+  including old-style ids that contain their own `/` (`hep-th/9901001`) —
+  splitting must not confuse that internal slash with the DOI's own
+  registrar/suffix separator. Builds `https://arxiv.org/pdf/<id>.pdf`.
+- `osf_pdf_url` — DOI containing `/osf.io/` (case-insensitive substring,
+  not a fixed prefix list, since it has to cover every OSF-hosted
+  preprint server's own registrar prefix). Extract the segment after it
+  up to the next `/` or end of string; strip a trailing `_v<digits>`
+  version suffix by hand to get the bare guid. Builds
+  `https://osf.io/<guid>/download`.
+- `preprints_org_pdf_url` — DOI shaped
+  `10.20944/preprints<manuscript>.v<version>`. Split on the last `.v`
+  followed by trailing digits. Builds
+  `https://www.preprints.org/manuscript/<manuscript>/v<version>/download`.
+
+**Networked resolver:**
+
+- `biorxiv_pdf_url(doi) -> Result<Option<String>, String>` — only
+  attempts a `10.1101/` DOI (shared by bioRxiv and medRxiv; the DOI alone
+  can't tell which). Calls `api.biorxiv.org/details/biorxiv/<doi>`; if
+  that reports no match, retries against `.../details/medrxiv/<doi>`.
+  Parsing is split from I/O exactly like `parse_crossref`/
+  `parse_unpaywall`: a pure `parse_biorxiv_details(json) -> Option<u32>`
+  picks the highest `version` out of the response's `collection` array.
+  Builds `https://www.{biorxiv,medrxiv}.org/content/<doi>v<version>.full.pdf`
+  against whichever host actually answered.
+
+**Orchestration**, in `fetch_pdf_for_entry` (the one choke point both
+`cmd_fetch` and the TUI's `fetch_selected` already call through): Unpaywall
+first, unchanged priority — it's the one source with a real legal-OA
+determination (`is_oa`). A network failure there is no longer fatal to the
+whole fetch; it's recorded in a new `attempted: Vec<String>` and the other
+sources still get tried. If Unpaywall found nothing, the four new sources
+are tried in a fixed order (arXiv, bioRxiv, OSF, preprints.org); in
+practice at most one ever matches a given DOI, since the patterns are
+mutually exclusive by registrar prefix, so this is a selection, not a
+race. A found candidate downloads exactly as today — no fallback to a
+second candidate if the download itself fails, matching existing behavior
+for a failed Unpaywall URL.
+
+`FetchOutcome::NoPdfFound` gains `is_oa: Option<bool>` (was `bool`; `None`
+only when Unpaywall itself errored, previously fatal) and `attempted`.
+`FetchOutcome::Downloaded` gains `source: &'static str`, surfaced in the
+CLI message/JSON and the TUI status line.
+
+Delegation: **yes / yes**. Same class as Phase 8/13 — network, remote JSON
+not under our control, and a genuine silent-failure trap (a wrong host for
+a bioRxiv-vs-medRxiv DOI, or a version off-by-one, downloads *a* PDF that
+isn't obviously wrong instead of erroring).
+
+**Built and shipped**, author/critic per the user's explicit split: `coder`
+(write access) implemented against the spec above; `adversarial-reviewer`
+(read-only — Read/Grep/Glob/Bash, no Write/Edit) reviewed the diff
+afterward, executing in a scratch copy outside the repo rather than
+reasoning from the source alone (confirmed `cargo build`/`cargo test`/
+`cargo clippy` clean itself, didn't trust the author's self-report; probed
+the four new resolvers with additional exploratory inputs — non-ASCII
+DOIs, a DOI where the arXiv prefix appears as a substring rather than a
+true prefix, live queries against the real `api.biorxiv.org` to confirm
+its "not found" shape is an HTTP 200 with an empty `collection`, not a
+404, which is what makes the biorxiv→medrxiv host fallback actually
+reachable in the normal case rather than short-circuited by `?`).
+
+One real, reproducible bug survived to review: `preprints_org_pdf_url`
+matched its `10.20944/preprints` prefix case-*sensitively*, unlike
+`arxiv_pdf_url` and `osf_pdf_url`, which both lowercase the DOI before
+matching (and which the design text above explicitly calls
+case-insensitive) — confirmed by executing
+`preprints_org_pdf_url("10.20944/Preprints202001.0001.v1")` and getting
+`None` for a structurally valid, only-differently-cased DOI. Low severity
+(a false negative, not a false positive — a real preprints.org paper is
+missed rather than a wrong URL being fabricated for an unrelated DOI —
+and Crossref/DataCite DOIs are lowercase in practice), but a genuine
+inconsistency with the sibling resolvers in the same file, and DOIs are
+case-insensitive by the DOI system's own spec. Fixed by lowercasing the
+same way `arxiv_pdf_url` does (match on the lowercased string, slice the
+original for the manuscript id so real casing survives into the URL),
+with a regression test (`preprints_org_pdf_url_is_case_insensitive`)
+added alongside it. Nothing else the review found needed a change: the
+OSF `_v<digits>`-suffix stripping, the preprints.org `.v<version>` split,
+the arXiv old-style-id slash handling, `parse_biorxiv_details`'s numeric
+(not lexicographic) version comparison, and the SSRF/`%PDF`-magic-byte
+trust boundary being reached unconditionally by every new source were all
+independently re-verified and found correct as designed.
+
+---
+
+## Phase 20 — TUI: `attach` via a file browser
+
+`attach` (Phase 6) has always been CLI-only: `ferref attach <cite_key>
+<path>` takes an exact path, typed or shell-completed. In the TUI that
+means leaving to a shell, finding the file, and typing the path back in --
+friction Phase 16 already removed for edit/fetch/delete/merge. This phase
+adds `attach` as a fifth `:`-palette action (`":"` -> `"a"`), opening a
+directory browser instead of a text box, since the whole point is
+navigating to *where the file actually is* rather than remembering its
+path.
+
+**One implementation, still.** `cmd_attach`'s body (`main.rs`) is pulled
+into `attach_path_for_entry(conn, cite_key, source_path, extract) ->
+Result<AttachOutcome, String>` -- the same shape Phase 16 already
+established for fetch (`fetch_pdf_for_entry`) and the same rule merge's
+section states explicitly: a write has exactly one implementation
+regardless of which front end triggers it. `cmd_attach` becomes a thin
+wrapper that calls it and formats CLI/JSON output; the TUI calls the same
+function with `extract: true` always (matching `fetch`'s TUI behavior --
+text is worth having by default when a paper's already open in front of
+someone). Reuses `cli::resolve_attachment_path`, `copy_into_library`, and
+`db::attach` completely unchanged -- including the existing `O_EXCL`
+claim-before-write race fix and the copied-file cleanup on a failed
+`db::attach`, none of which this phase touches.
+
+**The browser itself**, a new `Mode::FileBrowser { entry_id, cwd, entries,
+selected }`: starts at `$HOME` (falling back to the process's current
+directory if `$HOME` is unset, matching `config::library_root`'s own
+`$HOME`-first convention). `entries` is a sorted, dotfile-filtered listing
+of `cwd` -- directories first, then files, both alphabetical
+case-insensitively -- from a small `list_dir(dir: &Path) ->
+Result<Vec<BrowserEntry>, String>`, kept as its own function (real
+`#[test]` against a tempdir, the same pattern
+`resolve_attachment_path_is_absolute_and_rejects_missing` already uses in
+`cli.rs`) rather than inlined into the key handler, so the sorting/
+filtering logic is checked directly rather than only through a live TUI
+session.
+
+Keys, vim-consistent with the rest of the TUI: `j`/`k` (and arrows) move,
+`g`/`G` jump top/bottom, `l`/`Enter` on a directory descends into it, `l`/
+`Enter` on a file attaches it (no confirm popup -- attach isn't
+destructive, the same bar `c`/fetch/tag already sit at; only delete/merge
+get a confirm), `h`/`Backspace` goes to the parent directory (a no-op at
+filesystem root, not an error), `Esc` cancels back to `Normal` with
+nothing written. No live text filter (unlike the merge entry-picker) --
+`j`/`k`/`h`/`l` would collide with typed filter characters, and a
+directory listing is usually short enough that scrolling is fine; this is
+deliberately the simpler of the two picker shapes in this codebase, not
+the `EntryPicker` one.
+
+A directory that fails to list (permission denied, mid-navigation) is a
+footer error, not a crash or a silent empty listing -- `cwd`/`entries`/
+`selected` stay exactly as they were before the failed attempt, so a
+blocked directory doesn't strand the browser on an empty screen.
+
+`draw_command`'s popup and its footer hint line both gain the `a` entry
+next to the existing `e`/`f`/`m`/`d`/`t`/`u`; a new `draw_file_browser`
+follows the same `floating_window`/cyan-accent/`ListState` shape every
+other popup here already uses (the standing "every floating window is
+cyan" rule from Phase 16 applies unconditionally, including this one).
+
+Delegation: **yes / yes**, author/critic per the user's established split
+for this project (`coder` write access implements against this spec,
+`adversarial-reviewer` read-only reviews afterward). Smaller than Phase 16
+(one new mode, not five) but with the same class of local risk Phase 12's
+`attach` race and Phase 16's merge-rename atomicity both turned out to
+hide: filesystem navigation edge cases (symlinks, an unreadable directory,
+a path that disappears between listing and attach, `cwd.parent()` at
+root) are the kind of thing that looks obviously correct and isn't,
+without someone deliberately trying to break it.
+
+**Built and shipped.** No new dependency -- the browser is hand-rolled
+(`list_dir` over `std::fs::read_dir`, rendered as a `List` inside the
+existing popup machinery), not a crate, the same call this project already
+made for the citation-meta HTML scanner (Phase 13): there's no clearly
+best-of-breed "ratatui file picker" crate, and the alternative is ~80
+lines of straightforward directory listing.
+
+`adversarial-reviewer` actually built adversarial directory trees in a
+scratch location (a symlink loop, a broken symlink, a `chmod 000`
+directory, a non-UTF-8 filename, a 50-level-deep path, a directory removed
+out from under a stale reference) and ran `list_dir` and the full attach
+path against each, rather than reasoning from the source alone.
+
+One real bug survived to review: `list_dir` classified `is_dir` via
+`DirEntry::file_type()`, which uses `lstat` semantics -- it does not
+follow symlinks, so a symlink pointing at a real directory (common under
+`$HOME`: a papers folder symlinked in from another mount or drive) was
+reported as "not a directory." It didn't panic -- pressing `l`/`Enter` on
+one silently took the "attach as file" branch instead of "descend," and
+`copy_into_library`'s own existing regular-file check caught it further
+down with a correct but confusing error ("the source path is neither a
+regular file nor a symlink to a regular file") -- but it broke this
+phase's own stated contract that `l`/`Enter` on a directory descends into
+it, for a genuinely common case. Confirmed by reproducing directly: a
+`realdir/` and a `symlink_to_dir -> realdir` in the same listing came back
+`is_dir=true`/`is_dir=false` respectively.
+
+Fixed by following the symlink to classify it -- `std::fs::metadata`
+instead of `DirEntry::file_type()` when the entry is itself a symlink,
+falling back to "not a directory" if that `metadata()` call errors (a
+broken link or a symlink loop), which defers to the same clean
+attach-time error path a vanished/unreadable file already produces rather
+than failing the whole directory listing over one bad entry. A regression
+test (`list_dir_follows_symlinks_to_classify_dir_vs_file`, Unix-only,
+`#[cfg(unix)]`) covers both a working directory symlink and a broken one.
+
+Everything else the review checked -- symlink loops and permission-denied
+directories producing a clean `Err` rather than a hang or panic, the
+`is_dir` bool-ordering sort trick actually sorting directories first (not
+last, the easy way to misread it), `cwd.parent()` at `/` being a genuine
+no-op, selection-index arithmetic on an empty directory, and the
+`attach_path_for_entry` extraction preserving the CLI's exact prior
+behavior byte-for-byte -- was independently re-verified and found correct
+as built.
+
+---
+
 ## Roadmap (not yet scoped)
 
 Ideas worth doing sometime, deliberately not designed in detail yet — see
@@ -1305,7 +1539,7 @@ one yet.
 
 ## Order of work
 
-Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17 → 18. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
+Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17 → 18 → 19 → 20. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
 
 ---
 
@@ -1334,6 +1568,8 @@ Which phases get farmed out to a `coder` subagent, and which get an
 | 16 — TUI editing, fetch, delete, merge | **yes** | **yes** | Biggest TUI grind yet (five new modes), plus two silent-failure traps: attachment-filename collision on merge (same class as Phase 12's `attach` race) and a blocking network call inside the render loop that must not corrupt terminal state on failure. |
 | 17 — `ferref doctor` | no | no | One join query plus a CLI command, no migration, no new trust boundary. Same shape as Phase 4. |
 | 18 — TUI copy to clipboard | no | no | One keybinding and one pure resolution function, smaller than Phase 6. |
+| 19 — Multi-source OA fetch | **yes** | **yes** | Network, remote JSON not under our control, a genuine silent-failure trap (wrong host/version silently lands a plausible-looking PDF instead of erroring). Same shape as Phase 8. |
+| 20 — TUI attach via file browser | **yes** | **yes** | New mode + real key-handling grind, plus local filesystem edge cases (symlinks, permission denied, root traversal) in the same class Phase 12/16 were burned by. |
 
 The table is a default, not a rule. The reasoning behind it, which outlives the
 table if the phases change:

@@ -62,6 +62,132 @@ pub fn fetch_oa_pdf_url(doi: &str, email: &str) -> Result<OaStatus, String> {
     parse_unpaywall(&body)
 }
 
+/// arXiv-registered DOI -> PDF URL, pure string parsing, no network call.
+/// `None` means `doi` isn't an arXiv DOI (the normal case, not an error).
+/// Matches DOI prefix `10.48550/arXiv.` case-insensitively on the `arXiv.`
+/// label; everything after it is the arXiv id verbatim, including old-style
+/// ids that contain their own `/` (e.g. `hep-th/9901001`) -- that internal
+/// slash is not the DOI's own registrar/suffix separator, so it must not be
+/// split on.
+pub fn arxiv_pdf_url(doi: &str) -> Option<String> {
+    const PREFIX: &str = "10.48550/arxiv.";
+    let lower = doi.to_ascii_lowercase();
+    if !lower.starts_with(PREFIX) {
+        return None;
+    }
+    // PREFIX is ASCII, so its byte length matches the original (mixed-case)
+    // doi's byte length for the same span -- slicing doi (not lower) here
+    // preserves the id's real casing.
+    let id = &doi[PREFIX.len()..];
+    if id.is_empty() {
+        return None;
+    }
+    Some(format!("https://arxiv.org/pdf/{id}.pdf"))
+}
+
+/// OSF-hosted-preprint DOI -> PDF URL, pure string parsing. `None` means
+/// `doi` doesn't contain an `/osf.io/` segment -- matched as a
+/// case-insensitive substring, not a fixed prefix list, since it has to
+/// cover every OSF-hosted preprint server's own registrar prefix (OSF
+/// Preprints, PsyArXiv, SocArXiv, EdArXiv, ...). Strips a trailing
+/// `_v<digits>` version suffix by hand to get the bare guid, e.g.
+/// `abc12_v1` -> `abc12`.
+pub fn osf_pdf_url(doi: &str) -> Option<String> {
+    let lower = doi.to_ascii_lowercase();
+    let marker = "/osf.io/";
+    let idx = lower.find(marker)?;
+    let start = idx + marker.len();
+    let rest = &doi[start..];
+    let end = rest.find('/').unwrap_or(rest.len());
+    let mut guid = &rest[..end];
+
+    if let Some(pos) = guid.rfind("_v") {
+        let suffix = &guid[pos + 2..];
+        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+            guid = &guid[..pos];
+        }
+    }
+
+    if guid.is_empty() {
+        return None;
+    }
+    Some(format!("https://osf.io/{guid}/download"))
+}
+
+/// preprints.org DOI -> PDF URL, pure string parsing. `None` means `doi`
+/// isn't shaped `10.20944/preprints<manuscript>.v<version>`. Splits on the
+/// last `.v` followed by trailing digits, since `<manuscript>` itself can
+/// contain dots (e.g. `202001.0001`).
+pub fn preprints_org_pdf_url(doi: &str) -> Option<String> {
+    const PREFIX: &str = "10.20944/preprints";
+    let lower = doi.to_ascii_lowercase();
+    if !lower.starts_with(PREFIX) {
+        return None;
+    }
+    // PREFIX and ".v" are both ASCII, so byte offsets found in `lower` land
+    // on the same byte in `doi` -- slicing `doi` (not `lower`) here preserves
+    // the manuscript id's real casing, the same trick `arxiv_pdf_url` uses.
+    let lower_rest = &lower[PREFIX.len()..];
+    let pos = lower_rest.rfind(".v")?;
+    let rest = &doi[PREFIX.len()..];
+    let manuscript = &rest[..pos];
+    let version = &rest[pos + 2..];
+    if manuscript.is_empty() || version.is_empty() || !version.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(format!(
+        "https://www.preprints.org/manuscript/{manuscript}/v{version}/download"
+    ))
+}
+
+const BIORXIV_API_BASE: &str = "https://api.biorxiv.org/details";
+
+/// bioRxiv/medRxiv DOI -> PDF URL. Unlike the other three sources, a
+/// `10.1101/` DOI (shared by both servers -- the DOI alone can't tell which)
+/// doesn't encode the version needed to build the PDF URL, so this makes a
+/// JSON API call. Tries `api.biorxiv.org/details/biorxiv/<doi>` first; if
+/// that reports no match, retries against `.../details/medrxiv/<doi>`.
+/// `Ok(None)` means neither host has this DOI -- the normal "not from this
+/// source" case, not an error. Only a genuine network/parse failure comes
+/// back as `Err`.
+pub fn biorxiv_pdf_url(doi: &str) -> Result<Option<String>, String> {
+    validate_doi(doi)?;
+    if !doi.starts_with("10.1101/") {
+        return Ok(None);
+    }
+
+    for host in ["biorxiv", "medrxiv"] {
+        let url = format!("{BIORXIV_API_BASE}/{host}/{}", percent_encode(doi));
+        let body = get_json(&url, "bioRxiv")?;
+        if let Some(version) = parse_biorxiv_details(&body) {
+            return Ok(Some(format!(
+                "https://www.{host}.org/content/{doi}v{version}.full.pdf"
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// Picks the highest `version` out of a bioRxiv/medRxiv `/details` response's
+/// `collection` array. `None` covers both shapes a "no match" response can
+/// take -- no `collection` key at all, or an empty `collection` array --
+/// treating both as the normal "not on this host" case, never a panic or an
+/// error. Parsing is split from I/O here exactly like `parse_crossref`/
+/// `parse_unpaywall`, so this is testable without the network.
+fn parse_biorxiv_details(json: &str) -> Option<u32> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let collection = v.get("collection")?.as_array()?;
+    collection
+        .iter()
+        .filter_map(|item| {
+            item.get("version")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u32>().ok())
+        })
+        .max()
+}
+
 /// Downloads the bytes at `url`, which must have come from a trusted call
 /// site (Unpaywall JSON) and already passed the scheme check the caller is
 /// expected to have done -- this function re-checks it anyway, since a URL
@@ -1285,5 +1411,117 @@ mod tests {
             parse_unpaywall(both).unwrap().pdf_url.as_deref(),
             Some("https://best.example/a.pdf")
         );
+    }
+
+    #[test]
+    fn arxiv_pdf_url_new_and_old_style_ids() {
+        assert_eq!(
+            arxiv_pdf_url("10.48550/arXiv.2301.00001").as_deref(),
+            Some("https://arxiv.org/pdf/2301.00001.pdf")
+        );
+        // Old-style id contains its own '/', which must survive intact.
+        assert_eq!(
+            arxiv_pdf_url("10.48550/arXiv.hep-th/9901001").as_deref(),
+            Some("https://arxiv.org/pdf/hep-th/9901001.pdf")
+        );
+        // Case-insensitive on the "arXiv." label.
+        assert_eq!(
+            arxiv_pdf_url("10.48550/ARXIV.2301.00001").as_deref(),
+            Some("https://arxiv.org/pdf/2301.00001.pdf")
+        );
+    }
+
+    #[test]
+    fn arxiv_pdf_url_rejects_non_arxiv_dois() {
+        assert_eq!(arxiv_pdf_url("10.1038/nature12373"), None);
+        assert_eq!(arxiv_pdf_url("10.48550/arXiv."), None); // empty id
+    }
+
+    #[test]
+    fn osf_pdf_url_covers_every_osf_hosted_server() {
+        assert_eq!(
+            osf_pdf_url("10.31219/osf.io/abc12").as_deref(),
+            Some("https://osf.io/abc12/download")
+        );
+        // PsyArXiv: a different registrar prefix, same /osf.io/ segment.
+        assert_eq!(
+            osf_pdf_url("10.31234/osf.io/xyz98").as_deref(),
+            Some("https://osf.io/xyz98/download")
+        );
+        // Versioned: the guid must come out bare, not with "_v1" attached.
+        assert_eq!(
+            osf_pdf_url("10.31219/osf.io/abc12_v1").as_deref(),
+            Some("https://osf.io/abc12/download")
+        );
+    }
+
+    #[test]
+    fn osf_pdf_url_rejects_non_osf_dois() {
+        assert_eq!(osf_pdf_url("10.1038/nature12373"), None);
+    }
+
+    #[test]
+    fn preprints_org_pdf_url_splits_manuscript_and_version() {
+        assert_eq!(
+            preprints_org_pdf_url("10.20944/preprints202001.0001.v1").as_deref(),
+            Some("https://www.preprints.org/manuscript/202001.0001/v1/download")
+        );
+    }
+
+    // Case-insensitive on the "preprints"/".v" labels, the same as
+    // arxiv_pdf_url and osf_pdf_url are on theirs -- DOIs are case-insensitive
+    // by the DOI system's own spec. Regression: an earlier version matched
+    // the prefix case-sensitively and silently missed a capitalized DOI.
+    #[test]
+    fn preprints_org_pdf_url_is_case_insensitive() {
+        assert_eq!(
+            preprints_org_pdf_url("10.20944/Preprints202001.0001.V1").as_deref(),
+            Some("https://www.preprints.org/manuscript/202001.0001/v1/download")
+        );
+    }
+
+    #[test]
+    fn preprints_org_pdf_url_rejects_non_preprints_org_dois() {
+        assert_eq!(preprints_org_pdf_url("10.1038/nature12373"), None);
+        assert_eq!(preprints_org_pdf_url("10.20944/preprints202001.0001"), None); // no .v<version>
+    }
+
+    // Real shape (trimmed) from GET api.biorxiv.org/details/biorxiv/<doi>: a
+    // multi-version posting, highest version wins.
+    #[test]
+    fn parse_biorxiv_details_picks_the_highest_version() {
+        let json = r#"
+        {"collection":[
+            {"doi":"10.1101/2020.01.01.900000","version":"1"},
+            {"doi":"10.1101/2020.01.01.900000","version":"2"}
+        ],"messages":[{"status":"ok","count":"2"}]}
+        "#;
+        assert_eq!(parse_biorxiv_details(json), Some(2));
+    }
+
+    // "no posts found" shape: no `collection` key at all. Must be None, not
+    // an error or a panic.
+    #[test]
+    fn parse_biorxiv_details_no_collection_key_is_none() {
+        let json = r#"{"messages":[{"status":"no posts found matching the DOI"}]}"#;
+        assert_eq!(parse_biorxiv_details(json), None);
+    }
+
+    // An empty collection array is the same "not found" case as a missing key.
+    #[test]
+    fn parse_biorxiv_details_empty_collection_is_none() {
+        let json = r#"{"collection":[],"messages":[{"status":"ok","count":"0"}]}"#;
+        assert_eq!(parse_biorxiv_details(json), None);
+    }
+
+    // Malformed JSON and a non-numeric version must never panic.
+    #[test]
+    fn parse_biorxiv_details_malformed_input_is_none_not_panic() {
+        assert_eq!(parse_biorxiv_details("not json"), None);
+        assert_eq!(
+            parse_biorxiv_details(r#"{"collection":[{"version":"not-a-number"}]}"#),
+            None
+        );
+        assert_eq!(parse_biorxiv_details(r#"{"collection":"oops"}"#), None);
     }
 }

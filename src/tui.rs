@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -128,6 +129,12 @@ fn handle_key(
         Mode::Confirm { action, .. } => handle_confirm_key(app, conn, code, action),
         // any key closes it; app.mode is already Normal from the replace above
         Mode::Help => {}
+        Mode::FileBrowser {
+            entry_id,
+            cwd,
+            entries,
+            selected,
+        } => handle_file_browser_key(app, conn, code, entry_id, cwd, entries, selected),
     }
 }
 
@@ -463,6 +470,7 @@ fn handle_command_key(
             let ids = app.bulk_targets(entry_id);
             app.mode = Mode::Input(InputKind::Tag { ids, add: false }, String::new());
         }
+        KeyCode::Char('a') => app.begin_attach(entry_id),
         _ => app.mode = Mode::Command { entry_id },
     }
 }
@@ -548,6 +556,92 @@ fn handle_entry_picker_key(
         within,
         filter,
         rows,
+        selected,
+    };
+}
+
+// Attach's directory browser: j/k/g/G move, l/Enter descends a directory or
+// attaches a file (extraction always on -- matches fetch's TUI behavior),
+// h/Backspace goes to the parent (a no-op at filesystem root), Esc cancels.
+// A directory that fails to list is a footer error, not a crash or a lost
+// listing -- cwd/entries/selected stay exactly as they were before the
+// failed attempt.
+fn handle_file_browser_key(
+    app: &mut App,
+    conn: &Connection,
+    code: KeyCode,
+    entry_id: i64,
+    mut cwd: PathBuf,
+    mut entries: Vec<BrowserEntry>,
+    mut selected: usize,
+) {
+    match code {
+        KeyCode::Esc => return, // app.mode is already Normal
+        KeyCode::Char('j') | KeyCode::Down => {
+            selected = (selected + 1).min(entries.len().saturating_sub(1));
+        }
+        KeyCode::Char('k') | KeyCode::Up => selected = selected.saturating_sub(1),
+        KeyCode::Char('g') => selected = 0,
+        KeyCode::Char('G') => selected = entries.len().saturating_sub(1),
+        KeyCode::Char('l') | KeyCode::Enter => {
+            if let Some(entry) = entries.get(selected) {
+                if entry.is_dir {
+                    match list_dir(&entry.path) {
+                        Ok(new_entries) => {
+                            cwd = entry.path.clone();
+                            entries = new_entries;
+                            selected = 0;
+                        }
+                        Err(e) => app.status = Some(e),
+                    }
+                } else {
+                    let Some(cite_key) = app.entry_by_id(entry_id).map(|e| e.cite_key.clone())
+                    else {
+                        return;
+                    };
+                    match crate::attach_path_for_entry(conn, &cite_key, &entry.path, true) {
+                        Ok(outcome) => {
+                            let mut msg = if outcome.changed {
+                                format!("Attached '{}' to '{}'", outcome.path, cite_key)
+                            } else {
+                                format!("'{}' already has '{}'", cite_key, outcome.path)
+                            };
+                            if let Some(extraction) = &outcome.extraction {
+                                msg.push_str(&match extraction {
+                                    Ok(chars) => format!(" ({chars} chars extracted)"),
+                                    Err(e) => format!(", but extraction failed: {e}"),
+                                });
+                            }
+                            app.status = Some(msg);
+                            if let Err(e) = app.refresh_entry(conn, entry_id) {
+                                app.status = Some(e);
+                            }
+                        }
+                        Err(e) => app.status = Some(e),
+                    }
+                    return; // back to Mode::Normal
+                }
+            }
+        }
+        KeyCode::Char('h') | KeyCode::Backspace => {
+            if let Some(parent) = cwd.parent() {
+                match list_dir(parent) {
+                    Ok(new_entries) => {
+                        cwd = parent.to_path_buf();
+                        entries = new_entries;
+                        selected = 0;
+                    }
+                    Err(e) => app.status = Some(e),
+                }
+            }
+        }
+        _ => {}
+    }
+
+    app.mode = Mode::FileBrowser {
+        entry_id,
+        cwd,
+        entries,
         selected,
     };
 }
@@ -704,6 +798,73 @@ enum Mode {
     // "?": the full keymap reference. Static content, so no fields -- any
     // key closes it.
     Help,
+    // Attach's directory browser, opened by ":" -> "a". `cwd` starts at
+    // $HOME (see App::begin_attach); `entries` is `list_dir(&cwd)`'s
+    // listing, refreshed on every descend/ascend.
+    FileBrowser {
+        entry_id: i64,
+        cwd: PathBuf,
+        entries: Vec<BrowserEntry>,
+        selected: usize,
+    },
+}
+
+struct BrowserEntry {
+    name: String,
+    path: PathBuf,
+    is_dir: bool,
+}
+
+// A sorted, dotfile-filtered directory listing for Mode::FileBrowser:
+// directories first, then files, both alphabetical case-insensitively.
+// `file_type()` (not `path.is_dir()`) decides dir-vs-file so a broken
+// symlink or a permission-denied stat can't panic; an entry that errors on
+// `file_type()` is skipped rather than failing the whole listing, since one
+// bad entry in a directory shouldn't hide every other entry.
+fn list_dir(dir: &Path) -> Result<Vec<BrowserEntry>, String> {
+    let read = std::fs::read_dir(dir)
+        .map_err(|e| format!("failed to read '{}': {e}", dir.display()))?;
+
+    let mut entries: Vec<BrowserEntry> = Vec::new();
+    for item in read.flatten() {
+        let name = item.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let Ok(file_type) = item.file_type() else {
+            continue;
+        };
+        // DirEntry::file_type() uses lstat semantics: a symlink is never
+        // "a directory" by its own report, even one pointing at a real
+        // directory -- common under $HOME (a papers folder symlinked from
+        // another mount), and without this the browser could never descend
+        // into one. metadata() follows the link to classify it correctly;
+        // a broken link or a symlink loop makes that error, which is
+        // treated as "not a directory" rather than propagated -- the
+        // file-attach path already produces a clean error for an
+        // unreadable/vanished path, so this just defers to that instead of
+        // failing the whole listing over one bad entry.
+        let is_dir = if file_type.is_symlink() {
+            std::fs::metadata(item.path())
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+        } else {
+            file_type.is_dir()
+        };
+        entries.push(BrowserEntry {
+            name,
+            path: item.path(),
+            is_dir,
+        });
+    }
+
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+
+    Ok(entries)
 }
 
 enum InputKind {
@@ -1336,18 +1497,25 @@ impl App {
 
         match crate::fetch_pdf_for_entry(conn, &cite_key, None) {
             Ok(crate::FetchOutcome::NoPdfFound { is_oa, .. }) => {
-                self.status = Some(if is_oa {
-                    format!("'{cite_key}' is open access, but Unpaywall has no direct PDF link")
-                } else {
-                    format!("No open-access copy found for '{cite_key}'")
+                self.status = Some(match is_oa {
+                    Some(true) => {
+                        format!("'{cite_key}' is open access, but no direct PDF link was found")
+                    }
+                    Some(false) => format!("No open-access copy found for '{cite_key}'"),
+                    None => format!(
+                        "Could not determine open-access status for '{cite_key}'; no PDF found"
+                    ),
                 });
             }
             Ok(crate::FetchOutcome::Downloaded {
-                path, extraction, ..
+                path,
+                extraction,
+                source,
+                ..
             }) => {
                 self.status = Some(match extraction {
-                    Ok(chars) => format!("Downloaded '{path}' ({chars} chars extracted)"),
-                    Err(e) => format!("Downloaded '{path}', but extraction failed: {e}"),
+                    Ok(chars) => format!("Downloaded '{path}' from {source} ({chars} chars extracted)"),
+                    Err(e) => format!("Downloaded '{path}' from {source}, but extraction failed: {e}"),
                 });
                 if let Err(e) = self.refresh_entry(conn, entry_id) {
                     self.status = Some(e);
@@ -1432,6 +1600,30 @@ impl App {
             ),
             action: PendingAction::Delete { entry_id },
         };
+    }
+
+    // ":" -> "a": opens the file browser at $HOME (falling back to the
+    // process's current directory if $HOME is unset), matching
+    // config::library_root's own $HOME-first convention.
+    fn begin_attach(&mut self, entry_id: i64) {
+        let start = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok());
+        let Some(start) = start else {
+            self.status = Some("cannot determine a starting directory: $HOME is not set".to_string());
+            return;
+        };
+        match list_dir(&start) {
+            Ok(entries) => {
+                self.mode = Mode::FileBrowser {
+                    entry_id,
+                    cwd: start,
+                    entries,
+                    selected: 0,
+                };
+            }
+            Err(e) => self.status = Some(e),
+        }
     }
 
     // Moves the selection to the nearest visible ancestor when the selected
@@ -1871,6 +2063,12 @@ fn draw(frame: &mut Frame, app: &App) {
         } => draw_entry_picker(frame, area, app, filter, rows, *selected, within.is_some()),
         Mode::Confirm { message, .. } => draw_confirm(frame, area, message),
         Mode::Help => draw_help(frame, area),
+        Mode::FileBrowser {
+            entry_id,
+            cwd,
+            entries,
+            selected,
+        } => draw_file_browser(frame, area, app, *entry_id, cwd, entries, *selected),
         Mode::Normal | Mode::Input(..) => {}
     }
 }
@@ -2209,8 +2407,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 " Enter file marked \u{b7} jk move \u{b7} Esc/q close".to_string()
             }
             Mode::Command { .. } => {
-                " e edit \u{b7} f fetch \u{b7} m merge \u{b7} d delete \u{b7} t tag \u{b7} \
-                 u untag \u{b7} Esc close"
+                " e edit \u{b7} f fetch \u{b7} a attach \u{b7} m merge \u{b7} d delete \u{b7} \
+                 t tag \u{b7} u untag \u{b7} Esc close"
                     .to_string()
             }
             Mode::FieldPicker { .. } => " Enter edit \u{b7} jk move \u{b7} Esc back".to_string(),
@@ -2220,6 +2418,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             }
             Mode::Confirm { message, .. } => format!(" {message}"),
             Mode::Help => " Esc/q/any key: close".to_string(),
+            Mode::FileBrowser { .. } => {
+                " jk move \u{b7} l/Enter open/attach \u{b7} h back \u{b7} Esc cancel".to_string()
+            }
             Mode::Normal if !app.filter.is_empty() => format!(" filter: {}", app.filter),
             // The full keymap lived here as one long line that grew with
             // every new feature; it's behind "?" now instead (draw_help).
@@ -2358,7 +2559,7 @@ fn draw_command(frame: &mut Frame, frame_area: Rect, app: &App, entry_id: i64) {
         .unwrap_or("");
 
     let width = 26u16.min(frame_area.width.saturating_sub(4)).max(12);
-    let height = 8u16.min(frame_area.height.saturating_sub(4)).max(3);
+    let height = 9u16.min(frame_area.height.saturating_sub(4)).max(3);
     let (popup, block) = floating_window(frame, frame_area, width, height, cite_key.to_string());
 
     let hotkey = |key: &'static str, label: &'static str| {
@@ -2370,6 +2571,7 @@ fn draw_command(frame: &mut Frame, frame_area: Rect, app: &App, entry_id: i64) {
     let items = vec![
         hotkey("e", "Edit field"),
         hotkey("f", "Fetch PDF"),
+        hotkey("a", "Attach PDF"),
         hotkey("m", "Merge"),
         hotkey("d", "Delete"),
         hotkey("t", "Tag"),
@@ -2464,6 +2666,49 @@ fn draw_entry_picker(
     frame.render_stateful_widget(list, popup, &mut state);
 }
 
+// Attach's directory browser: cwd as the title (truncated if too wide,
+// same as draw_field_picker truncates field values), directories shown
+// with a trailing '/' so they read as distinct from files at a glance.
+fn draw_file_browser(
+    frame: &mut Frame,
+    frame_area: Rect,
+    _app: &App,
+    _entry_id: i64,
+    cwd: &Path,
+    entries: &[BrowserEntry],
+    selected: usize,
+) {
+    let width = frame_area.width.saturating_sub(6).clamp(20, 70);
+    let height = ((entries.len() as u16) + 2)
+        .min(frame_area.height.saturating_sub(4))
+        .max(3);
+    let title = truncate_display(&cwd.display().to_string(), (width as usize).saturating_sub(2));
+    let (popup, block) = floating_window(frame, frame_area, width, height, title);
+
+    let text_width = (width as usize).saturating_sub(2);
+    let items: Vec<ListItem> = entries
+        .iter()
+        .map(|entry| {
+            let label = if entry.is_dir {
+                format!("{}/", entry.name)
+            } else {
+                entry.name.clone()
+            };
+            ListItem::new(truncate_display(&label, text_width))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    if !entries.is_empty() {
+        state.select(Some(selected));
+    }
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    frame.render_stateful_widget(list, popup, &mut state);
+}
+
 // Delete/merge confirmation: just the message, sized to fit it.
 fn draw_confirm(frame: &mut Frame, frame_area: Rect, message: &str) {
     let width = (message.len() as u16 + 4)
@@ -2525,6 +2770,52 @@ mod tests {
         );
         assert_eq!(truncate_display("hello", 1), "\u{2026}");
         assert_eq!(truncate_display("hello", 0), "");
+    }
+
+    #[test]
+    fn list_dir_filters_dotfiles_and_sorts_dirs_first() {
+        let dir = std::env::temp_dir().join("ferref-list-dir-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("zeta_dir")).unwrap();
+        std::fs::write(dir.join("alpha.txt"), b"x").unwrap();
+        std::fs::write(dir.join(".hidden"), b"x").unwrap();
+
+        let entries = list_dir(&dir).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["zeta_dir", "alpha.txt"]);
+        assert!(entries[0].is_dir);
+        assert!(!entries[1].is_dir);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Regression: DirEntry::file_type() uses lstat semantics, so a symlink
+    // pointing at a real directory (common under $HOME) used to be
+    // classified as "not a directory" and the browser could never descend
+    // into it. A broken symlink must still be classified as "not a
+    // directory" (metadata() errors on it), not cause a panic.
+    #[test]
+    #[cfg(unix)]
+    fn list_dir_follows_symlinks_to_classify_dir_vs_file() {
+        let dir = std::env::temp_dir().join("ferref-list-dir-symlink-test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("real_dir")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real_dir"), dir.join("dir_link")).unwrap();
+        std::os::unix::fs::symlink(dir.join("does_not_exist"), dir.join("broken_link")).unwrap();
+
+        let entries = list_dir(&dir).unwrap();
+        let is_dir_of = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("missing entry {name}"))
+                .is_dir
+        };
+        assert!(is_dir_of("dir_link"), "symlink to a directory must classify as a directory");
+        assert!(!is_dir_of("broken_link"), "a broken symlink must not classify as a directory");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
