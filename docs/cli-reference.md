@@ -13,7 +13,7 @@
 | `extract <key>` | (Re)extract text for all of an entry's attachments |
 | `open <key>` | Open attachments in the system viewer |
 | `fetch <key>` | Find and download an open-access PDF for the entry's DOI |
-| `add --from-url <url>` | Add from a publisher's landing page, downloading the PDF it advertises using this machine's network access |
+| `add --url <url>` (alone, no `--type`/`--key`/`--title`) | Add from a publisher's landing page, downloading the PDF it advertises using this machine's network access |
 | `collection new <path>` | Create a collection, `mkdir -p` style |
 | `collection ls` | The whole tree, with entry counts |
 | `collection add` / `rm` | Add or remove an entry's membership. Idempotent |

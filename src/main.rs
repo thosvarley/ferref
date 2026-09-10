@@ -41,7 +41,6 @@ fn main() {
             volume,
             pages,
             doi,
-            from_url,
             url,
             abstract_text,
             json,
@@ -56,7 +55,6 @@ fn main() {
             volume,
             pages,
             doi,
-            from_url,
             url,
             abstract_text,
             json,
@@ -381,10 +379,21 @@ fn main() {
             collection,
             recursive,
         } => {
+            // Unlike list/search's silent "matches nothing" sentinel, a
+            // typo'd --collection here must fail loudly before anything is
+            // written -- an empty export from a bad path is easy to mistake
+            // for a genuinely empty collection.
+            let collection_id = match collection {
+                Some(path) => match db::require_collection(&conn, &path) {
+                    Ok(id) => Some(id),
+                    Err(e) => die(&format!("failed to resolve collection '{path}': {e}")),
+                },
+                None => None,
+            };
             let entries = match db::list_entries(
                 &conn,
                 &db::Filter {
-                    collection_id: resolve_collection_filter(&conn, collection),
+                    collection_id,
                     recursive,
                     ..Default::default()
                 },
@@ -393,15 +402,27 @@ fn main() {
                 Ok(e) => e,
                 Err(e) => die(&format!("failed to list entries: {e}")),
             };
-            let bibtex_str = bibtex::export(&entries, biblatex);
 
             match out {
                 Some(path) => {
+                    // Second, independent guard: even a genuine (non-typo)
+                    // empty collection must not be allowed to truncate an
+                    // existing file at --out to zero bytes.
+                    if entries.is_empty() {
+                        die(&format!(
+                            "no entries to export; refusing to overwrite '{}' with an empty file",
+                            path.display()
+                        ));
+                    }
+                    let bibtex_str = bibtex::export(&entries, biblatex);
                     if let Err(e) = std::fs::write(&path, &bibtex_str) {
                         die(&format!("failed to write '{}': {e}", path.display()));
                     }
                 }
-                None => emit(bibtex_str.trim_end()),
+                None => {
+                    let bibtex_str = bibtex::export(&entries, biblatex);
+                    emit(bibtex_str.trim_end())
+                }
             }
         }
 
@@ -425,7 +446,7 @@ fn main() {
 
 // An explicit --key always wins; otherwise derive one from the entry (first
 // author's last name + year, e.g. "kucsko2013") the way both the DOI and
-// --from-url paths in cmd_add need to, identically.
+// --url (landing-page) paths in cmd_add need to, identically.
 fn resolve_cite_key(
     conn: &rusqlite::Connection,
     explicit: Option<String>,
@@ -440,6 +461,41 @@ fn resolve_cite_key(
     }
 }
 
+// Applies the manual override flags (--journal/--volume/--pages/--abstract/
+// --url/--author) on top of whatever --doi (Crossref) or a scraped landing
+// page already put on `entry`. An explicit flag always wins over a fetched
+// value -- the precedence --url established first; this extends the same
+// rule to every other flag that can accompany --doi/scrape --url, which used
+// to be silently discarded there. --author replaces the fetched author list
+// outright rather than merging with it, same as a fresh `parse_author` per
+// name in the fully-manual path.
+#[allow(clippy::too_many_arguments)] // one per overridable flag
+fn apply_manual_overrides(
+    entry: &mut Entry,
+    year: Option<i32>,
+    journal: Option<String>,
+    volume: Option<String>,
+    pages: Option<String>,
+    abstract_text: Option<String>,
+    url: Option<String>,
+    authors: Vec<String>,
+) -> Result<(), String> {
+    entry.year = year.or(entry.year);
+    entry.journal = journal.or(entry.journal.take());
+    entry.volume = volume.or(entry.volume.take());
+    entry.pages = pages.or(entry.pages.take());
+    entry.abstract_text = abstract_text.or(entry.abstract_text.take());
+    entry.url = url.or(entry.url.take());
+    if !authors.is_empty() {
+        let mut parsed = Vec::with_capacity(authors.len());
+        for raw in &authors {
+            parsed.push(cli::parse_author(raw)?);
+        }
+        entry.authors = parsed;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // one per --flag on `ferref add`, same shape as Command::Add itself
 fn cmd_add(
     conn: &rusqlite::Connection,
@@ -452,20 +508,31 @@ fn cmd_add(
     volume: Option<String>,
     pages: Option<String>,
     doi: Option<String>,
-    from_url: Option<String>,
     url: Option<String>,
     abstract_text: Option<String>,
     json: bool,
 ) {
-    // --from-url is the third way in, alongside --doi and the manual
-    // flags. It reads a landing page's citation_* meta tags; if the
-    // page names a DOI it hands off to the Crossref path below, since
-    // publisher pages abbreviate and Crossref is authoritative.
+    // --url given alone -- none of --type/--key/--title, which clap only
+    // allows when --doi or --url is present -- is the third way in,
+    // alongside --doi and the manual flags: it reads the page's citation_*
+    // meta tags, and if the page names a DOI it hands off to the Crossref
+    // path below, since publisher pages abbreviate and Crossref is
+    // authoritative. With any of --type/--key/--title also given, --url is
+    // just the entry's own url field instead (handled further down,
+    // alongside --journal/--volume/etc.) -- this is the fold of what used
+    // to be a separate --from-url flag into --url, so the two nearly
+    // identical flags don't have to be explained separately.
+    let scrape_url = doi.is_none() && entry_type.is_none() && cite_key.is_none() && title.is_none();
+
     let mut pending_pdf: Option<String> = None;
     let mut doi = doi;
     let mut page: Option<doi::PageMetadata> = None;
 
-    if let Some(page_url) = &from_url {
+    if scrape_url {
+        // clap's required_unless_present_any guarantees --url is Some here:
+        // it's the only thing that could have exempted --type/--key/--title
+        // from being required, since --doi is also None in this branch.
+        let page_url = url.as_deref().expect("--url required by clap here");
         let found = match doi::fetch_page_metadata(page_url) {
             Ok(m) => m,
             Err(e) => die(&format!("failed to read '{page_url}': {e}")),
@@ -474,8 +541,8 @@ fn cmd_add(
             die(&format!(
                 "'{page_url}' has no citation_doi or citation_title meta tag -- \
                  ferref reads the Highwire Press tags publishers emit for Google \
-                 Scholar, and this page doesn't carry them. Add it by hand, or \
-                 with --doi if you know it."
+                 Scholar, and this page doesn't carry them. Add it by hand with \
+                 --type/--key/--title, or with --doi if you know it."
             ));
         }
         pending_pdf = found.pdf_url.clone();
@@ -484,9 +551,11 @@ fn cmd_add(
     }
 
     // --doi fetches metadata from Crossref instead of taking it from
-    // flags -- see Command::Add's docs. Everything else (--type,
-    // --title, --author, --year, ...) is ignored in this mode; only
-    // --key (to override the derived cite_key) still applies.
+    // flags -- see Command::Add's docs. --type/--title are ignored in this
+    // mode (the entry already has both); --key (to override the derived
+    // cite_key) and every other manual flag -- --year/--journal/--volume/
+    // --pages/--abstract/--url/--author -- override whatever Crossref
+    // supplied, via apply_manual_overrides below.
     let mut entry = if let Some(doi_value) = doi {
         let mut entry = match doi::fetch_metadata(&doi_value) {
             Ok(e) => e,
@@ -495,12 +564,19 @@ fn cmd_add(
             )),
         };
         entry.doi = Some(doi_value);
-        // Keep the page we were pointed at. Crossref supplies the
-        // metadata but not this, and dropping it only on the DOI path
-        // meant the common --from-url case lost the URL the user typed
-        // while the rarer fallback kept it.
-        if entry.url.is_none() {
-            entry.url = from_url.clone();
+        // Explicit flags always win over whatever Crossref supplied -- used
+        // to be silently dropped here for everything but --url.
+        if let Err(e) = apply_manual_overrides(
+            &mut entry,
+            year,
+            journal,
+            volume,
+            pages,
+            abstract_text,
+            url,
+            authors,
+        ) {
+            die(&e);
         }
         entry.cite_key = resolve_cite_key(conn, cite_key, &entry);
         entry
@@ -524,17 +600,39 @@ fn cmd_add(
         }
         entry.year = found.year;
         entry.journal = found.journal.clone();
-        entry.url = from_url.clone();
+        // Explicit flags always win over whatever the page's meta tags
+        // supplied -- used to be silently dropped here for everything but
+        // --url.
+        if let Err(e) = apply_manual_overrides(
+            &mut entry,
+            year,
+            journal,
+            volume,
+            pages,
+            abstract_text,
+            url,
+            authors,
+        ) {
+            die(&e);
+        }
         entry.cite_key = resolve_cite_key(conn, cite_key, &entry);
         entry
     } else {
-        // clap's required_unless_present_any guarantees these are Some
-        // when neither --doi nor --from-url was passed.
-        let mut entry = Entry::new(
-            entry_type.expect("--type required by clap without --doi"),
-            cite_key.expect("--key required by clap without --doi"),
-            title.expect("--title required by clap without --doi"),
-        );
+        // Reached whenever --doi is absent and at least one of
+        // --type/--key/--title was given (scrape mode requires *none* of
+        // them) -- so, unlike the old --from-url split, clap alone can't
+        // guarantee all three are present here (a partial --type without
+        // --key/--title, plus --url, satisfies clap's required_unless
+        // check without this branch's own requirements being met).
+        let (entry_type, cite_key, title) = match (entry_type, cite_key, title) {
+            (Some(t), Some(k), Some(ti)) => (t, k, ti),
+            _ => die(
+                "--type, --key, and --title are all required unless --doi is \
+                 given, or --url is given alone (with none of --type/--key/\
+                 --title) to fetch from a landing page",
+            ),
+        };
+        let mut entry = Entry::new(entry_type, cite_key, title);
         for raw in authors {
             match cli::parse_author(&raw) {
                 Ok(author) => entry.add_author(author),
@@ -728,14 +826,13 @@ fn cmd_extract(conn: &rusqlite::Connection, cite_key: String, json: bool) {
 }
 
 fn cmd_import(conn: &rusqlite::Connection, path: PathBuf, json: bool) {
-    let entries = match bibtex::import(&path) {
+    let (entries, mut rejected) = match bibtex::import(&path) {
         Ok(e) => e,
         Err(e) => die(&format!("failed to import '{}': {e}", path.display())),
     };
 
     let mut imported = Vec::new();
     let mut skipped = Vec::new();
-    let mut rejected: Vec<(String, String)> = Vec::new();
 
     for entry in &entries {
         match db::insert_entry(conn, entry) {
@@ -777,6 +874,11 @@ fn cmd_import(conn: &rusqlite::Connection, path: PathBuf, json: bool) {
             skipped.len(),
             rejected.len()
         ));
+        // A count alone doesn't say which entries were dropped or why --
+        // --json always carried this (rejected_keys), plain text didn't.
+        for (cite_key, reason) in &rejected {
+            emit(&format!("  {cite_key}: {reason}"));
+        }
     }
 
     if failed {
@@ -1305,9 +1407,9 @@ fn open_path(path: &str) -> Result<(), String> {
     }
 }
 
-// The PDF half of `add --from-url`: download what the page advertised, attach
-// it, extract its text. Errors are returned rather than fatal -- see the call
-// site for why the entry survives a failed download.
+// The PDF half of `add --url` (landing-page mode): download what the page
+// advertised, attach it, extract its text. Errors are returned rather than
+// fatal -- see the call site for why the entry survives a failed download.
 fn add_pdf_from_page(
     conn: &rusqlite::Connection,
     cite_key: &str,
@@ -1324,9 +1426,10 @@ fn add_pdf_from_page(
 }
 
 // Downloads a PDF and lands it in ./pdfs/ under the entry's cite_key, then
-// attaches it. Shared by `fetch` (URL from Unpaywall) and `add --from-url` (URL
-// from a landing page's citation_pdf_url) -- the two differ only in where the
-// URL came from, and writing it twice is how two copies drift apart.
+// attaches it. Shared by `fetch` (URL from Unpaywall) and `add --url` in
+// landing-page mode (URL from a landing page's citation_pdf_url) -- the two
+// differ only in where the URL came from, and writing it twice is how two
+// copies drift apart.
 //
 // Returns (stored path, attachment id, whether the file was already there).
 fn land_downloaded_pdf(
@@ -1340,28 +1443,20 @@ fn land_downloaded_pdf(
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("failed to create '{}': {e}", dir.display()))?;
 
-    let (target, already_present) = pdf_target(conn, cite_key, &dir, &filename, "pdf", None)?;
+    let (mut target, already_present) = pdf_target(conn, cite_key, &dir, &filename, "pdf", None)?;
 
     if !already_present {
         let bytes =
             doi::download_pdf(pdf_url).map_err(|e| format!("failed to download PDF: {e}"))?;
-        // create_new claims the name atomically, the same rule copy_into_library
-        // follows: two downloads racing on one cite_key both saw a free name,
-        // and one silently overwrote the other.
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&target)
-        {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(format!(
-                    "'{}' appeared while downloading; run the command again",
-                    target.display()
-                ));
-            }
-            Err(e) => return Err(format!("failed to create '{}': {e}", target.display())),
-        }
+        // B9: the download already happened above, so discarding it on a
+        // name conflict (another process claiming `target` in the meantime)
+        // and telling the user to run the command again threw away
+        // completed work. claim_free_name is the same atomic-claim-with-
+        // retry-to-the-next-name primitive copy_into_library already uses
+        // for the identical race -- fall through to whatever name it hands
+        // back instead of failing on the first conflict.
+        target = claim_free_name(&dir, &filename, "pdf")
+            .map_err(|e| format!("failed to claim a filename for '{filename}' in {}: {e}", dir.display()))?;
         if let Err(e) = std::fs::write(&target, &bytes) {
             let _ = std::fs::remove_file(&target);
             return Err(format!("failed to save PDF to '{}': {e}", target.display()));
@@ -1785,40 +1880,74 @@ fn collapse_whitespace(s: &str) -> String {
 // lowercased copy are valid offsets into the original `text` -- this is
 // what makes slicing `text` (not the lowercased copy) at those offsets
 // correct, snippets keep the source's original casing.
+// B1: SQLite's FTS5 MATCH (the SQL-layer check that gates whether this
+// function even runs) does full Unicode case folding, so an ASCII-only
+// lowercase here used to disagree with it -- "café" (lowercase é) wouldn't
+// find "CAFÉ" in the stored text, and text_search_results's "0 Rust-side
+// matches means no match" guard would then drop an entry SQL already said
+// matched.
+//
+// Matching here is character-count-based (a candidate window is
+// `query.chars().count()` chars wide, compared via `.to_lowercase()`) rather
+// than a byte-level ASCII transform of the whole text -- this sidesteps
+// needing to remap byte offsets between the original and a lowercased copy,
+// since match_start/match_end always come from the original text's own
+// char_indices(). This is not fully Unicode-text-segmentation-correct for
+// the rare case where lowercasing changes a character's expansion length in
+// a way that shifts alignment mid-window (e.g. Turkish İ, German ẞ) -- see
+// the test below for that edge case, which we only require not to panic.
 fn find_snippets(
     text: &str,
     query: &str,
     context_bytes: usize,
     max_matches: usize,
 ) -> (Vec<String>, usize) {
-    let lower_text = text.to_ascii_lowercase();
-    let lower_query = query.to_ascii_lowercase();
+    let lower_query = query.to_lowercase();
     if lower_query.is_empty() {
         return (Vec::new(), 0);
     }
+    let query_char_count = query.chars().count();
+
+    // (byte offset, char) pairs in order -- gives us real char boundaries to
+    // slide a query-width window over, and to use directly for the context
+    // window below.
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
 
     let mut snippets = Vec::new();
     let mut count = 0;
-    let mut cursor = 0;
-    while let Some(offset) = lower_text[cursor..].find(&lower_query) {
-        let match_start = cursor + offset;
-        let match_end = match_start + lower_query.len();
-        count += 1;
+    let mut i = 0;
+    while i + query_char_count <= chars.len() {
+        let match_start = chars[i].0;
+        let match_end = chars
+            .get(i + query_char_count)
+            .map(|&(byte, _)| byte)
+            .unwrap_or(text.len());
 
-        if snippets.len() < max_matches {
-            let start = text.floor_char_boundary(match_start.saturating_sub(context_bytes));
-            let end = text.ceil_char_boundary((match_end + context_bytes).min(text.len()));
-            let mut snippet = collapse_whitespace(&text[start..end]);
-            if start > 0 {
-                snippet = format!("…{snippet}");
+        let window: String = chars[i..i + query_char_count]
+            .iter()
+            .map(|&(_, c)| c)
+            .collect();
+
+        if window.to_lowercase() == lower_query {
+            count += 1;
+
+            if snippets.len() < max_matches {
+                let start = text.floor_char_boundary(match_start.saturating_sub(context_bytes));
+                let end = text.ceil_char_boundary((match_end + context_bytes).min(text.len()));
+                let mut snippet = collapse_whitespace(&text[start..end]);
+                if start > 0 {
+                    snippet = format!("…{snippet}");
+                }
+                if end < text.len() {
+                    snippet = format!("{snippet}…");
+                }
+                snippets.push(snippet);
             }
-            if end < text.len() {
-                snippet = format!("{snippet}…");
-            }
-            snippets.push(snippet);
+
+            i += query_char_count; // non-overlapping: advance past this match
+        } else {
+            i += 1;
         }
-
-        cursor = match_end; // non-overlapping: advance past this match
     }
 
     (snippets, count)
@@ -1910,6 +2039,91 @@ fn format_text_search_result(result: &TextSearchResult) -> String {
 mod tests {
     use super::*;
 
+    // B4 regression: --doi/scrape --url mode used to discard --abstract/
+    // --journal/--volume/--pages/--author outright (only --url was fixed
+    // earlier). An explicit flag must override whatever Crossref/the page
+    // supplied.
+    #[test]
+    fn apply_manual_overrides_lets_explicit_flags_win_over_fetched_values() {
+        let mut entry = Entry::new(
+            "article".to_string(),
+            "smith2024".to_string(),
+            "Fetched Title".to_string(),
+        );
+        entry.year = Some(2020);
+        entry.journal = Some("Fetched Journal".to_string());
+        entry.volume = Some("1".to_string());
+        entry.pages = Some("1-2".to_string());
+        entry.abstract_text = Some("Fetched abstract".to_string());
+        entry.url = Some("https://fetched.example".to_string());
+        entry.add_author(Author::new("Fetched".to_string(), Some("Author".to_string())));
+
+        apply_manual_overrides(
+            &mut entry,
+            Some(1999),
+            Some("MY JOURNAL".to_string()),
+            Some("9".to_string()),
+            Some("100-200".to_string()),
+            Some("MY ABSTRACT".to_string()),
+            Some("https://mine.example".to_string()),
+            vec!["Doe, Jane".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(entry.year, Some(1999));
+        assert_eq!(entry.journal, Some("MY JOURNAL".to_string()));
+        assert_eq!(entry.volume, Some("9".to_string()));
+        assert_eq!(entry.pages, Some("100-200".to_string()));
+        assert_eq!(entry.abstract_text, Some("MY ABSTRACT".to_string()));
+        assert_eq!(entry.url, Some("https://mine.example".to_string()));
+        assert_eq!(entry.authors.len(), 1);
+        assert_eq!(entry.authors[0].last_name, "Doe");
+        assert_eq!(entry.authors[0].first_name, Some("Jane".to_string()));
+    }
+
+    // No override flags given: fetched/scraped values must be left alone,
+    // including the author list (an empty --author vector is a no-op, not
+    // "wipe the authors Crossref found").
+    #[test]
+    fn apply_manual_overrides_is_a_no_op_when_nothing_is_overridden() {
+        let mut entry = Entry::new(
+            "article".to_string(),
+            "smith2024".to_string(),
+            "Fetched Title".to_string(),
+        );
+        entry.year = Some(2020);
+        entry.journal = Some("Fetched Journal".to_string());
+        entry.add_author(Author::new("Fetched".to_string(), Some("Author".to_string())));
+
+        apply_manual_overrides(&mut entry, None, None, None, None, None, None, vec![]).unwrap();
+
+        assert_eq!(entry.year, Some(2020));
+        assert_eq!(entry.journal, Some("Fetched Journal".to_string()));
+        assert_eq!(entry.authors.len(), 1);
+        assert_eq!(entry.authors[0].last_name, "Fetched");
+    }
+
+    // A malformed --author must fail loudly, same as the fully-manual path.
+    #[test]
+    fn apply_manual_overrides_rejects_an_unparsable_author() {
+        let mut entry = Entry::new(
+            "article".to_string(),
+            "smith2024".to_string(),
+            "Title".to_string(),
+        );
+        let result = apply_manual_overrides(
+            &mut entry,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec!["   ".to_string()],
+        );
+        assert!(result.is_err());
+    }
+
     // The reuse rule: a name is only "already there" when the file at it
     // belongs to this entry AND matches what's being copied in. Getting this
     // wrong drops the second file a user attaches to one entry.
@@ -1947,6 +2161,33 @@ mod tests {
         let (skipped, present) = pick_target(&dir, "smith2024", "pdf", &[], None).unwrap();
         assert_eq!(skipped, dir.join("smith2024-2.pdf"));
         assert!(!present);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // B9: land_downloaded_pdf now claims its target via this same primitive
+    // (instead of a single create_new attempt that gave up on conflict), so
+    // proving claim_free_name itself retries to the next free name on a
+    // taken one is sufficient coverage -- the race inside a real download is
+    // not independently unit-testable, per this codebase's existing
+    // convention for these races (see copy_into_library's doc comment).
+    #[test]
+    fn claim_free_name_retries_to_the_next_name_on_conflict() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferref-claim-free-name-test-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Pre-claim the first two names, simulating another process having
+        // already landed a download there.
+        std::fs::write(dir.join("paper.pdf"), b"one").unwrap();
+        std::fs::write(dir.join("paper-2.pdf"), b"two").unwrap();
+
+        let claimed = claim_free_name(&dir, "paper", "pdf").unwrap();
+        assert_eq!(claimed, dir.join("paper-3.pdf"));
+        assert!(claimed.is_file(), "claim_free_name must leave a placeholder file behind");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2007,5 +2248,29 @@ mod tests {
         let (snippets, count) = find_snippets(text, "match", 1, 3);
         assert_eq!(count, 1);
         assert_eq!(snippets, vec!["…ématché…".to_string()]);
+    }
+
+    // B1 regression: SQL's FTS5 MATCH does full Unicode case folding, so a
+    // lowercase query must still find an uppercase-accented match -- an
+    // ASCII-only lowercase pass (the old implementation) misses this.
+    #[test]
+    fn find_snippets_matches_unicode_case_insensitively() {
+        let text = "the drink was CAFÉ flavored";
+        let (snippets, count) = find_snippets(text, "café", 3, 3);
+        assert_eq!(count, 1, "lowercase query must find the uppercase match");
+        assert_eq!(snippets, vec!["…as CAFÉ fl…".to_string()]);
+    }
+
+    // Edge case: a character whose lowercase form has a different length
+    // than its uppercase form (Turkish İ lowercases to "i̇", two chars) must
+    // not panic -- exact snippet/count behavior isn't guaranteed correct
+    // here, just that it doesn't blow up.
+    #[test]
+    fn find_snippets_does_not_panic_on_a_length_changing_case_fold() {
+        let text = "İstanbul is a city, as is ISTANBUL";
+        let (_snippets, _count) = find_snippets(text, "istanbul", 5, 3);
+
+        let text2 = "ß appears here, and SS appears there too";
+        let (_snippets2, _count2) = find_snippets(text2, "ss", 5, 3);
     }
 }

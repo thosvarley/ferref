@@ -316,7 +316,7 @@ fn handle_input_key(
                     };
                 }
                 InputKind::ExportPath { ids } => {
-                    app.export_bibtex(&ids, buffer.trim());
+                    app.export_bibtex(conn, &ids, buffer.trim());
                     app.mode = Mode::Normal;
                 }
                 InputKind::Tag { ids, add } => {
@@ -1399,14 +1399,22 @@ impl App {
     // export` which always writes everything. Legacy BibTeX only, matching
     // that command's own default; --biblatex has no TUI equivalent, same as
     // Fetch has no --email flag here.
-    fn export_bibtex(&mut self, ids: &[i64], path: &str) {
+    fn export_bibtex(&mut self, conn: &Connection, ids: &[i64], path: &str) {
         if path.is_empty() {
             self.status = Some("export path cannot be empty".to_string());
             return;
         }
+        // B7: `marked` persists across a collection switch on purpose (mark
+        // some papers, browse elsewhere, mark more, then bulk-export
+        // together), but self.entries only holds the currently loaded
+        // collection -- a marked id from a previous collection falls back to
+        // a direct DB lookup instead of being silently dropped.
         let selected: Vec<Entry> = ids
             .iter()
-            .filter_map(|&id| self.entry_by_id(id).cloned())
+            .filter_map(|&id| match self.entry_by_id(id).cloned() {
+                Some(e) => Some(e),
+                None => db::get_entry_by_id(conn, id).ok().flatten(),
+            })
             .collect();
         let bibtex_str = crate::bibtex::export(&selected, false);
         match std::fs::write(path, &bibtex_str) {
@@ -1430,9 +1438,15 @@ impl App {
             self.status = Some("tag name cannot be empty".to_string());
             return;
         }
+        // B7: same fallback as export_bibtex -- a marked id from a
+        // collection that isn't currently loaded must not be silently
+        // dropped from a bulk tag/untag.
         let cite_keys: Vec<String> = ids
             .iter()
-            .filter_map(|&id| self.entry_by_id(id).map(|e| e.cite_key.clone()))
+            .filter_map(|&id| match self.entry_by_id(id) {
+                Some(e) => Some(e.cite_key.clone()),
+                None => db::cite_key_for_id(conn, id).ok().flatten(),
+            })
             .collect();
 
         let mut changed = 0usize;

@@ -188,12 +188,15 @@ copy, that's the end of it.
 a paper your institution subscribes to: Unpaywall correctly says "not open"
 while your browser, on the campus VPN, downloads it without complaint.
 
-`--from-url` asks a different question — it just requests the page, reads the
-`citation_*` meta tags publishers emit for Google Scholar, and downloads the PDF
-the page advertises:
+`--url`, given **alone** — with none of `--type`/`--key`/`--title` — asks a
+different question — it just requests the page, reads the `citation_*` meta
+tags publishers emit for Google Scholar, and downloads the PDF the page
+advertises. (Give `--url` alongside `--type`/`--key`/`--title` instead, and
+it's just the entry's own URL field, same as `--journal` or `--volume` — no
+page is fetched.)
 
 ```console
-$ ferref add --from-url https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-020-3494-x
+$ ferref add --url https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-020-3494-x
 MEPHAS: an interactive graphical user interface... [zhou2020]
   ...
 Attached '/home/you/papers/pdfs/zhou2020.pdf'
@@ -205,7 +208,7 @@ paywall bypass — ferref makes an ordinary request and keeps whatever the serve
 chooses to return. Off the VPN you get the metadata and an honest refusal:
 
 ```console
-$ ferref add --from-url https://www.nature.com/articles/nature14539
+$ ferref add --url https://www.nature.com/articles/nature14539
 Deep learning [lecun2015]
   ...
 Warning: failed to download PDF: downloaded content is not a PDF (missing %PDF
@@ -227,7 +230,7 @@ Measured coverage, from outside any VPN:
 | Wiley | no — 403s the page to non-browser clients | — |
 | science.org | no — emits no `citation_*` tags | — |
 
-Worth knowing: `--from-url` also succeeds on some open-access papers `fetch`
+Worth knowing: a bare `--url` also succeeds on some open-access papers `fetch`
 can't get, because Unpaywall lists only a landing page for them. PLOS above is
 exactly that case.
 

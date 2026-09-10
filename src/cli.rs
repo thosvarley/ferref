@@ -13,19 +13,23 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Add a new entry. Either give --type/--key/--title directly, or give
-    /// --doi and let Crossref fill them in.
+    /// Add a new entry. Either give --type/--key/--title directly, give
+    /// --doi and let Crossref fill them in, or give --url alone and let the
+    /// page's own citation_* meta tags fill them in.
     Add {
-        /// Required unless --doi or --from-url is given, which fetch it.
-        #[arg(long = "type", required_unless_present_any = ["doi", "from_url"])]
+        /// Required unless --doi is given, or --url is given alone (with
+        /// none of --type/--key/--title) to fetch it from that page.
+        #[arg(long = "type", required_unless_present_any = ["doi", "url"])]
         entry_type: Option<String>,
-        /// Required unless --doi or --from-url is given, which derive one
-        /// (first author's last name + year, e.g. "kucsko2013"). An explicit
-        /// --key always wins over a derived one.
-        #[arg(long = "key", required_unless_present_any = ["doi", "from_url"])]
+        /// Required unless --doi is given, or --url is given alone (with
+        /// none of --type/--key/--title) to derive one (first author's last
+        /// name + year, e.g. "kucsko2013"). An explicit --key always wins
+        /// over a derived one.
+        #[arg(long = "key", required_unless_present_any = ["doi", "url"])]
         cite_key: Option<String>,
-        /// Required unless --doi or --from-url is given, which fetch it.
-        #[arg(long, required_unless_present_any = ["doi", "from_url"])]
+        /// Required unless --doi is given, or --url is given alone (with
+        /// none of --type/--key/--title) to fetch it from that page.
+        #[arg(long, required_unless_present_any = ["doi", "url"])]
         title: Option<String>,
         /// Repeatable, each as "Last, First"
         #[arg(long = "author")]
@@ -40,14 +44,15 @@ pub enum Command {
         pages: Option<String>,
         #[arg(long)]
         doi: Option<String>,
-        /// Add from a publisher's landing page instead of a DOI: reads the
-        /// page's citation_* meta tags, prefers Crossref when the page names a
+        /// The paper's URL. Given alone -- with none of --type/--key/--title
+        /// -- this is instead treated as a landing page to fetch from: reads
+        /// its citation_* meta tags, prefers Crossref when the page names a
         /// DOI, and downloads the PDF the page advertises. The download uses
         /// this machine's network position, so on an institutional VPN or
-        /// proxy it gets what your browser would get -- and off it, usually a
-        /// login page, which is rejected rather than saved.
-        #[arg(long = "from-url", conflicts_with = "doi")]
-        from_url: Option<String>,
+        /// proxy it gets what your browser would get -- and off it, usually
+        /// a login page, which is rejected rather than saved. Given
+        /// alongside --type/--key/--title (or --doi), it's just stored as
+        /// the entry's url field, same as --journal or --volume.
         #[arg(long)]
         url: Option<String>,
         #[arg(long = "abstract")]

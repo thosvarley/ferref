@@ -11,7 +11,13 @@ use biblatex::{
 
 use crate::models::{Author, Entry};
 
-pub fn import(path: &Path) -> Result<Vec<Entry>, String> {
+// Entries parsed successfully, and entries rejected during parsing itself
+// (currently just a missing/empty title -- see from_biblatex) as
+// (cite_key, reason) pairs -- the same shape cmd_import already uses for
+// entries rejected at insert time, so the two can be merged into one report.
+type ImportResult = (Vec<Entry>, Vec<(String, String)>);
+
+pub fn import(path: &Path) -> Result<ImportResult, String> {
     let src = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read '{}': {e}", path.display()))?;
     parse_bibtex_str(&src)
@@ -19,9 +25,17 @@ pub fn import(path: &Path) -> Result<Vec<Entry>, String> {
 
 // Factored out of `import` so tests can feed a string directly instead of
 // writing a temp file.
-fn parse_bibtex_str(src: &str) -> Result<Vec<Entry>, String> {
+fn parse_bibtex_str(src: &str) -> Result<ImportResult, String> {
     let bib = Bibliography::parse(src).map_err(|e| format!("failed to parse BibTeX: {e}"))?;
-    Ok(bib.iter().map(from_biblatex).collect())
+    let mut entries = Vec::new();
+    let mut rejected = Vec::new();
+    for e in bib.iter() {
+        match from_biblatex(e) {
+            Ok(entry) => entries.push(entry),
+            Err(reason) => rejected.push((e.key.clone(), reason)),
+        }
+    }
+    Ok((entries, rejected))
 }
 
 // Two output formats, because they are genuinely two formats and not a
@@ -44,13 +58,23 @@ pub fn export(entries: &[Entry], biblatex_syntax: bool) -> String {
 
 // --- biblatex::Entry -> our Entry ---------------------------------------
 
-fn from_biblatex(e: &BibEntry) -> Entry {
+// A missing (or present-but-empty, post-trim) title used to default to ""
+// and import successfully -- inconsistent with every other path that puts a
+// title in the DB (`add --title` is required by clap, the TUI's edit
+// rejects an empty title outright). Reported as a rejection instead, the
+// same "bad data" treatment cmd_import already gives an entry that fails
+// db::insert_entry.
+fn from_biblatex(e: &BibEntry) -> Result<Entry, String> {
     let entry_type = entry_type_to_string(&e.entry_type);
     let title = e
         .title()
         .ok()
         .map(|c| c.format_verbatim())
         .unwrap_or_default();
+
+    if title.trim().is_empty() {
+        return Err(format!("entry '{}' has no title", e.key));
+    }
 
     let mut entry = Entry::new(entry_type, e.key.clone(), title);
 
@@ -79,7 +103,7 @@ fn from_biblatex(e: &BibEntry) -> Entry {
         .map(|c| split_keywords(&c.format_verbatim()))
         .unwrap_or_default();
 
-    entry
+    Ok(entry)
 }
 
 // BibTeX's `keywords` is a free-text field with no agreed separator; comma
@@ -279,7 +303,8 @@ mod tests {
         entry.abstract_text = Some("An abstract about things.".into());
 
         let bibtex_str = export(std::slice::from_ref(&entry), false);
-        let imported = parse_bibtex_str(&bibtex_str).unwrap();
+        let (imported, rejected) = parse_bibtex_str(&bibtex_str).unwrap();
+        assert!(rejected.is_empty());
         assert_eq!(imported.len(), 1);
         let round_tripped = &imported[0];
 
@@ -304,7 +329,8 @@ mod tests {
             journal = {Science},
             year = {2024},
         }"#;
-        let entries = parse_bibtex_str(src).unwrap();
+        let (entries, rejected) = parse_bibtex_str(src).unwrap();
+        assert!(rejected.is_empty());
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].journal.as_deref(), Some("Science"));
         assert_eq!(entries[0].year, Some(2024));
@@ -317,7 +343,8 @@ mod tests {
             journaltitle = {Cell},
             year = {2023},
         }"#;
-        let entries = parse_bibtex_str(src).unwrap();
+        let (entries, rejected) = parse_bibtex_str(src).unwrap();
+        assert!(rejected.is_empty());
         assert_eq!(entries[0].journal.as_deref(), Some("Cell"));
     }
 
@@ -327,7 +354,8 @@ mod tests {
             title = {Electronic Paper},
             pages = {e12345},
         }"#;
-        let entries = parse_bibtex_str(src).unwrap();
+        let (entries, rejected) = parse_bibtex_str(src).unwrap();
+        assert!(rejected.is_empty());
         assert_eq!(entries[0].pages.as_deref(), Some("e12345"));
     }
 
@@ -337,7 +365,8 @@ mod tests {
             title = {No Name},
             author = {Smith, John and , }
         }"#;
-        let entries = parse_bibtex_str(src).unwrap();
+        let (entries, rejected) = parse_bibtex_str(src).unwrap();
+        assert!(rejected.is_empty());
         assert_eq!(entries[0].authors.len(), 1);
         assert_eq!(entries[0].authors[0].last_name, "Smith");
     }
@@ -348,12 +377,42 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // B5: a missing (or empty) title used to default to "" and import
+    // successfully -- inconsistent with every other path that requires a
+    // real title. It must be rejected instead, without aborting a sibling
+    // entry in the same file that does have a title (this codebase's usual
+    // per-entry partial-failure rule).
+    #[test]
+    fn entry_missing_title_is_rejected_but_sibling_entry_still_imports() {
+        let src = r#"@article{notitle2021,
+            author = {Smith, John},
+        }
+        @article{blanktitle2021,
+            title = {},
+        }
+        @article{realtitle2021,
+            title = {A Real Title},
+        }"#;
+        let (entries, rejected) = parse_bibtex_str(src).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cite_key, "realtitle2021");
+
+        assert_eq!(rejected.len(), 2);
+        let rejected_keys: Vec<&str> = rejected.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(rejected_keys.contains(&"notitle2021"));
+        assert!(rejected_keys.contains(&"blanktitle2021"));
+        for (_, reason) in &rejected {
+            assert!(reason.contains("title"));
+        }
+    }
+
     fn round_trip(entry: Entry) -> Entry {
         let exported = export(&[entry], false);
-        parse_bibtex_str(&exported)
-            .expect("exported BibTeX should re-parse")
-            .pop()
-            .expect("round trip should yield an entry")
+        let (mut entries, rejected) =
+            parse_bibtex_str(&exported).expect("exported BibTeX should re-parse");
+        assert!(rejected.is_empty());
+        entries.pop().expect("round trip should yield an entry")
     }
 
     // BibTeX reads a two-comma name as "Last, Suffix, First", so folding our
@@ -401,7 +460,9 @@ mod tests {
 
         // Tags round-trip through `keywords`, in order, either way.
         for exported in [legacy, modern] {
-            let back = parse_bibtex_str(&exported).unwrap().pop().unwrap();
+            let (mut entries, rejected) = parse_bibtex_str(&exported).unwrap();
+            assert!(rejected.is_empty());
+            let back = entries.pop().unwrap();
             assert_eq!(back.tags, vec!["entropy", "information theory"]);
         }
     }

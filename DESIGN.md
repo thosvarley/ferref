@@ -1286,7 +1286,8 @@ preprints (and every OSF-hosted preprint server — PsyArXiv, SocArXiv,
 EdArXiv, ...), and preprints.org. All four are public preprint servers
 with no access control on their PDFs, so this stays inside the existing
 non-goal boundary ("no paywall circumvention") — the same shape as
-Unpaywall or `add --from-url`: an ordinary request, revalidated by the
+Unpaywall or `add --url` in landing-page mode (Phase 13; folded into `--url`
+by Phase 21): an ordinary request, revalidated by the
 existing SSRF guard, with the existing `%PDF` magic-byte check as the
 final backstop against landing garbage. No new dependency.
 
@@ -1508,6 +1509,238 @@ as built.
 
 ---
 
+## Phase 21 — `add`: fold `--from-url` into `--url`
+
+Phase 13 added `--from-url <page>` as a third way into `add`, alongside the
+manual `--type`/`--key`/`--title` flags and `--doi`. It sat next to a
+fourth, unrelated-looking flag: plain `--url`, which just set the entry's
+own `url` column, the same as `--journal` or `--volume`. Two flags with
+"url" in the name, doing genuinely different things, is exactly the kind
+of surface that's confusing from the outside even though each one made
+sense in isolation — and they hid a real bug: `cmd_add`'s DOI and
+`--from-url` branches only ever wrote `entry.url` from `from_url`, never
+from a manually-passed `--url`, so `ferref add --doi X --url Y` silently
+dropped `Y`.
+
+Consolidated into one `--url` flag, dispatched on what else was passed:
+
+- `--url <page>` given **alone** — none of `--type`/`--key`/`--title` —
+  is treated exactly as `--from-url` used to be: fetch the page, read its
+  `citation_*` meta tags, prefer Crossref when the page names a DOI,
+  download the PDF it advertises.
+- `--url <value>` given **alongside** `--type`/`--key`/`--title` (or
+  `--doi`) is just the entry's own `url` field, as it always was — and
+  now actually applies in every mode, including `--doi`, fixing the
+  silent-drop bug above (an explicit `--url` wins over whatever Crossref
+  or the scraped page supplied).
+
+clap's `required_unless_present_any` on `--type`/`--key`/`--title` now
+reads `["doi", "url"]` (was `["doi", "from_url"]`), which only proves "at
+least one of `--doi`/`--url` is present" — it can't express "none of
+`--type`/`--key`/`--title` was *also* given," so a partial manual
+invocation (e.g. `--type` alone, plus `--url`, no `--doi`) now clap-
+validates but isn't a legitimate scrape-mode or manual-mode call. Caught
+at runtime instead: `cmd_add`'s manual-mode branch requires all three of
+`entry_type`/`cite_key`/`title` together via a `match` (`die()` with a
+clear message otherwise) rather than the old clap-guaranteed
+`.expect()`s, and a `scrape_url` bool computed up front
+(`doi.is_none() && entry_type.is_none() && cite_key.is_none() &&
+title.is_none()`) decides which of the two meanings `--url` has for this
+invocation, checked before either branch runs.
+
+`add_pdf_from_page`/`land_downloaded_pdf`'s comments and the `docs/`
+tutorial/CLI reference were updated to `--url` throughout; Phase 13's own
+section above is left as-written (an accurate record of what shipped at
+the time) rather than rewritten in place.
+
+Delegation: **no / no**. Mechanical: one function's dispatch logic, no
+new trust boundary (still the same `fetch_page_metadata`/`fetch_metadata`
+calls Phase 13/8 already hardened), same shape as Phase 4/17. Verified
+directly against live network calls in a scratch `FERREF_HOME`, not just
+`cargo test`: manual mode, the `--type`-without-`--key`/`--title` error
+path, scrape mode against a real landing page (`nature.com`, matching
+Phase 13's own documented "metadata yes, PDF no — paywall interstitial"
+case), and `--doi` + `--url` together confirming the explicit override
+now actually lands in the stored entry instead of being silently dropped.
+
+---
+
+## Phase 22 — Opus audit: 9 bugs found and fixed
+
+An Opus-model adversarial review, given no diff to anchor on -- a full
+read of the codebase against its own stated principles (`DESIGN.md`'s
+design principles, `CLAUDE.md`'s conventions), conciseness, and friction
+between the CLI and TUI -- found nine real bugs, several of them data-loss
+or silent-failure shaped. Fixed here, in the order the audit ranked them
+by severity:
+
+**B2 -- `merge` could silently break a shared attachment.** `db::merge_entries`
+renames a drop-side attachment's file onto a name built from keep's
+cite_key. If keep and drop both had an `attachments` row pointing at the
+*same file* (a state the schema explicitly allows -- `db.rs`'s own
+comment on the `attachments` table names it), the rename moved the file
+out from under whichever row wasn't the one being processed, and `merge`
+reported success while `ferref doctor` would later find the orphaned row.
+Fixed: before renaming, check whether any other `attachments` row already
+points at the path being moved; if so, skip the filesystem rename and
+just re-parent the DB row (`UPDATE OR IGNORE`, since `(entry_id, path)`
+is unique) instead of touching a file another row still correctly
+depends on. Two regression tests: the two-way shared case (keep+drop) and
+the three-way case (drop shares a file with some unrelated third entry,
+not keep) -- both must end up with every surviving row pointing at a file
+that actually exists.
+
+**B3 -- `export` could silently blank an existing `.bib` file.** Two
+independent causes, both fixed: a typo'd `--collection` path resolved to
+the same "matches nothing" sentinel `list`/`search` deliberately use (so
+a bad path returns empty rather than the whole library) -- reasonable for
+a read, wrong for a command that writes a file, since it meant a typo
+produced a silent zero-entry export. `export` now resolves `--collection`
+through the erroring form every other collection-taking command already
+uses (`db::require_collection`, now `pub`). Independently: `export --out`
+now refuses to write when the entry list is empty, regardless of cause,
+rather than truncating whatever was already at that path.
+
+**B4 -- `add --doi`/`add --url` (scrape mode) silently discarded manual
+override flags.** Earlier the same day, Phase 21 fixed this for `--url`
+alone (`entry.url = url.clone().or(entry.url)`); the identical bug
+remained, unfixed, for `--abstract`, `--journal`, `--volume`, `--pages`,
+`--author`, and (caught in the follow-up review round below) `--year` --
+all six silently dropped when combined with `--doi` or a bare `--url`.
+Fixed by extracting `apply_manual_overrides`, a pure helper applying all
+seven fields as explicit-wins-over-fetched overrides, called identically
+from both the `--doi` and page-scrape branches -- fixing the bug in one
+place instead of twice, and giving `cmd_add`'s two near-identical
+branches one shared implementation of the part that was actually
+duplicated (a D1-class fix, not just a B4 one).
+
+**B1 -- third FTS5 silent-failure, Unicode case folding.** SQLite's FTS5
+`MATCH` (Phase 15's trigram search) does full Unicode case folding;
+`find_snippets` (the Rust-side pass that locates match positions for
+snippet text) only folded ASCII. So SQL would correctly match an entry
+containing `"CAFÉ"` against a query of `"café"`, `find_snippets` would
+then find zero Rust-side matches, and `text_search_results`'s existing
+"0 matches means treat as no match" defensive skip (written for a case
+believed unreachable) silently dropped the entry -- the exact failure
+shape Phase 15's own `search --text ""` fix exists to prevent, reachable
+again through a different door. Fixed by comparing `char`-window
+lowercased text against the lowercased query, anchored on the original
+string's `char_indices()` (not a separately-built lowercased copy, which
+would need error-prone byte-offset remapping since `to_lowercase()` isn't
+guaranteed 1:1 in byte length for every Unicode character). Verified not
+to panic on the specific characters where that byte-length assumption
+breaks (Turkish `İ`, German `ß`/`ẞ`), and checked for pathological
+performance on realistic (tens-of-KB) text -- fine.
+
+**B5 -- `import` accepted a missing title as `""`.** Every other path in
+this codebase rejects an empty required field before it reaches the DB
+(`add --title` is clap-required; the TUI's editor explicitly rejects an
+empty title; `cli::parse_author` rejects an empty last name for the
+identical "NOT NULL still accepts `\"\"`" reason) -- `bibtex::import`
+alone let a `.bib` entry with no `title` field through as a real row with
+an empty title, invisible in `list` and unfindable by `/` in the TUI.
+Fixed: `from_biblatex` now returns `Result`, rejecting a missing/empty
+(post-trim) title; `import`/`parse_bibtex_str` return
+`(Vec<Entry>, Vec<(cite_key, reason)>)`, merged into the same
+already-existing "imported/skipped/rejected" accounting `cmd_import` uses
+for duplicate-DOI rejections at insert time -- one report, two sources of
+rejection. While fixing this, also closed a smaller pre-existing gap the
+follow-up review surfaced: the plain-text (non-`--json`) `import` output
+reported only a rejection *count*, never which entries or why, even
+though `--json`'s `rejected_keys` always carried both -- plain text now
+prints one `cite_key: reason` line per rejection too.
+
+**B7 -- TUI bulk tag/untag and bulk export silently dropped
+out-of-collection marked entries.** `App::marked` deliberately survives a
+collection change (mark some papers, browse elsewhere, mark more, then
+bulk-act on all of them together is a real, useful workflow) -- but
+`apply_tag`/`export_bibtex` resolved their targets via `entry_by_id`,
+which only searches `self.entries`, the *currently loaded* collection's
+rows. So a mark made in a previously-viewed collection was silently
+skipped, while the footer reported success for whatever *was* found
+("Tagged 1 of 1 entry" -- true, silently incomplete). Bulk *filing* (`c`)
+never had this bug, since it already worked against raw ids directly.
+Fixed by adding two DB-backed fallbacks (`db::get_entry_by_id`,
+`db::cite_key_for_id`, same shape as the existing `get_entry(cite_key)`)
+that `apply_tag`/`export_bibtex` now use whenever `entry_by_id` misses,
+so a bulk action targets what's actually marked, not just what's on
+screen.
+
+**B9 -- a `fetch` download race discarded a completed download.**
+`land_downloaded_pdf` picked a target filename (look-only), downloaded up
+to 100MB, then claimed the name with a single `create_new`; on conflict
+it told the user to run the command again, discarding the bytes.
+`copy_into_library` already handles the identical race correctly, looping
+to the next free name via `claim_free_name` rather than giving up. Fixed
+by having `land_downloaded_pdf` use the same already-tested primitive
+instead of a second, worse implementation of the same claim.
+
+**B6 -- `merge_entries` had no self-merge guard at the layer that would do
+the damage.** The `keep == drop` check lived only in the CLI handler,
+keyed on cite_key strings -- not reachable through the TUI today (its
+picker already excludes this case), but the invariant belonged in
+`merge_entries` itself, the same way `update_entry` stamps
+`date_modified` itself "so callers can't forget." Added a guard before
+the transaction starts.
+
+**B8 -- SSRF `is_internal` gaps.** Missing RFC 6598 CGNAT
+(`100.64.0.0/10` -- a real internal range on some cloud/Kubernetes node
+networks) and multicast, both IPv4 and (caught in the follow-up review
+round, missed in the first pass) IPv6 (`ff00::/8`). All four added, with
+the CGNAT range's boundaries independently recomputed rather than trusted
+on the first pass's own math.
+
+**Author/critic, three rounds.** `coder` (Sonnet, write access)
+implemented all 9 as one batch against a brief written from the audit's
+own findings. An Opus-model review of that batch (matching the audit's
+own model, at the user's explicit request for that one task) found the
+9 fixes correct but two of them incomplete in ways a narrower fix easily
+misses: B4 had fixed six of seven overridable fields but left `--year`
+behind (the exact class of bug B4 itself was fixing, reappearing in the
+fix), and B8 had added IPv4 multicast but not IPv6. It also caught two
+smaller things: a stale comment claiming `--year`/`--author` were still
+ignored in `--doi` mode (true before this phase, false after `--url`'s
+own fix and now false again after B4), and two new `clippy::
+type_complexity` warnings from B5's tuple-returning signature. All four
+fixed directly (not delegated -- small, precisely-scoped, the "if writing
+the brief is most of the work, don't delegate" rule cuts the other way
+at this size), then re-verified by a third round, Sonnet-high per the
+user's standing preference for this project (Opus only on explicit
+per-task request, not as the default critic) -- confirmed correct with no
+further issues.
+
+**What the audit flagged but this phase didn't change.** Two informational
+findings from the Opus review round, deliberate rather than left broken:
+B2's fix means a shared attachment can end up not renamed to match keep's
+cite_key naming convention -- cosmetic, and the alternative is the data
+loss B2 exists to prevent. B9's fix means a real download race now
+produces a duplicate attachment (same bytes, two rows) instead of an
+error -- the right tradeoff, but not loss-free in the other direction.
+Both worth knowing if either surfaces again in a future audit.
+
+**Documentation drift, also flagged and worth naming even though most of
+it is prose, not code:** the audit found `DESIGN.md`'s "Current state"
+header stale in several places (claims fifteen phases when the file
+documents twenty-one; describes the TUI as still mostly CLI-only, which
+Phase 16/18/20 already closed; undercounts `main.rs`'s `cmd_*`
+functions), Phase 16's merge section describing the 3+-marked case as a
+hard error when it's actually a picker (`MergePlan::PickDropWithin`,
+landed by a later commit than the section itself), and `export
+--collection`/`--recursive` (commit `c18d597`) having shipped with no
+`DESIGN.md` section or delegation-table row at all -- the exact process
+this file's own opening instructions require. Not fixed in this phase
+(scope was the 9 bugs); flagged here so it isn't lost, and worth a
+dedicated pass rather than folding into a bug-fix phase's own section.
+
+Delegation: **yes / yes** for the 9-bug batch itself (real correctness
+fixes across `db.rs`/`main.rs`/`bibtex.rs`/`tui.rs`/`doi.rs`, several
+touching the same trust boundaries -- SSRF, the `O_EXCL` attachment race,
+FTS5 -- this project's delegation table already flags as earning review).
+**No / no** for the four follow-up fixes -- small enough, and precisely
+enough scoped by the review that found them, to just write directly.
+
+---
+
 ## Roadmap (not yet scoped)
 
 Ideas worth doing sometime, deliberately not designed in detail yet — see
@@ -1539,7 +1772,7 @@ one yet.
 
 ## Order of work
 
-Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17 → 18 → 19 → 20. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
+Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17 → 18 → 19 → 20 → 21 → 22. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
 
 ---
 
@@ -1570,6 +1803,8 @@ Which phases get farmed out to a `coder` subagent, and which get an
 | 18 — TUI copy to clipboard | no | no | One keybinding and one pure resolution function, smaller than Phase 6. |
 | 19 — Multi-source OA fetch | **yes** | **yes** | Network, remote JSON not under our control, a genuine silent-failure trap (wrong host/version silently lands a plausible-looking PDF instead of erroring). Same shape as Phase 8. |
 | 20 — TUI attach via file browser | **yes** | **yes** | New mode + real key-handling grind, plus local filesystem edge cases (symlinks, permission denied, root traversal) in the same class Phase 12/16 were burned by. |
+| 21 — `add`: fold `--from-url` into `--url` | no | no | One function's dispatch logic, no new trust boundary. Same shape as Phase 4/17. |
+| 22 — Opus audit: 9 bugs | **yes** | **yes** | Real correctness fixes across five files, several touching trust boundaries (SSRF, `O_EXCL` races, FTS5) this table already flags as earning review. |
 
 The table is a default, not a rule. The reasoning behind it, which outlives the
 table if the phases change:

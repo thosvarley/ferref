@@ -672,6 +672,11 @@ fn is_internal(ip: IpAddr) -> bool {
                 || v4.is_broadcast()
                 || v4.is_unspecified()
                 || v4.is_documentation()
+                || v4.is_multicast()
+                // RFC 6598 CGNAT range, 100.64.0.0/10 -- a real internal
+                // range on some cloud/Kubernetes node networks, missed by
+                // the private/link-local/etc. checks above.
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 0b0100_0000)
                 || v4.octets()[0] == 0
                 || v4.octets()[0] >= 240
         }
@@ -684,6 +689,7 @@ fn is_internal(ip: IpAddr) -> bool {
                 || v6.is_unspecified()
                 || (first & 0xfe00) == 0xfc00 // unique local fc00::/7
                 || (first & 0xffc0) == 0xfe80 // link local fe80::/10
+                || (first & 0xff00) == 0xff00 // multicast ff00::/8
         }
     }
 }
@@ -1305,10 +1311,27 @@ mod tests {
             "fc00::1",
             "fe80::1",
             "::ffff:127.0.0.1", // v4-mapped loopback
+            // B8: RFC 6598 CGNAT range, 100.64.0.0/10.
+            "100.64.0.1",
+            "100.127.255.255",
+            // B8: IPv4 multicast.
+            "224.0.0.1",
+            // B8: IPv6 multicast ff00::/8 -- missed in the first pass, which
+            // only added the IPv4 multicast check.
+            "ff02::1",   // all-nodes link-local multicast
+            "ff02::fb",  // mDNS
+            "ff05::1:3", // site-local multicast
         ] {
             assert!(is_internal(ip.parse().unwrap()), "{ip} should be internal");
         }
-        for ip in ["1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"] {
+        for ip in [
+            "1.1.1.1",
+            "93.184.216.34",
+            "2606:4700:4700::1111",
+            // B8: just outside the CGNAT range on either side.
+            "100.63.255.255",
+            "100.128.0.0",
+        ] {
             assert!(!is_internal(ip.parse().unwrap()), "{ip} should be public");
         }
     }

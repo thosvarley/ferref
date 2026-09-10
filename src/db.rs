@@ -341,6 +341,33 @@ pub fn get_entry(conn: &Connection, cite_key: &str) -> Result<Option<Entry>> {
     Ok(Some(entry))
 }
 
+// Same as get_entry, but keyed by id instead of cite_key -- used where a
+// caller only has an id on hand (e.g. tui.rs's bulk actions falling back to
+// the DB for a marked id that isn't in the currently loaded collection).
+pub fn get_entry_by_id(conn: &Connection, id: i64) -> Result<Option<Entry>> {
+    let mut stmt = conn.prepare("SELECT * FROM entries WHERE id = ?1")?;
+    let mut rows = stmt.query([id])?;
+
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+
+    let mut entry = entry_from_row(row)?;
+    entry.authors = authors_for_entry(conn, entry.id.unwrap())?;
+    entry.tags = tags_for_entry(conn, entry.id.unwrap())?;
+    entry.attachments = attachments_for_entry(conn, entry.id.unwrap(), true)?;
+    Ok(Some(entry))
+}
+
+pub fn cite_key_for_id(conn: &Connection, id: i64) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT cite_key FROM entries WHERE id = ?1",
+        [id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
 fn tags_for_entry(conn: &Connection, entry_id: i64) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT t.name FROM tags t JOIN entry_tags et ON et.tag_id = t.id \
@@ -625,7 +652,7 @@ fn entry_id_for(conn: &Connection, cite_key: &str) -> Result<i64> {
 // human (InvalidParameterName, which `main::db_error` passes straight
 // through) -- the same "not found" case `collection_by_path` alone leaves
 // as a bare `None` for callers that can't just skip a missing collection.
-fn require_collection(conn: &Connection, path: &str) -> Result<i64> {
+pub fn require_collection(conn: &Connection, path: &str) -> Result<i64> {
     collection_by_path(conn, path)?.ok_or_else(|| {
         rusqlite::Error::InvalidParameterName(format!("no collection found at path '{path}'"))
     })
@@ -1249,6 +1276,12 @@ pub fn delete_entry(conn: &Connection, cite_key: &str) -> Result<()> {
 // overwrite a file that's already there; if the natural name is taken by an
 // unrelated attachment keep already has, fall back to "-2", "-3", ...
 pub fn merge_entries(conn: &Connection, keep_id: i64, drop_id: i64) -> Result<()> {
+    if keep_id == drop_id {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "cannot merge an entry into itself".to_string(),
+        ));
+    }
+
     let tx = conn.unchecked_transaction()?;
 
     let keep_cite_key: String = tx.query_row(
@@ -1324,6 +1357,31 @@ fn move_attachment(
     attachment_id: i64,
     old_path_str: &str,
 ) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+    // If any other attachments row (belonging to keep, or a third entry)
+    // already points at this exact path, the file is shared -- renaming it
+    // would silently break whichever row keeps pointing at the old name.
+    // Just re-parent this row onto keep_id and leave the file where it is.
+    //
+    // UPDATE OR IGNORE, not UPDATE: attachments has UNIQUE(entry_id, path),
+    // and keep can already own a row at (keep_id, old_path_str) -- the same
+    // "conflicting row" case entry_tags/collection_entries's re-parenting
+    // handles above. When that happens this row is left parked on drop_id,
+    // where DELETE FROM entries's ON DELETE CASCADE sweeps it up: keep's
+    // existing row already covers this exact file, so nothing is lost.
+    let shared: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM attachments WHERE path = ?1 AND id != ?2)",
+        rusqlite::params![old_path_str, attachment_id],
+        |row| row.get(0),
+    )?;
+    if shared {
+        tx.execute(
+            "UPDATE OR IGNORE attachments SET entry_id = ?1 WHERE id = ?2",
+            rusqlite::params![keep_id, attachment_id],
+        )?;
+        let path = Path::new(old_path_str).to_path_buf();
+        return Ok((path.clone(), path));
+    }
+
     let old_path = Path::new(old_path_str);
     let dir = old_path.parent().ok_or_else(|| {
         rusqlite::Error::InvalidParameterName(format!(
@@ -2603,5 +2661,219 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // B2 regression: keep and drop both have an attachments row pointing at
+    // the exact same file path (a state the DB explicitly allows -- see the
+    // comment above set_full_text). The old code renamed the drop-side row's
+    // file unconditionally, which silently broke the sibling row (keep's,
+    // here) still pointing at the old path. The fix detects the shared path
+    // and only re-parents the DB row, leaving the file untouched.
+    #[test]
+    fn merge_entries_handles_attachments_that_share_one_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferref-merge-shared-file-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        let keep = Entry::new(
+            "article".to_string(),
+            "keep2024".to_string(),
+            "Keep".to_string(),
+        );
+        let keep_id = insert_entry(&conn, &keep).unwrap();
+        let drop = Entry::new(
+            "article".to_string(),
+            "drop2024".to_string(),
+            "Drop".to_string(),
+        );
+        let drop_id = insert_entry(&conn, &drop).unwrap();
+
+        let shared_pdf = dir.join("shared.pdf");
+        std::fs::write(&shared_pdf, b"shared bytes").unwrap();
+        let shared_path = shared_pdf.to_str().unwrap();
+
+        // Hand-inserted so both rows carry the identical path, matching how
+        // this state is actually reached (two attach() calls on the same
+        // file from two entries, or a hand-edited DB).
+        conn.execute(
+            "INSERT INTO attachments (entry_id, path, date_added) VALUES (?1, ?2, ?3)",
+            rusqlite::params![keep_id, shared_path, 0],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO attachments (entry_id, path, date_added) VALUES (?1, ?2, ?3)",
+            rusqlite::params![drop_id, shared_path, 0],
+        )
+        .unwrap();
+
+        merge_entries(&conn, keep_id, drop_id).unwrap();
+
+        // File survives untouched at its original path.
+        assert!(
+            shared_pdf.is_file(),
+            "the shared file must still exist at its original path"
+        );
+
+        // attachments has UNIQUE(entry_id, path): re-parenting drop's row
+        // onto keep_id would collide with keep's own row at the identical
+        // (keep_id, path) pair, so it's left parked on drop_id and swept up
+        // by drop's cascade delete -- keep's original row already covers
+        // this exact file, so nothing is lost, but the count collapses to
+        // one rather than two.
+        let kept = get_entry(&conn, "keep2024").unwrap().unwrap();
+        assert_eq!(
+            kept.attachments.len(),
+            1,
+            "the duplicate row collapses into keep's own, which already covered this file"
+        );
+        assert_eq!(kept.attachments[0].path, shared_path);
+
+        // Sanity check the DB is still consistent.
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // B2 regression, second shape: the shared file belongs to drop and a
+    // third, unrelated entry (not keep) -- re-parenting drop's row onto
+    // keep_id doesn't collide with anything here, so both rows genuinely
+    // survive, each still pointing at the untouched file.
+    #[test]
+    fn merge_entries_handles_a_file_shared_with_a_third_entry() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferref-merge-shared-file-third-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        let keep = Entry::new(
+            "article".to_string(),
+            "keep2024".to_string(),
+            "Keep".to_string(),
+        );
+        let keep_id = insert_entry(&conn, &keep).unwrap();
+        let drop = Entry::new(
+            "article".to_string(),
+            "drop2024".to_string(),
+            "Drop".to_string(),
+        );
+        let drop_id = insert_entry(&conn, &drop).unwrap();
+        let third = Entry::new(
+            "article".to_string(),
+            "third2024".to_string(),
+            "Third".to_string(),
+        );
+        let third_id = insert_entry(&conn, &third).unwrap();
+
+        let shared_pdf = dir.join("shared.pdf");
+        std::fs::write(&shared_pdf, b"shared bytes").unwrap();
+        let shared_path = shared_pdf.to_str().unwrap();
+
+        conn.execute(
+            "INSERT INTO attachments (entry_id, path, date_added) VALUES (?1, ?2, ?3)",
+            rusqlite::params![drop_id, shared_path, 0],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO attachments (entry_id, path, date_added) VALUES (?1, ?2, ?3)",
+            rusqlite::params![third_id, shared_path, 0],
+        )
+        .unwrap();
+
+        merge_entries(&conn, keep_id, drop_id).unwrap();
+
+        assert!(shared_pdf.is_file(), "the shared file must survive untouched");
+
+        let kept = get_entry(&conn, "keep2024").unwrap().unwrap();
+        assert_eq!(kept.attachments.len(), 1);
+        assert_eq!(kept.attachments[0].path, shared_path);
+
+        let third = get_entry(&conn, "third2024").unwrap().unwrap();
+        assert_eq!(
+            third.attachments.len(),
+            1,
+            "the unrelated third entry's row must be untouched by the merge"
+        );
+        assert_eq!(third.attachments[0].path, shared_path);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // B6 regression: merge_entries had no keep==drop guard of its own, only
+    // one enforced by the CLI handler keyed on cite_key strings -- not
+    // reachable from every caller (e.g. the TUI). The function itself must
+    // refuse and leave the entry untouched.
+    #[test]
+    fn merge_entries_refuses_to_merge_an_entry_into_itself() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        let entry = Entry::new(
+            "article".to_string(),
+            "solo2024".to_string(),
+            "Solo".to_string(),
+        );
+        let id = insert_entry(&conn, &entry).unwrap();
+
+        let result = merge_entries(&conn, id, id);
+        assert!(result.is_err(), "merging an entry into itself must error");
+
+        assert!(
+            get_entry(&conn, "solo2024").unwrap().is_some(),
+            "the entry must still exist after a refused self-merge"
+        );
+    }
+
+    // B7: db-backed fallback lookups the TUI uses when a marked id belongs
+    // to an entry outside the currently loaded collection.
+    #[test]
+    fn get_entry_by_id_and_cite_key_for_id_round_trip() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        let entry = Entry::new(
+            "article".to_string(),
+            "lookup2024".to_string(),
+            "Lookup".to_string(),
+        );
+        let id = insert_entry(&conn, &entry).unwrap();
+
+        let by_id = get_entry_by_id(&conn, id).unwrap().unwrap();
+        assert_eq!(by_id.cite_key, "lookup2024");
+        assert_eq!(by_id.title, "Lookup");
+
+        assert_eq!(
+            cite_key_for_id(&conn, id).unwrap(),
+            Some("lookup2024".to_string())
+        );
+
+        assert!(get_entry_by_id(&conn, id + 999).unwrap().is_none());
+        assert_eq!(cite_key_for_id(&conn, id + 999).unwrap(), None);
+    }
+
+    // B3: `export`'s --collection resolution was switched from the
+    // silent-empty sentinel (`resolve_collection_filter`, used by
+    // list/search on purpose) to this erroring form, so a typo'd path fails
+    // loudly instead of quietly exporting nothing.
+    #[test]
+    fn require_collection_errors_loudly_on_an_unknown_path() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        create_collection(&conn, "Physics").unwrap();
+
+        assert!(require_collection(&conn, "Physics").is_ok());
+        let err = require_collection(&conn, "Pyhsics"); // typo
+        assert!(err.is_err(), "an unresolvable path must be an error, not None/empty");
     }
 }
