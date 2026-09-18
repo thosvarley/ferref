@@ -101,9 +101,15 @@ All fifteen phases are complete.
 - Nothing lists all known tags, and a tag row orphaned by its last `untag` is
   left behind rather than garbage-collected. Both are worth fixing together, if
   a `ferref tags` command ever exists.
-- There is no `detach`, and no way to edit an attachment's path. Since `attach`
-  rejects a path that doesn't resolve, the usual cause (a typo) is caught up
-  front; a moved file still needs `rm` + re-add.
+- **Superseded (Phase 23):** `db::detach` now exists (not yet exposed as a
+  standalone CLI subcommand — only through `open`'s self-heal and
+  `doctor --fix`), and a file deleted outside ferref self-heals the moment
+  `open`/`doctor --fix` next touches it, or gets pruned automatically the
+  next time `attach`/`fetch` lands a new attachment for the same entry.
+  There is still no way to edit an attachment's path directly, and a
+  *moved* (not deleted) file — one `Path::is_file()` still finds, just
+  somewhere else — isn't self-healed by anything here; that case still
+  needs `rm` + re-add.
 - Attachment paths are absolute and stored at attach time. `attach` and `fetch`
   both copy into `./pdfs/`, so the files travel with the library — but the
   stored paths don't, and moving the library directory breaks every one of them
@@ -1109,11 +1115,16 @@ the ones that fail. `--json` gets `{"checked": N, "broken": [{"cite_key",
 attachments resolve." if none. Exits 1 if anything's broken, 0 otherwise, so
 it's usable as a health-check script (`ferref doctor || alert-someone`).
 
-No `--fix` yet, per the original Roadmap note — re-pointing a path needs a
-human to say what it should point to instead (there's no way to infer a
-moved file's new location), and dropping the row outright is a data-loss
-decision that shouldn't be a flag's default behavior. Report first, decide
-later whether a fix mode earns its keep.
+**Superseded (Phase 23):** `--fix` now exists. The "decide later" above
+was resolved once a real library actually accumulated broken rows a
+human wanted gone: dropping a row whose file is confirmed absent isn't
+the same decision as guessing where a moved file went (still not
+attempted, and still needs the re-pointing a human would have to do by
+hand) — there's nothing to lose by removing a pointer to a file that
+provably doesn't exist. `--fix` detaches every broken attachment
+`doctor` finds, reports how many, and exits 0 once nothing's left broken;
+plain `doctor` (no `--fix`) is unchanged, still read-only, still exits 1
+on anything broken.
 
 Note the direction: `doctor` catches a DB row pointing at a file that
 isn't there. It does *not* catch the opposite — a file sitting in `./pdfs/`
@@ -1741,6 +1752,190 @@ enough scoped by the review that found them, to just write directly.
 
 ---
 
+## Phase 23 — Self-healing dangling attachments, `doctor --fix`, `detach`
+
+Reported directly against a real library: `open` on an entry whose
+attachment file(s) had been deleted outside ferref (by hand, on disk --
+the database is hand-editable and the filesystem is too) just fails, and
+the dangling `attachments` row sits there forever -- `ferref doctor`
+already reports it (Phase 17), but does nothing about it, per its own
+documented "report first, decide later" deferral. The same report also
+flagged a second, related discomfort: an entry ending up with *two*
+attachment rows was surprising. Root cause, confirmed against the real
+case: `attach`/`fetch` don't check whether an entry's *existing*
+attachment still resolves before adding a new one, so re-attaching after
+an external deletion doesn't replace the dangling row, it adds beside it.
+Multiple attachments are still a legitimate, intentional shape (`open`'s
+own comment: "an entry usually has one, and when it has two they're the
+paper and its supplement") -- the fix is pruning *dead* rows before a
+write, not capping the count.
+
+Three pieces, all landing on the same primitive:
+
+**`db::detach(conn, attachment_id: i64) -> Result<()>`** -- the missing
+half of `attach` this project's own Known Limitations section has named
+since Phase 6 ("There is no detach"). `DELETE FROM attachments WHERE id =
+?1`; the existing `attachments_fts_ad` trigger (Phase 15) already keeps
+FTS in sync on any delete through this table, so nothing new is needed
+there. A free function over `&Connection`, no filesystem I/O -- deciding
+*whether* to detach (does the file still exist?) is a caller concern, not
+this function's, the same separation `db.rs` already draws everywhere
+else (P1 from the Phase 22 audit specifically flagged `db.rs` reaching
+into the filesystem where it shouldn't; this phase doesn't repeat that).
+
+**Self-heal on read: `open`.** Before calling the system opener on an
+attachment's path, check `Path::is_file()`. A path that doesn't resolve
+is detached on the spot (report it: "removed dangling attachment '<path>'
+-- file no longer exists") rather than handed to `xdg-open`/`open` to
+fail on. If every attachment for an entry turns out to be dangling, all
+are cleaned up and the command reports that plainly and exits non-zero
+(nothing was actually opened) rather than launching an opener doomed to
+fail. Both CLI `open` and the TUI's `o` (`open_selected`) get this --
+same logic, not duplicated (a `main.rs` free function both call, matching
+the project's "one write implementation" rule already established for
+attach/fetch).
+
+**Self-heal on write: `attach`/`fetch`.** Before landing a new attachment,
+prune the entry's existing attachment rows whose file no longer resolves
+on disk. This is what actually prevents the two-PDF state from
+recurring: re-running `fetch`, or `attach`ing a replacement PDF, after
+deleting the old file externally now replaces the dangling row instead of
+accumulating beside it. A *still-resolving* second attachment (the
+paper-plus-supplement case) is untouched -- pruning only ever removes
+rows whose file is confirmed gone, never a row just because a new one is
+being added.
+
+**`ferref doctor --fix`.** The bulk version, for a library with existing
+dangling rows accumulated before this phase (like the one that prompted
+it) -- scans exactly what `doctor` already scans, `detach`es every
+attachment that doesn't resolve, and reports how many were removed.
+Still doesn't touch the opposite direction (a file in `pdfs/` with no
+matching row) -- that's still explicitly out of scope, per Phase 17's own
+note, a different query shape entirely.
+
+`db::all_attachment_paths` gains the attachment `id` alongside
+`(cite_key, path)` (`doctor` needs it to call `detach`) -- the one
+call site (`cmd_doctor`) updates to match; no other caller exists.
+
+Delegation: **yes / yes**. Touches the same `O_EXCL`-sensitive attach/
+fetch write paths the Phase 22 audit already flagged as review-worthy,
+plus a new bulk-delete path (`doctor --fix`) whose failure mode is
+data loss if it detaches the wrong rows -- worth a hostile look before
+it ships, even though the individual pieces are each small.
+
+**Built and shipped.** `coder` (Sonnet) implemented against the spec
+above; `adversarial-reviewer` (Sonnet-high, the new default for this
+project -- see below) reviewed read-only in a scratch copy, executing
+every piece rather than reading it: `detach`'s FTS desync, `open`'s
+self-heal on both fronts (a real attachment still opens; a fully-dangling
+entry detaches and exits non-zero; a mixed real+dangling entry opens the
+real one and only detaches the dangling one), `doctor --fix`'s
+persistence (a follow-up plain `doctor` actually shows 0 broken
+afterward, not just a reported count), and -- the one piece most worth
+hostile scrutiny, since getting it wrong means a quiet, different flavor
+of data loss -- `prune_dangling_attachments` never touching a
+still-resolving second attachment: verified against both call sites
+(`attach_path_for_entry` and `land_downloaded_pdf`, the latter against a
+real, live Unpaywall download) that a legitimate paper-plus-supplement
+pair survives a new attach/fetch completely untouched, while a genuinely
+dangling row gets pruned. No correctness bugs found; three `clippy`
+warnings the new code introduced (`redundant_closure` in
+`land_downloaded_pdf`, two `collapsible_if`s in the TUI's `open_selected`)
+were fixed directly rather than delegated back -- small enough that
+writing a second brief would have cost more than just fixing them, the
+same call this project's delegation reasoning already makes for
+similarly-sized issues.
+
+This is also the first phase reviewed under the user's explicit standing
+preference: `adversarial-reviewer` defaults to Sonnet on high effort, not
+Opus -- Opus is for an explicit per-task ask (as it was for the Phase 22
+audit itself), not the standing default, purely on token cost grounds.
+
+**Closed the reported case directly.** The bug report that prompted this
+phase named a real entry, `canalesjohnson2026`, with two attachment rows
+both pointing at files the user had deleted outside ferref. Once Phase 23
+shipped, `ferref doctor --fix` was run against the real library (not a
+scratch copy) and removed both dangling rows -- `ferref doctor`
+afterward reports all attachments resolve, and the entry now correctly
+shows zero attachments rather than two broken ones.
+
+---
+
+## Phase 24 — TUI: export a whole collection, mark-all, a visible input cursor
+
+Three small, independent pieces of TUI friction reported together, none
+big enough on its own to earn a full delegation cycle -- implemented
+directly, verified live via `tmux`, then given a scoped review (Sonnet-
+high, per the standing default) rather than the full coder/critic split
+larger phases get.
+
+**Export a highlighted collection.** Exporting a whole (sub)collection
+used to mean marking every paper in it by hand first, then `x` from the
+Entries pane. `x` now also works from the Collections pane: with a tree
+row highlighted, it exports every entry already loaded for that row --
+`self.entries` is always that row's *recursive* set (`load_entries`/
+`select_row`), independent of whether the row is visually collapsed in
+the tree, so a collapsed subtree with children still exports everything
+underneath it, not just what's currently drawn. No marking involved. The
+export path defaults to the collection's own name
+(`export_filename_for_row`, a small pure function: `<sanitized-
+name>.bib`, reusing `doi::sanitize_filename`), so `Physics` pre-fills
+`Physics.bib`; the synthetic "All Papers" root has no name worth using as
+a filename and falls back to the same `export.bib` default the
+Entries-pane export already uses.
+
+**`A`: mark every visible row.** Entries-pane only, unions every id in
+the current view (`self.view` -- filter-respecting) into `self.marked`,
+skipping anything already marked. Deliberately additive, not a replace:
+`marked` is designed to survive a collection change (see `select_row`'s
+own comment -- marking across collections to bulk-act on all of them
+together is an existing, intentional workflow, closed as B7 in Phase 22),
+so "mark everything I can see" must not silently drop a mark made
+somewhere else. Verified live: marking one entry in a subcollection, then
+switching collections and pressing `A`, produces a mark count that
+includes both -- not just what's currently on screen.
+
+**A visible input cursor.** Every text-entry mode (`/` search, `n` new
+collection, `:` -> `e`'s field editor, `x`'s export path, `:` -> `t`/`u`'s
+tag name) renders into the footer line, and until now gave no visual
+signal that a field was actively accepting keystrokes beyond the label
+text itself -- easy to miss, especially on an empty buffer. `draw_footer`
+now calls ratatui's `Frame::set_cursor_position` whenever an input mode's
+own text is what's on screen (guarded against `app.status`, a transient
+one-frame message that pre-empts the footer text above this and must
+pre-empt the cursor too, or it would sit at the end of someone else's
+message). This is the terminal's own native cursor, shown/hidden per
+frame based on whether `set_cursor_position` was called that frame
+(ratatui's documented behavior) -- so it blinks however the user's own
+terminal emulator is configured to blink a cursor, with no hand-rolled
+blink timer needed. Every `Mode::Input` variant's footer text already
+ends with the live buffer verbatim, so the cursor column is just the
+rendered text's char count (not byte count -- verified live with a
+multi-byte UTF-8 character typed into the search box, cursor advances one
+column per char, no drift, no panic).
+
+Delegation: **no / no** for the initial implementation -- each piece is
+small, mechanical, and extends an existing pattern (Collections-pane `x`
+reuses the exact `Mode::Input`/`ExportPath` machinery Entries-pane `x`
+already built; `mark_all_visible` is a five-line loop beside an existing
+`toggle_mark`; the cursor is one `ratatui` API call). Still got a scoped
+review (Sonnet-high) rather than skipping one outright, since two of the
+three are only verifiable by actually driving the TUI (cursor
+position/visibility is a runtime property no amount of reading `tui.rs`
+proves; the tree-pane export's collapsed-subtree behavior depends on
+`load_entries`/`select_row`'s actual runtime relationship, not something
+safe to assume from the code alone). The review found no correctness
+bugs in any of the three, live-tested via `tmux` (including a collapsed
+subtree with nested children still exporting its full recursive set, and
+the cursor's exact column independently recomputed and matched for both
+an empty and a multi-byte-character buffer) -- one purely cosmetic note
+(a collection literally named `.` -- permitted by `db.rs`'s own name
+validation, though not by `sanitize_filename` -- falls back to the
+generic `export.bib` filename rather than anything referencing the name),
+not worth a special case for.
+
+---
+
 ## Roadmap (not yet scoped)
 
 Ideas worth doing sometime, deliberately not designed in detail yet — see
@@ -1772,7 +1967,7 @@ one yet.
 
 ## Order of work
 
-Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17 → 18 → 19 → 20 → 21 → 22. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
+Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17 → 18 → 19 → 20 → 21 → 22 → 23 → 24. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
 
 ---
 
@@ -1805,6 +2000,8 @@ Which phases get farmed out to a `coder` subagent, and which get an
 | 20 — TUI attach via file browser | **yes** | **yes** | New mode + real key-handling grind, plus local filesystem edge cases (symlinks, permission denied, root traversal) in the same class Phase 12/16 were burned by. |
 | 21 — `add`: fold `--from-url` into `--url` | no | no | One function's dispatch logic, no new trust boundary. Same shape as Phase 4/17. |
 | 22 — Opus audit: 9 bugs | **yes** | **yes** | Real correctness fixes across five files, several touching trust boundaries (SSRF, `O_EXCL` races, FTS5) this table already flags as earning review. |
+| 23 — Self-healing attachments, `doctor --fix`, `detach` | **yes** | **yes** | Touches the `O_EXCL`-sensitive attach/fetch write paths plus a new bulk-delete path (`doctor --fix`) whose failure mode is data loss if it's wrong. |
+| 24 — TUI: collection export, mark-all, input cursor | no | no | Three small, mechanical additions, each extending an existing pattern. Still reviewed (Sonnet-high) since two of the three are only verifiable by actually running the TUI. |
 
 The table is a default, not a rule. The reasoning behind it, which outlives the
 table if the phases change:

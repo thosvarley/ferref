@@ -447,6 +447,18 @@ pub fn set_full_text(conn: &Connection, attachment_id: i64, text: &str) -> Resul
     )
 }
 
+// The missing half of `attach` (Known Limitations, since Phase 6: "there is
+// no detach"). Deciding *whether* to detach -- does the file still resolve
+// on disk? -- is a caller concern, not this function's, the same split
+// db.rs draws everywhere else (attach doesn't touch the filesystem either).
+// The attachments_fts_ad AFTER DELETE trigger (Phase 15) already keeps FTS5
+// in sync on any delete through this table, so there's nothing else to do
+// here.
+pub fn detach(conn: &Connection, attachment_id: i64) -> Result<()> {
+    conn.execute("DELETE FROM attachments WHERE id = ?1", [attachment_id])?;
+    Ok(())
+}
+
 // The attachment paths for one entry: (id, path) pairs, the id being what
 // set_full_text keys on.
 pub fn attachments_for_cite_key(conn: &Connection, cite_key: &str) -> Result<Vec<(i64, String)>> {
@@ -484,19 +496,21 @@ pub fn all_attachment_text_lengths(conn: &Connection) -> Result<HashMap<i64, Vec
     Ok(out)
 }
 
-// Every attachment's owning cite_key and stored path, for `ferref doctor`
-// (Roadmap: "scan attachment paths against the filesystem and report ones
-// that no longer resolve"). One query, not one per entry -- same reasoning
-// as all_attachment_text_lengths. Read-only: doctor doesn't touch the
-// filesystem existence check here, that's the caller's job, so this stays
-// pure DB access with no I/O to mock in a test.
-pub fn all_attachment_paths(conn: &Connection) -> Result<Vec<(String, String)>> {
+// Every attachment's id, owning cite_key, and stored path, for `ferref
+// doctor` (Roadmap: "scan attachment paths against the filesystem and
+// report ones that no longer resolve"). One query, not one per entry --
+// same reasoning as all_attachment_text_lengths. Read-only: doctor doesn't
+// touch the filesystem existence check here, that's the caller's job, so
+// this stays pure DB access with no I/O to mock in a test. The id rides
+// along so `doctor --fix` (Phase 23) can detach whatever the caller finds
+// broken without a second lookup.
+pub fn all_attachment_paths(conn: &Connection) -> Result<Vec<(i64, String, String)>> {
     let mut stmt = conn.prepare(
-        "SELECT entries.cite_key, attachments.path FROM attachments \
+        "SELECT attachments.id, entries.cite_key, attachments.path FROM attachments \
          JOIN entries ON entries.id = attachments.entry_id \
          ORDER BY entries.cite_key, attachments.id",
     )?;
-    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect()
 }
 
@@ -2224,15 +2238,45 @@ mod tests {
         attach(&conn, "other", "/tmp/c.pdf").unwrap();
 
         let mut all = all_attachment_paths(&conn).unwrap();
-        all.sort();
+        all.sort_by(|a, b| (&a.1, &a.2).cmp(&(&b.1, &b.2)));
+        let pairs: Vec<(String, String)> = all.into_iter().map(|(_, k, p)| (k, p)).collect();
         assert_eq!(
-            all,
+            pairs,
             vec![
                 ("k".to_string(), "/tmp/a.pdf".to_string()),
                 ("k".to_string(), "/tmp/b.pdf".to_string()),
                 ("other".to_string(), "/tmp/c.pdf".to_string()),
             ]
         );
+    }
+
+    // detach removes the row *and* the FTS trigger fires on the delete,
+    // proving the same sync attach/set_full_text rely on also covers the
+    // reverse direction -- a search that used to hit this attachment's
+    // extracted text must stop matching once it's gone.
+    #[test]
+    fn detach_removes_the_row_and_its_fts_entry() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        seed(&conn, "k", "T", 2020, "Doe", "Jane");
+
+        let (att_id, _) = attach(&conn, "k", "/tmp/a.pdf").unwrap();
+        set_full_text(&conn, att_id, "unobtainium superconductor").unwrap();
+
+        let text_filter = Filter {
+            text: Some("unobtainium".to_string()),
+            ..Default::default()
+        };
+        let before = list_entries(&conn, &text_filter, false).unwrap();
+        assert_eq!(before.len(), 1);
+
+        detach(&conn, att_id).unwrap();
+
+        let remaining = attachments_for_cite_key(&conn, "k").unwrap();
+        assert!(remaining.is_empty());
+
+        let after = list_entries(&conn, &text_filter, false).unwrap();
+        assert!(after.is_empty());
     }
 
     // The realistic regression for the backfill guard: nothing today stops a

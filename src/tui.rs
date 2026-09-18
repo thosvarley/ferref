@@ -227,7 +227,7 @@ fn handle_normal_key(app: &mut App, conn: &Connection, code: KeyCode, modifiers:
         }
         KeyCode::Char('c') if app.focus == Focus::Entries => app.open_picker(conn),
         KeyCode::Char('o') if matches!(app.focus, Focus::Entries | Focus::Details) => {
-            app.open_selected();
+            app.open_selected(conn);
         }
         KeyCode::Char('y') if matches!(app.focus, Focus::Entries | Focus::Details) => {
             app.copy_url();
@@ -244,11 +244,34 @@ fn handle_normal_key(app: &mut App, conn: &Connection, code: KeyCode, modifiers:
                 app.mode = Mode::Input(InputKind::ExportPath { ids }, "export.bib".to_string());
             }
         }
+        // "x" in the tree pane exports the *highlighted collection* --
+        // every entry already loaded for it (self.entries is always that
+        // row's recursive set, per load_entries/select_row), not the
+        // marked/selected-entry set the Entries-pane "x" above uses. No
+        // marking required first, which is the whole point: marking every
+        // paper in a collection by hand was the friction this was added to
+        // remove. The filename defaults to the collection's own name
+        // (sanitized the same way attachment filenames are); "All Papers"
+        // (the synthetic root, `id: None`) has no name worth using as a
+        // filename, so it falls back to the same "export.bib" default the
+        // Entries-pane export uses.
+        KeyCode::Char('x') if app.focus == Focus::Collections && !app.entries.is_empty() => {
+            let ids: Vec<i64> = app.entries.iter().filter_map(|e| e.id).collect();
+            let filename = export_filename_for_row(&app.rows[app.selected_row]);
+            app.mode = Mode::Input(InputKind::ExportPath { ids }, filename);
+        }
         KeyCode::Char('?') => app.mode = Mode::Help,
         // Toggles the current row into the merge marks. Insertion order
         // matters (first marked survives a merge, second is folded in and
         // deleted) -- see App::toggle_mark.
         KeyCode::Char(' ') if app.focus == Focus::Entries => app.toggle_mark(),
+        // "A": marks every row currently visible (respecting the active "/"
+        // filter), in addition to whatever's already marked -- doesn't
+        // clear or replace existing marks, since a mark is deliberately
+        // meant to survive a collection change (see select_row's own
+        // comment on App::marked) and a bulk "mark everything I can see"
+        // shouldn't undo a cross-collection selection already in progress.
+        KeyCode::Char('A') if app.focus == Focus::Entries => app.mark_all_visible(),
         // The ":" command palette (Edit/Fetch/Merge/Delete), scoped to
         // whichever entry is currently selected.
         KeyCode::Char(':')
@@ -1062,6 +1085,21 @@ struct TreeRow {
     entry_count: i64,
 }
 
+// The default filename the tree pane's "x" (export the highlighted
+// collection) pre-fills. A named collection gets its own name, sanitized
+// the same way attachment filenames are (rejects nothing here -- a
+// collection's `name` is never empty by construction, so sanitize_filename
+// can't return the reject case, only remap unsafe characters). The
+// synthetic "All Papers" root (`id: None`) has no name worth using as a
+// filename, so it falls back to the same "export.bib" default the
+// Entries-pane export already uses.
+fn export_filename_for_row(row: &TreeRow) -> String {
+    row.id
+        .and_then(|_| crate::doi::sanitize_filename(&row.name).ok())
+        .map(|n| format!("{n}.bib"))
+        .unwrap_or_else(|| "export.bib".to_string())
+}
+
 // Positionally aligned with entry.attachments (both ORDER BY id): index i
 // here is the length for e.attachments[i]. No path stored -- that's already
 // on the Attachment itself, and nothing here ever read a second copy of it.
@@ -1294,20 +1332,56 @@ impl App {
     // Opens every attachment of the selected entry through the system
     // opener. A failure (missing opener, no attachments) is shown on the
     // footer rather than propagated -- a broken path shouldn't end the
-    // session.
-    fn open_selected(&mut self) {
+    // session. A dangling attachment (file gone from disk) is self-healed
+    // via the same crate::open_or_detach_stale CLI `open` uses, rather than
+    // handed to the opener to fail on -- see that function's doc comment.
+    fn open_selected(&mut self, conn: &Connection) {
         let Some(entry) = self.selected_entry() else {
             return;
         };
-        if entry.attachments.is_empty() {
-            self.status = Some(format!("'{}' has no attachments", entry.cite_key));
-            return;
-        }
-        for a in &entry.attachments {
-            if let Err(e) = crate::open_path(&a.path) {
-                self.status = Some(e);
+        let entry_id = entry.id;
+        let cite_key = entry.cite_key.clone();
+        let attachments = match db::attachments_for_cite_key(conn, &cite_key) {
+            Ok(a) => a,
+            Err(e) => {
+                self.status = Some(crate::friendly(Some(&cite_key), "list attachments", e));
                 return;
             }
+        };
+        if attachments.is_empty() {
+            self.status = Some(format!("'{cite_key}' has no attachments"));
+            return;
+        }
+
+        let mut opened = 0usize;
+        let mut cleaned = 0usize;
+        let mut early_error = None;
+        for (id, path) in &attachments {
+            match crate::open_or_detach_stale(conn, *id, path) {
+                Ok(crate::OpenOutcome::Opened) => opened += 1,
+                Ok(crate::OpenOutcome::DetachedStale) => cleaned += 1,
+                Err(e) => {
+                    early_error = Some(e);
+                    break;
+                }
+            }
+        }
+
+        self.status = Some(match early_error {
+            Some(e) => e,
+            None if opened == 0 => format!(
+                "removed {cleaned} dangling attachment(s) for '{cite_key}'; nothing left to open"
+            ),
+            None if cleaned > 0 => format!(
+                "Opened {opened} attachment(s); removed {cleaned} dangling one(s) for '{cite_key}'"
+            ),
+            None => format!("Opened {opened} attachment(s) for '{cite_key}'"),
+        });
+
+        if cleaned > 0
+            && let Some(id) = entry_id
+        {
+            let _ = self.refresh_entry(conn, id);
         }
     }
 
@@ -1350,6 +1424,19 @@ impl App {
     fn toggle_mark(&mut self) {
         if let Some(id) = self.selected_entry().and_then(|e| e.id) {
             toggle_marked(&mut self.marked, id);
+        }
+    }
+
+    // "A": adds every row in the current view to `marked`, in view order,
+    // skipping any already marked -- a union, not a replace, so marks made
+    // in a previously-viewed collection (see select_row) survive this too.
+    fn mark_all_visible(&mut self) {
+        for &idx in &self.view {
+            if let Some(id) = self.entries[idx].id
+                && !self.marked.contains(&id)
+            {
+                self.marked.push(id);
+            }
         }
     }
 
@@ -2441,8 +2528,23 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             Mode::Normal => " ?  help \u{b7} q quit".to_string(),
         }
         };
-    let footer = Paragraph::new(text);
+    let footer = Paragraph::new(text.clone());
     frame.render_widget(footer, area);
+
+    // A visible, terminal-native blinking cursor is the signal that a field
+    // is actively accepting input -- otherwise the only difference between
+    // "typing into an empty search box" and "not searching" was the footer
+    // text itself, easy to miss at a glance. Every InputKind's footer text
+    // above ends with the live buffer verbatim (nothing rendered after it),
+    // so its rendered char count is exactly where the next keystroke lands.
+    // Only shown while an input mode's own text is actually on screen: a
+    // transient status message (app.status, cleared on the very next key)
+    // pre-empts it above, and must pre-empt the cursor too, or the cursor
+    // would sit at the end of someone else's message.
+    if app.status.is_none() && matches!(app.mode, Mode::Input(..)) {
+        let col = area.x + (text.chars().count() as u16).min(area.width.saturating_sub(1));
+        frame.set_cursor_position((col, area.y));
+    }
 }
 
 // Centered modal, blanked with Clear first so the panes underneath don't
@@ -2511,6 +2613,7 @@ fn draw_help(frame: &mut Frame, frame_area: Rect) {
             "Entries",
             &[
                 ("Space", "mark for merge/bulk actions"),
+                ("A", "mark every visible row"),
                 (":", "command palette (opens its own menu)"),
                 ("c", "file into collection (bulk if marked)"),
                 ("x", "export marked as BibTeX"),
@@ -2518,7 +2621,13 @@ fn draw_help(frame: &mut Frame, frame_area: Rect) {
                 ("y", "copy url (or DOI link) to clipboard"),
             ],
         ),
-        ("Collections", &[("n", "new (sub)collection")]),
+        (
+            "Collections",
+            &[
+                ("n", "new (sub)collection"),
+                ("x", "export this collection as BibTeX"),
+            ],
+        ),
         (
             "Other",
             &[("r", "reload"), ("q", "quit"), ("?", "this screen")],
@@ -2871,6 +2980,36 @@ mod tests {
         e
     }
 
+    // Minimal App fixture: the synthetic "All Papers" root as the only tree
+    // row, `entries` as given, `view` = every index in order (tests that
+    // care about filtering override it after construction).
+    fn mk_app(entries: Vec<Entry>) -> App {
+        let view = (0..entries.len()).collect();
+        App {
+            rows: vec![TreeRow {
+                id: None,
+                depth: 0,
+                name: "All Papers".to_string(),
+                entry_count: entries.len() as i64,
+            }],
+            collapsed: HashSet::new(),
+            selected_row: 0,
+            entries,
+            view,
+            table_selected: 0,
+            attachment_lengths: HashMap::new(),
+            filter: String::new(),
+            sort_key: SortKey::Title,
+            sort_desc: false,
+            marked: Vec::new(),
+            focus: Focus::Entries,
+            mode: Mode::Normal,
+            status: None,
+            should_quit: false,
+            clipboard: None,
+        }
+    }
+
     // EditField::Authors::current_value formats an author list into the
     // "Last, First; Last, First" text box, and ::apply parses that same
     // text back into a Vec<Author> -- a serialize/deserialize pair that
@@ -3032,6 +3171,66 @@ mod tests {
 
         toggle_marked(&mut marked, 5);
         assert_eq!(marked, vec![2], "marking again unmarks");
+    }
+
+    // "A" unions the view into `marked` (existing marks first, then newly
+    // added in view order), skips anything already marked (no duplicates),
+    // and leaves an id outside the current view (id 5, simulating a mark
+    // made in a previously-viewed collection) completely untouched -- the
+    // whole point of "A" being additive, not a replace.
+    #[test]
+    fn mark_all_visible_unions_the_view_without_clearing_existing_marks() {
+        let mut e1 = mk_entry("Alpha", "", None, "");
+        e1.id = Some(1);
+        let mut e2 = mk_entry("Beta", "", None, "");
+        e2.id = Some(2);
+        let mut e3 = mk_entry("Gamma", "", None, "");
+        e3.id = Some(3);
+
+        let mut app = mk_app(vec![e1, e2, e3]);
+        app.view = vec![0, 2]; // Beta (id 2) filtered out
+        app.marked = vec![5, 3]; // 5 is from elsewhere; 3 is already marked
+
+        app.mark_all_visible();
+        assert_eq!(
+            app.marked,
+            vec![5, 3, 1],
+            "existing marks (including the out-of-view one) survive; only \
+             the new, not-yet-marked visible id (1) is appended"
+        );
+    }
+
+    #[test]
+    fn export_filename_for_row_uses_the_collection_name_or_falls_back() {
+        assert_eq!(
+            export_filename_for_row(&TreeRow {
+                id: None,
+                depth: 0,
+                name: "All Papers".to_string(),
+                entry_count: 0,
+            }),
+            "export.bib",
+            "the synthetic root has no name worth using as a filename"
+        );
+        assert_eq!(
+            export_filename_for_row(&TreeRow {
+                id: Some(1),
+                depth: 1,
+                name: "Physics".to_string(),
+                entry_count: 0,
+            }),
+            "Physics.bib"
+        );
+        assert_eq!(
+            export_filename_for_row(&TreeRow {
+                id: Some(2),
+                depth: 1,
+                name: "Neuro/Science".to_string(),
+                entry_count: 0,
+            }),
+            "Neuro_Science.bib",
+            "a name containing a path separator must not escape ./ or collide with it"
+        );
     }
 
     #[test]

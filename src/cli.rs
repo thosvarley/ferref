@@ -254,11 +254,17 @@ pub enum Command {
     },
     /// Report attachments whose stored path no longer resolves on disk --
     /// moved or deleted files, or a hand-edited DB row pointing nowhere.
-    /// Read-only: nothing is fixed or removed, just listed. Exits 1 if any
-    /// are found, 0 otherwise, so it's usable as a health-check script.
+    /// Without --fix, nothing is fixed or removed, just listed: exits 1 if
+    /// any are found, 0 otherwise, so it's usable as a health-check script.
+    /// With --fix, every broken attachment is detached and the exit code is
+    /// 0 once that's done.
     Doctor {
         #[arg(long)]
         json: bool,
+        /// Detach every attachment whose path doesn't resolve, instead of
+        /// just reporting it.
+        #[arg(long)]
+        fix: bool,
     },
     /// Browse the library in a three-pane terminal UI (collections, entries,
     /// details): sorts, searches, edits fields, fetches PDFs, deletes and

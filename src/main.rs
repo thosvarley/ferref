@@ -341,32 +341,74 @@ fn main() {
         Command::Extract { cite_key, json } => cmd_extract(&conn, cite_key, json),
 
         Command::Open { cite_key, json } => {
-            let entry = match db::get_entry(&conn, &cite_key) {
-                Ok(Some(e)) => e,
+            // Existence of the entry itself is still checked up front, same
+            // message as before -- attachments_for_cite_key alone would
+            // instead report an empty Vec for an unknown cite_key, which
+            // reads as "no attachments" rather than "no such entry".
+            match db::get_entry(&conn, &cite_key) {
+                Ok(Some(_)) => {}
                 Ok(None) => die(&format!("no entry found with cite_key '{cite_key}'")),
                 Err(e) => die(&format!("failed to fetch entry: {e}")),
             };
-            if entry.attachments.is_empty() {
+            let attachments = match db::attachments_for_cite_key(&conn, &cite_key) {
+                Ok(a) => a,
+                Err(e) => die(&friendly(Some(&cite_key), "list attachments", e)),
+            };
+            if attachments.is_empty() {
                 die(&format!("'{cite_key}' has no attachments"));
             }
 
             // Every attachment, not just the first: an entry usually has one,
-            // and when it has two they're the paper and its supplement.
-            for attachment in &entry.attachments {
-                if let Err(e) = open_path(&attachment.path) {
-                    die(&e);
+            // and when it has two they're the paper and its supplement. A
+            // dangling one (file deleted outside ferref) is self-healed on
+            // the spot rather than handed to the opener to fail on.
+            let mut opened: Vec<String> = Vec::new();
+            let mut cleaned: Vec<String> = Vec::new();
+            for (id, path) in &attachments {
+                match open_or_detach_stale(&conn, *id, path) {
+                    Ok(OpenOutcome::Opened) => opened.push(path.clone()),
+                    Ok(OpenOutcome::DetachedStale) => cleaned.push(path.clone()),
+                    Err(e) => die(&e),
                 }
             }
 
-            if json {
+            if opened.is_empty() {
+                if cleaned.is_empty() {
+                    die(&format!(
+                        "'{cite_key}' has no attachments that resolve on disk"
+                    ));
+                } else {
+                    if json {
+                        let out = serde_json::json!({
+                            "cite_key": cite_key,
+                            "opened": Vec::<String>::new(),
+                            "cleaned": cleaned,
+                        });
+                        emit_json(&out);
+                    } else {
+                        emit(&format!(
+                            "removed {} dangling attachment(s) for '{cite_key}'; nothing left to open",
+                            cleaned.len()
+                        ));
+                        for path in &cleaned {
+                            emit(&format!("  removed dangling attachment '{path}' -- file no longer exists"));
+                        }
+                    }
+                    std::process::exit(1);
+                }
+            } else if json {
                 let out = serde_json::json!({
                     "cite_key": cite_key,
-                    "opened": entry.attachments.iter().map(|a| &a.path).collect::<Vec<_>>(),
+                    "opened": opened,
+                    "cleaned": cleaned,
                 });
                 emit_json(&out);
             } else {
-                for attachment in &entry.attachments {
-                    emit(&format!("Opened '{}'", attachment.path));
+                for path in &opened {
+                    emit(&format!("Opened '{path}'"));
+                }
+                for path in &cleaned {
+                    emit(&format!("removed dangling attachment '{path}' -- file no longer exists"));
                 }
             }
         }
@@ -434,7 +476,7 @@ fn main() {
 
         Command::Collection { command } => dispatch_collection(&conn, command),
 
-        Command::Doctor { json } => cmd_doctor(&conn, json),
+        Command::Doctor { json, fix } => cmd_doctor(&conn, json, fix),
 
         Command::Tui => {
             if let Err(e) = tui::run(&conn) {
@@ -678,6 +720,28 @@ struct AttachOutcome {
     extraction: Option<Result<usize, String>>,
 }
 
+// Prunes an entry's existing attachment rows whose file no longer resolves
+// on disk, right before a new one is added -- what actually prevents the
+// two-PDF state: re-attaching (or re-fetching) after deleting the old file
+// externally now replaces the dangling row instead of accumulating beside
+// it. Only rows confirmed gone are touched; a still-resolving second
+// attachment (the legitimate paper-plus-supplement case) is left alone.
+// Shared by attach_path_for_entry and land_downloaded_pdf (fetch, and
+// add --url's landing-page mode) rather than duplicated in each -- both are
+// write paths that add an attachment via db::attach.
+fn prune_dangling_attachments(conn: &rusqlite::Connection, cite_key: &str) -> Result<usize, String> {
+    let existing = db::attachments_for_cite_key(conn, cite_key)
+        .map_err(|e| friendly(Some(cite_key), "list attachments", e))?;
+    let mut pruned = 0usize;
+    for (id, path) in existing {
+        if !Path::new(&path).is_file() {
+            db::detach(conn, id).map_err(|e| friendly(Some(cite_key), "detach dangling attachment", e))?;
+            pruned += 1;
+        }
+    }
+    Ok(pruned)
+}
+
 fn attach_path_for_entry(
     conn: &rusqlite::Connection,
     cite_key: &str,
@@ -686,6 +750,7 @@ fn attach_path_for_entry(
 ) -> Result<AttachOutcome, String> {
     let source = cli::resolve_attachment_path(path)?;
     let (resolved, copied) = copy_into_library(conn, cite_key, Path::new(&source))?;
+    prune_dangling_attachments(conn, cite_key)?;
     let (attachment_id, changed) = match db::attach(conn, cite_key, &resolved) {
         Ok(pair) => pair,
         Err(e) => {
@@ -1094,41 +1159,68 @@ fn cmd_fetch(conn: &rusqlite::Connection, cite_key: String, email: Option<String
 // state, not just a defensive check). Doesn't touch the filesystem beyond
 // `Path::is_file`, and doesn't offer to fix anything -- that's future work
 // once the report itself has been useful for a while.
-fn cmd_doctor(conn: &rusqlite::Connection, json: bool) {
+fn cmd_doctor(conn: &rusqlite::Connection, json: bool, fix: bool) {
     let attachments = match db::all_attachment_paths(conn) {
         Ok(a) => a,
         Err(e) => die(&format!("failed to list attachments: {e}")),
     };
 
-    let broken: Vec<(&String, &String)> = attachments
+    let broken: Vec<(i64, &String, &String)> = attachments
         .iter()
-        .filter(|(_, path)| !std::path::Path::new(path).is_file())
-        .map(|(cite_key, path)| (cite_key, path))
+        .filter(|(_, _, path)| !std::path::Path::new(path).is_file())
+        .map(|(id, cite_key, path)| (*id, cite_key, path))
         .collect();
 
+    // --fix detaches every broken row found above. `broken` itself keeps
+    // reporting the pre-fix state (audit trail: what *was* wrong), not the
+    // now-empty post-fix scan.
+    let mut fixed = 0usize;
+    if fix {
+        for (id, _, _) in &broken {
+            match db::detach(conn, *id) {
+                Ok(()) => fixed += 1,
+                Err(e) => die(&format!("failed to detach attachment {id}: {e}")),
+            }
+        }
+    }
+
     if json {
-        let out = serde_json::json!({
+        let mut out = serde_json::json!({
             "checked": attachments.len(),
             "broken": broken
                 .iter()
-                .map(|(cite_key, path)| serde_json::json!({ "cite_key": cite_key, "path": path }))
+                .map(|(_, cite_key, path)| serde_json::json!({ "cite_key": cite_key, "path": path }))
                 .collect::<Vec<_>>(),
         });
+        if fix {
+            out["fixed"] = serde_json::json!(fixed);
+        }
         emit_json(&out);
     } else if broken.is_empty() {
         emit(&format!("All {} attachments resolve.", attachments.len()));
+    } else if fix {
+        emit(&format!(
+            "Fixed {fixed} of {} broken attachments.",
+            broken.len()
+        ));
+        for (_, cite_key, path) in &broken {
+            emit(&format!("  {cite_key}: {path}"));
+        }
     } else {
         emit(&format!(
             "{} of {} attachments do not resolve on disk:",
             broken.len(),
             attachments.len()
         ));
-        for (cite_key, path) in &broken {
+        for (_, cite_key, path) in &broken {
             emit(&format!("  {cite_key}: {path}"));
         }
     }
 
-    if !broken.is_empty() {
+    // --fix's whole point is that doctor's job -- nothing broken -- is now
+    // actually true, so it exits 0 even when something needed fixing.
+    // Report-only mode still exits 1 to stay usable as a health-check script.
+    if !fix && !broken.is_empty() {
         std::process::exit(1);
     }
 }
@@ -1374,6 +1466,35 @@ fn emit_json(value: &impl serde::Serialize) {
     }
 }
 
+// What happened to one attachment when `open` (CLI or TUI) tried it.
+enum OpenOutcome {
+    Opened,
+    DetachedStale,
+}
+
+// Shared by CLI `open` and the TUI's `o` (open_selected), per the "one write
+// implementation" rule attach/fetch already follow: check whether the
+// attachment's file still resolves before handing it to the system opener.
+// A path that's gone (deleted outside ferref -- the filesystem is
+// hand-editable, same as the DB) is detached on the spot instead of handed
+// to an opener doomed to fail on it. Detaching is the only DB write here;
+// deciding whether to detach is this function's job precisely because it's
+// paired 1:1 with the open attempt, unlike prune_dangling_attachments'
+// pre-write sweep below.
+fn open_or_detach_stale(
+    conn: &rusqlite::Connection,
+    attachment_id: i64,
+    path: &str,
+) -> Result<OpenOutcome, String> {
+    if !Path::new(path).is_file() {
+        db::detach(conn, attachment_id)
+            .map_err(|e| friendly(None, "detach dangling attachment", e))?;
+        return Ok(OpenOutcome::DetachedStale);
+    }
+    open_path(path)?;
+    Ok(OpenOutcome::Opened)
+}
+
 // The system file opener. `status()` rather than `spawn()`: both xdg-open and
 // macOS `open` hand off and exit immediately, and waiting is what lets a
 // missing opener be reported instead of silently doing nothing.
@@ -1483,6 +1604,8 @@ fn land_downloaded_pdf(
         .to_str()
         .ok_or_else(|| cleanup(format!("path {} is not valid UTF-8", abs.display())))?
         .to_string();
+
+    prune_dangling_attachments(conn, cite_key).map_err(cleanup)?;
 
     let (attachment_id, _changed) = db::attach(conn, cite_key, &path_str)
         .map_err(|e| cleanup(friendly(Some(cite_key), "attach downloaded PDF", e)))?;
@@ -2188,6 +2311,97 @@ mod tests {
         let claimed = claim_free_name(&dir, "paper", "pdf").unwrap();
         assert_eq!(claimed, dir.join("paper-3.pdf"));
         assert!(claimed.is_file(), "claim_free_name must leave a placeholder file behind");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A tiny real on-disk sqlite DB for the tests below -- prune_dangling_
+    // attachments and doctor --fix's core logic both need a real Connection
+    // (db::create_schema is private to db.rs, so db::init_db is the only way
+    // to get a schema from here), and both need a real temp file to prove
+    // the "still resolves" half is left untouched, not just the "gone" half.
+    fn test_db(name: &str) -> (rusqlite::Connection, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "ferref-{name}-test-{}-{}",
+            std::process::id(),
+            name
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = db::init_db(&dir.join("ferref.db")).unwrap();
+        (conn, dir)
+    }
+
+    // The prune half of "self-heal on write": one attachment row whose file
+    // still resolves must survive untouched (the legitimate paper-plus-
+    // supplement case), the other, pointing nowhere, must be pruned.
+    #[test]
+    fn prune_dangling_attachments_removes_only_the_row_whose_file_is_gone() {
+        let (conn, dir) = test_db("prune");
+
+        let entry = Entry::new(
+            "article".to_string(),
+            "k".to_string(),
+            "T".to_string(),
+        );
+        db::insert_entry(&conn, &entry).unwrap();
+
+        let real_path = dir.join("real.pdf");
+        std::fs::write(&real_path, b"pdf bytes").unwrap();
+        let real_path = real_path.to_str().unwrap().to_string();
+        let gone_path = dir.join("gone.pdf").to_str().unwrap().to_string();
+
+        db::attach(&conn, "k", &real_path).unwrap();
+        db::attach(&conn, "k", &gone_path).unwrap();
+
+        let pruned = prune_dangling_attachments(&conn, "k").unwrap();
+        assert_eq!(pruned, 1);
+
+        let remaining = db::attachments_for_cite_key(&conn, "k").unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].1, real_path);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // `doctor --fix`'s core logic: everything all_attachment_paths flags as
+    // not resolving gets detach()ed, everything that does resolve is left
+    // alone -- proven at the db level, without a full CLI harness, per the
+    // brief.
+    #[test]
+    fn doctor_fix_detaches_only_broken_attachments() {
+        let (conn, dir) = test_db("doctor-fix");
+
+        let entry = Entry::new(
+            "article".to_string(),
+            "k".to_string(),
+            "T".to_string(),
+        );
+        db::insert_entry(&conn, &entry).unwrap();
+
+        let real_path = dir.join("real.pdf");
+        std::fs::write(&real_path, b"pdf bytes").unwrap();
+        let real_path = real_path.to_str().unwrap().to_string();
+        let gone_path = dir.join("gone.pdf").to_str().unwrap().to_string();
+
+        db::attach(&conn, "k", &real_path).unwrap();
+        db::attach(&conn, "k", &gone_path).unwrap();
+
+        let attachments = db::all_attachment_paths(&conn).unwrap();
+        let broken: Vec<i64> = attachments
+            .iter()
+            .filter(|(_, _, path)| !Path::new(path).is_file())
+            .map(|(id, _, _)| *id)
+            .collect();
+        assert_eq!(broken.len(), 1);
+
+        for id in &broken {
+            db::detach(&conn, *id).unwrap();
+        }
+
+        let remaining = db::attachments_for_cite_key(&conn, "k").unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].1, real_path);
 
         std::fs::remove_dir_all(&dir).ok();
     }
