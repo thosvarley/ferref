@@ -1895,6 +1895,20 @@ somewhere else. Verified live: marking one entry in a subcollection, then
 switching collections and pressing `A`, produces a mark count that
 includes both -- not just what's currently on screen.
 
+**Follow-on: `U` clears every mark.** Requested right after `A` shipped,
+as its natural complement -- `Esc` already clears marks, but coupled with
+also wiping the search filter (and quitting the app if both happen to
+already be empty), so backing out of a mark-in-progress without losing
+an unrelated filter, or accidentally quitting, needed its own key. `U`
+is a one-line `app.marked.clear()`, deliberately not gated to
+`Focus::Entries` the way `A`/`Space` are -- unlike *making* a mark,
+*clearing* one is useful to reach for from wherever the user ended up,
+e.g. having tabbed over to Collections to file a marked set via `c` and
+changed their mind before pressing it. Verified live via `tmux` (mark
+all, confirm the footer's `(N marked)` suffix, press `U`, confirm it's
+gone); not delegated or reviewed -- too small a change for either to earn
+its keep.
+
 **A visible input cursor.** Every text-entry mode (`/` search, `n` new
 collection, `:` -> `e`'s field editor, `x`'s export path, `:` -> `t`/`u`'s
 tag name) renders into the footer line, and until now gave no visual

@@ -272,6 +272,14 @@ fn handle_normal_key(app: &mut App, conn: &Connection, code: KeyCode, modifiers:
         // comment on App::marked) and a bulk "mark everything I can see"
         // shouldn't undo a cross-collection selection already in progress.
         KeyCode::Char('A') if app.focus == Focus::Entries => app.mark_all_visible(),
+        // "U": clears every mark, regardless of focus -- the direct undo
+        // for "A"/Space, without also touching the search filter or
+        // quitting the way Esc does when both happen to already be empty.
+        // Not gated on `Focus::Entries`: marks (unlike making one) are
+        // useful to back out of from wherever you ended up, e.g. after
+        // tabbing to Collections to file a marked set and changing your
+        // mind before pressing "c".
+        KeyCode::Char('U') => app.marked.clear(),
         // The ":" command palette (Edit/Fetch/Merge/Delete), scoped to
         // whichever entry is currently selected.
         KeyCode::Char(':')
@@ -2614,6 +2622,7 @@ fn draw_help(frame: &mut Frame, frame_area: Rect) {
             &[
                 ("Space", "mark for merge/bulk actions"),
                 ("A", "mark every visible row"),
+                ("U", "clear all marks"),
                 (":", "command palette (opens its own menu)"),
                 ("c", "file into collection (bulk if marked)"),
                 ("x", "export marked as BibTeX"),
