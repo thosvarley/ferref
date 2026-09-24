@@ -1950,6 +1950,113 @@ not worth a special case for.
 
 ---
 
+## Phase 25 — TUI: a scrollable DETAILS pane
+
+Closes a gap the Phase 22 audit already named (F2): the DETAILS pane
+could take focus but did nothing with it, so a long abstract -- routinely
+1500-2500 characters from Crossref -- was simply cut off at the bottom of
+a 34-column pane with no way to read the rest. Under this project's own
+stated bar ("an unreadable field ... is a real bug, not cosmetic
+polish"), this qualified.
+
+`j`/`k`/`Ctrl-d`/`Ctrl-u`/`g`/`G` now scroll the DETAILS pane the same way
+they already move the other two panes, via a new `App::details_scroll:
+u16` field and `App::scroll_details`. `g` jumps to 0; `G` sets it to
+`u16::MAX` and lets the render clamp it down to the true bottom (the key
+handler has no way to know the real max -- that depends on the pane's
+rendered width, i.e. line-wrapping, which only `draw_details` has access
+to at render time). `details_scroll` resets to 0 everywhere the
+*selected entry* changes (`move_table`/`table_home`/`table_end`/
+`select_row`, and every place a `/` search re-filters or clears), so a
+freshly-opened paper always starts at the top rather than wherever the
+last one's scroll position happened to be.
+
+**A real, live-caught correctness bug, not a hypothetical one.** The
+first version clamped scroll against a hand-derived estimate of the
+pane's wrapped row count -- each `Line`'s raw character width divided by
+the available width, rounded up -- reasoning that `Paragraph` doesn't
+expose its own wrapped line count without the `unstable-rendered-line-info`
+cargo feature, and one field's scroll clamp didn't seem worth taking on
+an unstable API surface for. That reasoning was wrong in a way a unit
+test didn't catch (a hand-built `Line`/`Paragraph` in a test is a
+different failure mode than real ratatui word-wrap): driving the actual
+TUI live via `tmux` with a genuinely long abstract, `G` stopped short of
+the text's real final words -- `word192 word193 word194 word195` was the
+last thing visible, with `word196` through `word199` and a closing
+sentence never reachable no matter how many more times `j`/`G` were
+pressed. Word-wrap can't split a word mid-token, so a wrapped row often
+ends with unused width a plain division doesn't account for, and that
+consistently undercounts the true row total -- silently clamping the
+pane short of its own real content, which is exactly the bug this phase
+exists to fix, reintroduced by the fix's own scroll-limiting logic.
+
+Fixed by enabling `ratatui`'s `unstable-rendered-line-info` feature after
+all (`Cargo.toml`) and calling `Paragraph::line_count(width)` -- ratatui's
+own word-wrapper -- instead of re-deriving an approximation of it.
+Verified against the exact scenario that broke: the same long abstract,
+`G` now lands on the text's real last line. Taking on an unstable API
+surface (excluded from semver, so a future `ratatui` patch release could
+change or remove it) is a real, accepted tradeoff here, made explicit
+rather than silently absorbed -- preferred over a hand-rolled estimate
+that's now been directly observed to be wrong, in the one place ("does
+the pane's own scrolling reach the pane's own content") where wrong
+defeats the entire feature. A regression test
+(`details_scroll_uses_real_word_wrap_not_naive_division` -- see the
+review note below for why it isn't the test that first shipped here)
+locks down the clamp arithmetic (`total_lines - visible`) against
+`line_count`'s real, documented behavior; an earlier attempt at testing
+the *old* estimate
+against ratatui's real wrapper (asserting the naive estimate is always
+too low) turned out not to be a reliable invariant either -- word-wrap
+sometimes drops as much whitespace at line breaks as it wastes in
+ragged-right space, so the two can coincidentally match for some inputs
+-- which is itself a small instance of this phase's own lesson: a
+plausible-sounding property of text wrapping is worth checking against
+the real wrapper before asserting it, not just reasoning through it.
+
+Delegation: **no / no** for the implementation -- but the "not reviewed"
+call above was wrong, corrected on request: a scoped review (Sonnet-high)
+found two more real bugs in the same family as the one already fixed
+above, both live-verified via `tmux` rather than assumed from the diff.
+
+`s`/`S` (sort key/direction) and `r` (reload) both call `rebuild_view()`
+without resetting `details_scroll`, unlike every other place that changes
+which entry is selected. Since `table_selected` is a *position* in
+`view`, not an entry id, re-sorting or reloading can put a different
+entry at the same table position the scroll offset was left at --
+confirmed live: scroll deep into one long abstract, press `S` to reverse
+the sort, and the Details pane opened mid-abstract on a *different*
+paper's text the user had never scrolled, instead of at its top. Fixed
+by adding the same one-line reset already used at every other selection-
+changing call site, in both places. (A third occurrence, `reload()`
+reaching the same code path, was fixed identically -- traced with the
+same root cause, live-confirmed by deleting an entry from outside the
+TUI and reloading: the entry now occupying the previously-selected
+position opened without its own scroll reset until this fix.)
+
+The review also caught that the regression test added above didn't
+actually exercise the bug it claimed to guard: its fixture (a
+single 100-character token with no spaces) has no word-wrap breakpoints
+at all, so ratatui's real wrapper and the old, buggy character-division
+estimate happen to agree on it -- the test would still pass even with a
+regression back to the removed code. Replaced with a fixture *verified*
+(computed directly against the real `Paragraph::line_count`, not assumed)
+to diverge from naive division at a specific width, with the divergence
+itself asserted as a sanity check before the real regression assertion
+runs.
+
+Everything else the review checked -- the `u16::MAX` sentinel with
+`saturating_add` not panicking or misbehaving on `G` immediately followed
+by `j`, `refresh_entry` correctly *not* resetting scroll on an in-place
+edit to the currently-viewed entry, the `unstable-rendered-line-info`
+feature not pulling in any new transitive dependencies, and the original
+long-abstract fix itself holding up against several different abstract
+shapes (many short words, a few long unbroken tokens/URLs, short enough
+to need no scrolling at all) -- was independently re-verified and found
+correct.
+
+---
+
 ## Roadmap (not yet scoped)
 
 Ideas worth doing sometime, deliberately not designed in detail yet — see
@@ -1981,7 +2088,7 @@ one yet.
 
 ## Order of work
 
-Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17 → 18 → 19 → 20 → 21 → 22 → 23 → 24. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
+Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17 → 18 → 19 → 20 → 21 → 22 → 23 → 24 → 25. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
 
 ---
 
@@ -2016,6 +2123,7 @@ Which phases get farmed out to a `coder` subagent, and which get an
 | 22 — Opus audit: 9 bugs | **yes** | **yes** | Real correctness fixes across five files, several touching trust boundaries (SSRF, `O_EXCL` races, FTS5) this table already flags as earning review. |
 | 23 — Self-healing attachments, `doctor --fix`, `detach` | **yes** | **yes** | Touches the `O_EXCL`-sensitive attach/fetch write paths plus a new bulk-delete path (`doctor --fix`) whose failure mode is data loss if it's wrong. |
 | 24 — TUI: collection export, mark-all, input cursor | no | no | Three small, mechanical additions, each extending an existing pattern. Still reviewed (Sonnet-high) since two of the three are only verifiable by actually running the TUI. |
+| 25 — TUI: scrollable DETAILS pane | no | **yes** | Small, but real correctness risk in the scroll-clamp math -- one bug caught live during implementation, two more caught by a review requested after the fact. Selection-tracking-by-position bugs like this one recur easily; worth a look even on "small" changes. |
 
 The table is a default, not a rule. The reasoning behind it, which outlives the
 table if the phases change:

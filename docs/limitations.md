@@ -1,24 +1,50 @@
-# Limitations worth knowing
+# Known limitations
 
-- The library is one fixed location (`FERREF_HOME`, else `~/.ferref`) — there's
-  no support for multiple libraries from one install.
-- Two entries can't share a DOI, but nothing stops the same paper being added
-  twice under two DOIs (a preprint and its published version, say), or with no
-  DOI at all.
-- `edit` can't clear a field back to null, and there's no `detach`.
-- Attachment paths are absolute and stored once. The files live in
-  `~/.ferref/pdfs/`, but the paths don't move with the library — relocating the
-  directory breaks every link silently.
-- BibTeX export writes legacy BibTeX by default; `@online` and `@dataset` need
-  `--biblatex`, which legacy BibTeX styles can't read. Collections don't survive
-  a round trip (tags do, via `keywords`).
-- Extraction is PDF-only, capped at 10 MB of text per attachment.
-- A collection whose *name* contains `/` can't be addressed by the CLI's path
-  syntax. The CLI won't create one; only hand-editing the database can. The TUI
-  reaches collections by id and handles them fine.
-- The TUI files papers and creates collections, but can't edit or delete
-  anything, rename a collection, or tag — use the CLI, then press `r`.
-- The TUI doesn't watch the database. Changes from another shell appear on `r`,
-  not on their own.
+**Library**
 
-{doc}`design` has the full list, with the reasoning behind each.
+- There is one library per install. `FERREF_HOME` can point it elsewhere, but
+  ferref can't switch between several.
+- Attachment paths are stored in full. If you move the library folder, every
+  path breaks, and `ferref doctor --fix` would remove them all. Move it back,
+  or update the paths with SQL, before running `--fix`.
+- Deleting or merging a paper leaves its PDF files in `pdfs/`. Nothing cleans
+  them up yet.
+
+**Entries**
+
+- Two papers can't share a DOI, but ferref can't tell that a preprint and its
+  published version are the same paper. Use `ferref merge` when you spot one.
+- A cite key can't be changed after the paper is added.
+- `ferref edit` can't clear a field. The TUI's editor can.
+- There is no command to detach a PDF that still exists on disk.
+
+**Fetching**
+
+- `add --doi` only works for DOIs that Crossref knows about. arXiv DOIs
+  (`10.48550/arXiv.*`) are not among them, so add arXiv papers with
+  `add --url https://arxiv.org/abs/...` instead.
+- `fetch` only downloads free, legal copies. It will not get around a paywall.
+
+**Text**
+
+- Only PDFs can be converted to text, and only if `pdftotext` is installed.
+- At most 10 MB of text is kept per PDF.
+
+**BibTeX**
+
+- Export writes plain BibTeX unless you pass `--biblatex`. Plain BibTeX has no
+  `@online` or `@dataset`, so those become `@misc`.
+- Tags survive an export and re-import (in the `keywords` field). Collections
+  don't.
+- Line breaks inside a field, such as a multi-paragraph abstract, become spaces.
+
+**Collections**
+
+- The command line addresses collections by path, so a collection whose name
+  contains `/` can't be reached from it. ferref won't create one, and the TUI
+  handles them fine.
+
+**TUI**
+
+- It doesn't notice changes made from another terminal until you press `r`.
+- Its export (`x`) writes plain BibTeX only.

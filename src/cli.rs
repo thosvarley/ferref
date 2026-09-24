@@ -172,7 +172,8 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Attach a file to an entry. The file is copied into ./pdfs/ under the
+    /// Attach a file to an entry. The file is copied into the library's pdfs/
+    /// folder under the
     /// same <cite_key>.pdf naming scheme `fetch` uses, and that copy's path is
     /// what gets stored; the original is left where it is.
     Attach {
@@ -224,9 +225,10 @@ pub enum Command {
         #[arg(long)]
         recursive: bool,
     },
-    /// Look up an open-access PDF for an entry's DOI via Unpaywall, and
-    /// attach + extract it if one exists. No OA copy found is a normal
-    /// outcome (exit 0), not an error.
+    /// Look up an open-access PDF for an entry's DOI and attach + extract it
+    /// if one exists. Tries Unpaywall, then arXiv, bioRxiv/medRxiv, OSF, and
+    /// preprints.org. No OA copy found is a normal outcome (exit 0), not an
+    /// error.
     Fetch {
         cite_key: String,
         /// Contact email for Unpaywall's polite-pool policy. Falls back to

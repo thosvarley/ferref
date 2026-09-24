@@ -1,18 +1,28 @@
 # ferref
 
-A command-line/TUI reference manager.
+ferref is a reference manager for the terminal. It is built to be used by a
+person at a keyboard and by scripts or AI agents, with neither treated as an
+afterthought.
 
-The premise: a reference manager that can be useful for an AI agent as well
-as a human being — for a local RAG system on air-gapped machines, fine-tuning
-on pre-selected scientific literature, or compiling bibliographies. There is
-no GUI; everything is done on the command line for easy script-based
-interfacing. There is a TUI for human users that aims to mimic the experience
-of Zotero, but using keystrokes inspired by Vim motions.
+- **Your library is a plain SQLite file** plus a folder of PDFs. Any tool that
+  reads SQLite can read it, and backing it up means copying one directory.
+- **Every command that prints data accepts `--json`**, so ferref slots into
+  shell pipelines, Python scripts, and model pipelines.
+- **Full text is first-class.** PDFs are converted to text and indexed, so you
+  can search inside papers or hand their text to an embedding or LLM pipeline.
+- **`ferref tui`** opens a three-pane browser in the style of Zotero, driven with
+  Vim keys.
 
-The database is a plain SQLite file — no proprietary blob format. Anyone (or
-anything) can open it directly. See [Design & architecture](design) for the
-reasoning behind that and every other choice in the project, and a frank list
-of known limitations.
+It is useful for keeping a bibliography, building a local retrieval (RAG) corpus
+on a machine without internet access, or assembling a set of papers for
+fine-tuning.
+
+## Where to start
+
+- **New here?** {doc}`installation`, then the {doc}`tutorial`.
+- **Browsing in the terminal?** {doc}`tui`.
+- **Looking up a command or flag?** {doc}`cli-reference`.
+- **Writing a script against ferref?** {doc}`scripting`, then {doc}`database`.
 
 ```{toctree}
 :maxdepth: 2
@@ -28,11 +38,3 @@ limitations
 development
 design
 ```
-
-## Where to start
-
-- New to ferref? Start with {doc}`installation`, then work through {doc}`tutorial`.
-- Driving ferref from a script or a model pipeline? {doc}`scripting` covers the
-  `--json` contract and the output shape.
-- Using the terminal browser? See {doc}`tui`.
-- Looking for a specific flag? {doc}`cli-reference` is the full command table.

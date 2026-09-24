@@ -1,15 +1,20 @@
 # Development
 
 ```sh
-cargo test        # no network access required
+cargo test    # never touches the network
 cargo build
 ```
 
-No test touches the network; the Crossref and Unpaywall parsers are tested
-against captured fixture strings.
+Tests for the Crossref, Unpaywall, and bioRxiv code run against saved
+responses, so the suite works offline.
 
-See {doc}`design` for the design principles and the reasoning behind ferref's
-choices.
+## How work is organized
+
+`DESIGN.md`, at the root of the repository, is the working record of the
+project. It lists the design principles and every phase of work so far: what
+was built, why, and what review turned up. New work starts with a section
+there. {doc}`design` summarizes the parts that matter for using and extending
+ferref.
 
 ## Building these docs
 

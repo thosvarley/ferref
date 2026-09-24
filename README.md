@@ -1,74 +1,55 @@
 # ferref
 
-A command-line/TUI reference manager.
+A reference manager for the terminal, built for people and for scripts.
 
-The premise: a reference manager that can be useful for an AI agent as well as
-a human being — for a local RAG system on air-gapped machines, fine-tuning on
-pre-selected scientific literature, or compiling bibliographies. There is no
-GUI; everything is done on the command line for easy script-based
-interfacing. There's also a TUI for human browsing, using Vim-inspired
-keybindings.
+- **Plain SQLite storage.** Your library is one `.db` file plus a folder of PDFs.
+  Any tool that reads SQLite can read it.
+- **Scriptable.** Every command that prints data accepts `--json`.
+- **Full text.** PDFs are converted to text and indexed, so you can search inside
+  papers or feed them to an embedding or LLM pipeline.
+- **A terminal browser.** `ferref tui` gives a three-pane, Zotero-style view with
+  Vim keys.
 
-The database is a plain SQLite file, not a proprietary blob format —
-`sqlite3 ~/.ferref/ferref.db` gets you something sane.
-
-**Full documentation: https://ferref.readthedocs.io** — tutorial, TUI guide,
-command reference, JSON/scripting contract, and the design doc (reasoning and
-known limitations).
+Full documentation: **https://ferref.readthedocs.io**
 
 ## Install
 
-Requires Rust (2024 edition) and `pdftotext` (`apt install poppler-utils`).
+You need Rust (2024 edition) and `pdftotext` (`apt install poppler-utils`).
 
 ```sh
 ./install.sh
 ```
 
-Builds the release binary, installs it to `~/.local/bin`, and creates the
-library directory (`~/.ferref` by default, override with `FERREF_HOME`).
-Re-run any time to pick up a new build.
+This builds ferref, copies it to `~/.local/bin`, and creates your library at
+`~/.ferref` (set `FERREF_HOME` to put it elsewhere). Run it again after pulling
+changes.
 
-### Nix / NixOS
-
-A flake is included — no Rust toolchain or `pdftotext` needed up front, both
-are pulled in as build/runtime dependencies automatically.
+With Nix, no toolchain is needed:
 
 ```sh
-nix run github:thosvarley/ferref            # try it without installing
-nix profile install github:thosvarley/ferref # install into your profile
+nix run github:thosvarley/ferref             # try it
+nix profile install github:thosvarley/ferref # install it
 ```
 
-Or add it as a flake input to your own system config and reference
-`ferref.packages.${system}.default`.
-
-## Quick look
+## A quick look
 
 ```console
 $ ferref add --doi 10.1103/PhysRev.106.620
 Information Theory and Statistical Mechanics [jaynes1957]
   ...
-
 $ ferref tag jaynes1957 entropy
+$ ferref collection new "Information Theory"
 $ ferref collection add "Information Theory" jaynes1957
 $ ferref search --tag entropy --json | jq -r '.[].cite_key'
 jaynes1957
-
-$ ferref tui   # three-pane terminal browser
+$ ferref tui
 ```
-
-Every data-printing command supports `--json` — see the [scripting
-docs](https://ferref.readthedocs.io/en/latest/scripting.html) for the full
-contract and the JSON shape.
 
 ## Development
 
 ```sh
-cargo test
+cargo test    # never touches the network
 cargo build
 ```
 
-No test touches the network. See `DESIGN.md` for the design principles and
-reasoning behind ferref's choices — or the rendered version at
-[readthedocs](https://ferref.readthedocs.io/en/latest/design.html).
-
-To build the docs locally: `pip install -r docs/requirements.txt && sphinx-build -b html docs docs/_build/html`.
+`DESIGN.md` records the design principles and the history of every change.

@@ -151,6 +151,7 @@ fn handle_normal_key(app: &mut App, conn: &Connection, code: KeyCode, modifiers:
                 app.filter.clear();
                 app.marked.clear();
                 app.rebuild_view();
+                app.details_scroll = 0;
             }
         }
         KeyCode::Tab => app.focus = app.focus.next(),
@@ -165,32 +166,46 @@ fn handle_normal_key(app: &mut App, conn: &Connection, code: KeyCode, modifiers:
         KeyCode::Up | KeyCode::Char('k') => match app.focus {
             Focus::Collections => app.move_tree(conn, -1),
             Focus::Entries => app.move_table(-1),
-            Focus::Details => {}
+            Focus::Details => app.scroll_details(-1),
         },
         KeyCode::Down | KeyCode::Char('j') => match app.focus {
             Focus::Collections => app.move_tree(conn, 1),
             Focus::Entries => app.move_table(1),
-            Focus::Details => {}
+            Focus::Details => app.scroll_details(1),
         },
         KeyCode::Char('d')
-            if modifiers.contains(KeyModifiers::CONTROL) && app.focus == Focus::Entries =>
+            if modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(app.focus, Focus::Entries | Focus::Details) =>
         {
-            app.move_table(10);
+            match app.focus {
+                Focus::Entries => app.move_table(10),
+                Focus::Details => app.scroll_details(10),
+                Focus::Collections => {}
+            }
         }
         KeyCode::Char('u')
-            if modifiers.contains(KeyModifiers::CONTROL) && app.focus == Focus::Entries =>
+            if modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(app.focus, Focus::Entries | Focus::Details) =>
         {
-            app.move_table(-10);
+            match app.focus {
+                Focus::Entries => app.move_table(-10),
+                Focus::Details => app.scroll_details(-10),
+                Focus::Collections => {}
+            }
         }
         KeyCode::Char('g') => match app.focus {
             Focus::Collections => app.tree_top(conn),
             Focus::Entries => app.table_home(),
-            Focus::Details => {}
+            Focus::Details => app.details_scroll = 0,
         },
         KeyCode::Char('G') => match app.focus {
             Focus::Collections => app.tree_bottom(conn),
             Focus::Entries => app.table_end(),
-            Focus::Details => {}
+            // The true bottom depends on the pane's actual rendered width
+            // (line-wrapping), which this key handler doesn't have -- draw_details
+            // clamps whatever's stored here down to the real max at render time,
+            // so a large sentinel always lands exactly at the bottom.
+            Focus::Details => app.details_scroll = u16::MAX,
         },
         KeyCode::Left | KeyCode::Char('h') if app.focus == Focus::Collections => {
             app.collapse_or_to_parent(conn)
@@ -209,10 +224,17 @@ fn handle_normal_key(app: &mut App, conn: &Connection, code: KeyCode, modifiers:
         KeyCode::Char('s') => {
             app.sort_key = app.sort_key.next();
             app.rebuild_view();
+            // Re-sorting can put a different entry at the same table
+            // position `table_selected` still points at -- it's an index
+            // into `view`, not an entry id -- so a Details-pane scroll
+            // position from the entry that *used* to be there must not
+            // silently carry over onto whatever landed there instead.
+            app.details_scroll = 0;
         }
         KeyCode::Char('S') => {
             app.sort_desc = !app.sort_desc;
             app.rebuild_view();
+            app.details_scroll = 0; // see the "s" arm above
         }
         KeyCode::Char('/') => {
             app.mode = Mode::Input(
@@ -310,6 +332,7 @@ fn handle_input_key(
             if matches!(kind, InputKind::Search { .. }) {
                 app.filter = buffer.clone();
                 app.rebuild_view();
+                app.details_scroll = 0;
             }
             app.mode = Mode::Input(kind, buffer);
         }
@@ -318,6 +341,7 @@ fn handle_input_key(
             if matches!(kind, InputKind::Search { .. }) {
                 app.filter = buffer.clone();
                 app.rebuild_view();
+                app.details_scroll = 0;
             }
             app.mode = Mode::Input(kind, buffer);
         }
@@ -361,6 +385,7 @@ fn handle_input_key(
                 InputKind::Search { previous } => {
                     app.filter = previous;
                     app.rebuild_view();
+                    app.details_scroll = 0;
                     app.mode = Mode::Normal;
                 }
                 InputKind::NewCollection | InputKind::ExportPath { .. } | InputKind::Tag { .. } => {
@@ -1123,6 +1148,14 @@ struct App {
     // is an index into THIS, never into `entries` directly.
     view: Vec<usize>,
     table_selected: usize, // index into `view`
+    // Lines scrolled down in the DETAILS pane, for a long abstract that
+    // doesn't fit. Reset to 0 wherever the *selected entry* changes
+    // (move_table/table_home/table_end/select_row/rebuild_view) so a fresh
+    // paper always opens at its top rather than wherever the last one left
+    // off. Clamped to the real bottom at render time (see draw_details) --
+    // not here, since the true max depends on the pane's rendered width
+    // (line-wrapping), which this field's own writers don't have.
+    details_scroll: u16,
     // entry id -> [(attachment path, extracted-text char length)], loaded
     // alongside `entries` so the details pane never queries during render.
     attachment_lengths: AttachmentLengths,
@@ -1166,6 +1199,7 @@ impl App {
             entries,
             view: Vec::new(),
             table_selected: 0,
+            details_scroll: 0,
             attachment_lengths,
             filter: String::new(),
             sort_key: SortKey::Title,
@@ -1204,6 +1238,12 @@ impl App {
         self.entries = entries;
         self.attachment_lengths = lengths;
         self.rebuild_view();
+        // `table_selected` is a position, not an entry id -- a reload can
+        // change what actually occupies that position (an edit made from
+        // another session, an entry deleted elsewhere), so a stale Details
+        // scroll must not carry over onto whatever's there now. Same
+        // reasoning as the "s"/"S" sort handlers.
+        self.details_scroll = 0;
         Ok(())
     }
 
@@ -1789,6 +1829,7 @@ impl App {
                 self.entries = entries;
                 self.attachment_lengths = lengths;
                 self.table_selected = 0;
+                self.details_scroll = 0;
                 self.rebuild_view();
             }
             Err(e) => self.status = Some(e),
@@ -1854,16 +1895,32 @@ impl App {
         let len = self.view.len() as i32;
         let new = (self.table_selected as i32 + delta).clamp(0, len - 1);
         self.table_selected = new as usize;
+        self.details_scroll = 0;
     }
 
     fn table_home(&mut self) {
         self.table_selected = 0;
+        self.details_scroll = 0;
     }
 
     fn table_end(&mut self) {
         if !self.view.is_empty() {
             self.table_selected = self.view.len() - 1;
         }
+        self.details_scroll = 0;
+    }
+
+    // "j"/"k"/Ctrl-d/Ctrl-u in the DETAILS pane. Only ever moves down from
+    // (or up to) 0 -- the real bottom depends on the pane's rendered width
+    // (line-wrapping), which this method doesn't have, so it's clamped at
+    // render time instead (see draw_details); scrolling past the true end
+    // here is harmless; the render just doesn't move any further.
+    fn scroll_details(&mut self, delta: i32) {
+        self.details_scroll = if delta < 0 {
+            self.details_scroll.saturating_sub((-delta) as u16)
+        } else {
+            self.details_scroll.saturating_add(delta as u16)
+        };
     }
 }
 
@@ -2464,21 +2521,40 @@ fn details_lines(e: &Entry, lengths: Option<&Vec<Option<i64>>>) -> Vec<Line<'sta
 }
 
 fn draw_details(frame: &mut Frame, area: Rect, app: &App) {
-    let text = match app.selected_entry() {
-        None => Text::from("No entries."),
+    let lines = match app.selected_entry() {
+        None => vec![Line::raw("No entries.")],
         Some(e) => {
             let lengths = e.id.and_then(|id| app.attachment_lengths.get(&id));
-            Text::from(details_lines(e, lengths))
+            details_lines(e, lengths)
         }
     };
 
-    let para = Paragraph::new(text)
+    let para = Paragraph::new(Text::from(lines))
         .block(pane_block(
             "DETAILS".to_string(),
             app.focus == Focus::Details,
         ))
         .wrap(Wrap { trim: false });
-    frame.render_widget(para, area);
+
+    // The pane's two-cell border eats into the width text actually wraps
+    // at; `area.width` itself is the *outer* rect draw_details was given.
+    // `line_count` is ratatui's own word-wrapper, not a hand-rolled
+    // estimate -- a first attempt here divided each Line's raw character
+    // width by the available width, which undercounts real word-wrapped
+    // rows (word-wrap leaves ragged-right space at each break, so it needs
+    // *more* rows than a plain division assumes) and was caught silently
+    // clamping "G" short of a real abstract's actual last words -- exactly
+    // the failure this feature exists to prevent. `line_count` needs the
+    // `unstable-rendered-line-info` cargo feature (see Cargo.toml); that
+    // API surface not being under semver is an accepted, documented
+    // tradeoff against being wrong about where the text actually ends.
+    let text_width = area.width.saturating_sub(2);
+    let total_lines = para.line_count(text_width);
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_scroll = total_lines.saturating_sub(visible) as u16;
+    let scroll = app.details_scroll.min(max_scroll);
+
+    frame.render_widget(para.scroll((scroll, 0)), area);
 }
 
 // Priority order: a pending status message beats everything (it's
@@ -3006,6 +3082,7 @@ mod tests {
             entries,
             view,
             table_selected: 0,
+            details_scroll: 0,
             attachment_lengths: HashMap::new(),
             filter: String::new(),
             sort_key: SortKey::Title,
@@ -3123,6 +3200,7 @@ mod tests {
             ],
             view: Vec::new(),
             table_selected: 1, // pointing at "Beta" before the filter narrows things
+            details_scroll: 0,
             attachment_lengths: HashMap::new(),
             filter: String::new(),
             sort_key: SortKey::Title,
@@ -3167,6 +3245,53 @@ mod tests {
             .position(|l| std::ptr::eq(l, doi_line))
             .unwrap();
         assert!(lines[..doi_idx].iter().any(|l| l.spans.is_empty()));
+    }
+
+    // draw_details's scroll clamp is `total_lines - visible`, where
+    // `total_lines` comes from `Paragraph::line_count` (ratatui's own
+    // word-wrapper, gated behind the `unstable-rendered-line-info` cargo
+    // feature -- see Cargo.toml). An earlier version re-derived the
+    // wrapped row count itself (each Line's raw character width divided
+    // by the pane width) instead of asking ratatui, and that estimate
+    // undercounted real word-wrapped text for some inputs -- word-wrap
+    // can't split a word mid-token, so a row sometimes ends with unused
+    // width a plain division doesn't account for -- which silently
+    // clamped "G" short of a real abstract's actual last words, caught
+    // live in a real terminal session, not by any unit test.
+    //
+    // This locks down two things a live-only check can't: that the naive
+    // (wrong) estimate really does diverge from `line_count` for a
+    // realistic multi-word case (a regression back to raw-division would
+    // fail this), and that the clamp subtraction itself is correct at
+    // both a fits-entirely and a needs-scrolling boundary. The divergent
+    // case below is verified, not assumed -- a first attempt at this test
+    // used a fixture (a single unbroken 100-char token) where word-wrap
+    // has no breakpoints at all, so it coincidentally agreed with plain
+    // division and would have passed even with the old, buggy code path
+    // still in place; this one was checked to actually diverge before
+    // being written down as a fixture.
+    #[test]
+    fn details_scroll_uses_real_word_wrap_not_naive_division() {
+        let text =
+            "alpha bee car delta elephant fig grape house ivy jelly kangaroo lemon mango";
+        let width = 17u16;
+        let naive_estimate = (text.chars().count() as u16).div_ceil(width);
+        assert_eq!(naive_estimate, 5, "sanity check on the fixture itself");
+
+        let para = Paragraph::new(Text::from(vec![Line::raw(text.to_string())]))
+            .wrap(Wrap { trim: false });
+        let total_lines = para.line_count(width) as u16;
+        assert_eq!(
+            total_lines, 6,
+            "word-wrap needs a 6th row for this text at width 17 -- a \
+             regression to character-width division would compute 5 here \
+             and silently clamp scrolling one row short"
+        );
+
+        // A pane tall enough to show all 6 rows: nothing to scroll.
+        assert_eq!(total_lines.saturating_sub(6), 0);
+        // A pane that only fits 4 rows at a time: 2 rows of headroom.
+        assert_eq!(total_lines.saturating_sub(4), 2);
     }
 
     // Insertion order matters (first marked survives a merge), and marking

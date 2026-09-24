@@ -1,12 +1,12 @@
 # Tutorial
 
-Everything below is a real session. `ferref` works from anywhere once
-installed — no need to `cd` into a project directory first.
+This walks through a session from an empty library to exported BibTeX.
+Every command works from any directory.
 
-## 1. Add a paper by DOI
+## 1. Add papers
 
-The fastest way in. Crossref fills in the metadata, and the cite key is derived
-from the first author and year.
+**By DOI.** ferref looks the paper up on Crossref and builds a cite key from the
+first author's surname and the year.
 
 ```console
 $ ferref add --doi 10.1103/PhysRev.106.620
@@ -20,8 +20,11 @@ Information Theory and Statistical Mechanics [jaynes1957]
   DOI: 10.1103/PhysRev.106.620
 ```
 
-Or add one by hand when there's no DOI. `--author` repeats, each as
-`"Last, First"`:
+Any other flag you pass (`--journal`, `--year`, `--abstract`, `--author`, and so
+on) overrides what Crossref returned. `--key` sets your own cite key.
+
+**By hand.** Give a type, a cite key, and a title. Repeat `--author` once per
+author, written `"Last, First"`.
 
 ```sh
 ferref add --type article --key shannon1948 \
@@ -29,6 +32,23 @@ ferref add --type article --key shannon1948 \
   --author "Shannon, Claude E." \
   --year 1948 --journal "Bell System Technical Journal"
 ```
+
+**From a web page.** Give `--url` on its own and ferref reads the page's
+citation metadata (the `citation_*` tags publishers add for Google Scholar),
+then downloads the PDF the page links to.
+
+```console
+$ ferref add --url https://arxiv.org/abs/1706.03762
+Attention Is All You Need [vaswani2017]
+  ...
+Attached '~/.ferref/pdfs/vaswani2017.pdf'
+```
+
+This is the way to add arXiv papers, and papers your institution gives you
+access to. Section 5 explains how the download works.
+
+If you pass `--url` together with `--type`, `--key`, and `--title`, it is just
+stored as the entry's URL and no page is fetched.
 
 ## 2. Look at your library
 
@@ -38,17 +58,24 @@ jaynes1957      1957   Information Theory and Statistical Mechanics       Jaynes
 shannon1948     1948   A Mathematical Theory of Communication             Shannon, Claude E.
 ```
 
-`show` gives one entry in full, and every data command takes `--json`:
+`ferref show jaynes1957` prints one entry in full. Add `--json` to either
+command for machine-readable output.
+
+To change an entry, pass only the fields you want to change:
 
 ```sh
-ferref show jaynes1957
-ferref show jaynes1957 --json
+ferref edit shannon1948 --volume 27 --pages 379-423
 ```
 
-## 3. Tag things
+## 3. Tags and collections
 
-Tags are lowercased and trimmed, so `ML`, `ml`, and `  Ml  ` are one tag.
-Tagging twice is a no-op, not an error.
+ferref has both, because they do different jobs:
+
+- A **tag** describes a paper. A paper can have many tags, and tags don't nest.
+- A **collection** is a folder a paper is filed in. Collections nest.
+
+**Tags** are lowercased and trimmed, so `ML`, `ml`, and ` ml ` are the same tag.
+Adding a tag twice does nothing.
 
 ```console
 $ ferref tag jaynes1957 "  Entropy  "
@@ -57,155 +84,120 @@ $ ferref tag jaynes1957 entropy
 'jaynes1957' already tagged 'entropy'
 ```
 
-## 4. Organise into collections
-
-Tags and collections do different jobs and both exist. A **tag** describes a
-paper and doesn't nest; a **collection** is *where a paper lives*, and it does.
-
-Paths are `mkdir -p`-style — creating a nested path creates every level:
+**Collections** are written as paths. Creating a nested path creates every
+level, like `mkdir -p`.
 
 ```console
 $ ferref collection new "Information Theory/Foundations"
 Created collection 'Information Theory/Foundations' (id 2)
-
 $ ferref collection add "Information Theory/Foundations" shannon1948
 Added 'shannon1948' to 'Information Theory/Foundations'
 $ ferref collection add "Information Theory" jaynes1957
 Added 'jaynes1957' to 'Information Theory'
-
 $ ferref collection ls
 Information Theory (1)
   Foundations (1)
 ```
 
-Filtering is direct by default; `--recursive` includes descendants:
+Filtering by collection shows only papers filed directly in it. Add
+`--recursive` to include everything underneath.
 
 ```console
 $ ferref list --collection "Information Theory"
 jaynes1957      1957   Information Theory and Statistical Mechanics       Jaynes, E. T.
-
 $ ferref list --collection "Information Theory" --recursive
 jaynes1957      1957   Information Theory and Statistical Mechanics       Jaynes, E. T.
 shannon1948     1948   A Mathematical Theory of Communication             Shannon, Claude E.
 ```
 
-`collection mv` reparents a subtree and refuses to create a loop:
+`collection mv` moves a collection (and everything under it) to a new parent.
+`collection delete` removes a collection and its subcollections, but never the
+papers in them.
 
-```console
-$ ferref collection mv "Information Theory" --parent "Information Theory/Foundations"
-Error: cannot move a collection under its own descendant
-```
+## 4. Search
 
-`collection delete` removes a collection and its subtree. It never deletes
-entries — only their membership.
-
-## 5. Search
-
-Filters combine with AND. `--author` and `--title` are case-insensitive
-substring matches; `--tag` is an exact match, because tags are identifiers.
-`--text` searches extracted PDF text (see {doc}`scripting` for how that's
-indexed).
+Filters combine: a paper must match all of them.
 
 ```sh
 ferref search --author jaynes
 ferref search --title "information theory" --from 1950 --to 1960
-ferref search --tag ENTROPY --year 1957
-ferref search --text "multivariate information decomposition"
+ferref search --tag entropy --year 1957
 ```
 
-No matches prints nothing and exits 0 — it's a query, not a test.
+`--author` and `--title` match any part of the text, ignoring case. `--tag`
+must match the whole tag.
 
-## 6. Attach a PDF you already have
-
-ferref copies the file into `~/.ferref/pdfs/`, named after the cite_key — the
-same scheme `fetch` uses — and stores that copy's absolute path. Your original
-is left where it is. The point is that every paper in a library sits in one
-directory, whether it arrived by hand or over the network, so backing the whole
-thing up is `~/.ferref/pdfs/` plus one `.db` file.
-
-Say you've already downloaded a paper and added its entry (`ferref add --doi
-10.1186/s12859-020-3494-x`, which the next step covers):
+`--text` searches inside the papers themselves, and shows where each match
+occurs:
 
 ```console
-$ ferref attach zhou2020 ~/Downloads/zhou2020.pdf --extract
-Attached '/home/you/.ferref/pdfs/zhou2020.pdf' to 'zhou2020'
-Extracted 35163 characters from '/home/you/.ferref/pdfs/zhou2020.pdf'
+$ ferref search --text "scaled dot-product"
+vaswani2017    Attention Is All You Need (2017)
+  …Noam proposed scaled dot-product attention, multi-head attention and the parameter…
+  …ors. The output is computed as a weighted sum 3 Scaled Dot-Product Attention…
+  (+3 more matches in vaswani2017.pdf)
 ```
 
-(The character count is whatever's in your PDF.)
+A search with no matches prints nothing and succeeds.
 
-Attaching the same file twice is a no-op. Attaching a *second*, different file
-to the same entry — a paper and its supplement — gets `zhou2020-2.pdf`
-rather than overwriting the first.
+## 5. PDFs
 
-`--extract` runs `pdftotext` and stores the result. Without it, use
-`ferref extract zhou2020` later. `ferref open zhou2020` opens the
-attachments in your default viewer.
+Every PDF lives in `~/.ferref/pdfs/`, named after its cite key. However a paper
+arrived, it ends up in that one folder, so backing up your library means
+copying `~/.ferref`.
 
-## 7. Fetch an open-access PDF automatically
+### Attach a file you already have
 
-`fetch` asks Unpaywall whether a legal open-access copy exists, and if one does,
-downloads it to `~/.ferref/pdfs/`, attaches it, and extracts the text.
+ferref copies the file into the library; your original stays where it is.
+`--extract` converts it to text straight away.
 
-This needs a contact email — Unpaywall's polite-pool policy. Set it once:
-
-```sh
-mkdir -p ~/.config/ferref
-echo 'email = you@example.com' > ~/.config/ferref/config.toml
+```console
+$ ferref attach jaynes1957 ~/Downloads/jaynes.pdf --extract
+Attached '~/.ferref/pdfs/jaynes1957.pdf' to 'jaynes1957'
+Extracted ... characters from '~/.ferref/pdfs/jaynes1957.pdf'
 ```
 
-(Or pass `--email`, or set `FERREF_EMAIL`. The email is sent to Unpaywall and
-nowhere else — Crossref never sees it.)
+Attaching a second, different file to the same paper (a supplement, say)
+stores it as `jaynes1957-2.pdf`. To extract text later, run
+`ferref extract jaynes1957`. To read the paper, run `ferref open jaynes1957`.
 
-Add an open-access paper, then fetch it:
+### Fetch an open-access copy
+
+`fetch` looks for a legal, free copy of a paper using its DOI. It needs a
+contact email for Unpaywall ({doc}`installation` shows how to set one).
 
 ```console
 $ ferref add --doi 10.1038/s41586-020-2649-2
 Array programming with NumPy [harris2020]
   ...
-
 $ ferref fetch harris2020
-Downloaded open-access PDF for 'harris2020' to '/home/you/papers/pdfs/harris2020.pdf'
-Extracted 41013 characters from '/home/you/papers/pdfs/harris2020.pdf'
+Downloaded open-access PDF for 'harris2020' from Unpaywall to '~/.ferref/pdfs/harris2020.pdf'
+Extracted 41013 characters from '~/.ferref/pdfs/harris2020.pdf'
 ```
 
-Plenty of genuinely open papers are only linked as landing pages, so you'll also
-see this — it's an answer, not a failure, and exits 0:
+ferref asks Unpaywall first. If Unpaywall has nothing, it tries the preprint
+server the DOI belongs to: arXiv, bioRxiv/medRxiv, OSF (including PsyArXiv,
+SocArXiv, and others), or preprints.org.
+
+Finding nothing is a normal result, not an error:
 
 ```console
-$ ferref add --doi 10.7717/peerj.4375   # then:
 $ ferref fetch piwowar2018
-'piwowar2018' (DOI 10.7717/peerj.4375) is open access, but Unpaywall has no
-direct PDF link for it -- only landing pages
+'piwowar2018' (DOI 10.7717/peerj.4375) is open access, but no direct PDF link
+was found (tried: Unpaywall, arXiv, bioRxiv, OSF, preprints.org)
 ```
 
-ferref will not work around a paywall. If Unpaywall says there's no legal open
-copy, that's the end of it.
+ferref never works around a paywall.
 
-## 7b. Add from a page you're looking at
+### Download from a page you can already read
 
-`fetch` asks Unpaywall about a paper's *licence*. That's the wrong question for
-a paper your institution subscribes to: Unpaywall correctly says "not open"
-while your browser, on the campus VPN, downloads it without complaint.
+`fetch` asks whether a paper is *free*. That's the wrong question for a paper
+your university pays for. `ferref add --url <page>` asks a different one: it
+requests the page the same way your browser would, from your network, and
+keeps the PDF the page offers.
 
-`--url`, given **alone** — with none of `--type`/`--key`/`--title` — asks a
-different question — it just requests the page, reads the `citation_*` meta
-tags publishers emit for Google Scholar, and downloads the PDF the page
-advertises. (Give `--url` alongside `--type`/`--key`/`--title` instead, and
-it's just the entry's own URL field, same as `--journal` or `--volume` — no
-page is fetched.)
-
-```console
-$ ferref add --url https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-020-3494-x
-MEPHAS: an interactive graphical user interface... [zhou2020]
-  ...
-Attached '/home/you/papers/pdfs/zhou2020.pdf'
-```
-
-The download uses **this machine's network position**. On an institutional VPN
-or through `HTTPS_PROXY`, you get what your browser would get. This isn't a
-paywall bypass — ferref makes an ordinary request and keeps whatever the server
-chooses to return. Off the VPN you get the metadata and an honest refusal:
+On a campus network or VPN, or through an `HTTPS_PROXY`, you get what your
+browser gets. Elsewhere you get the metadata and a clear refusal:
 
 ```console
 $ ferref add --url https://www.nature.com/articles/nature14539
@@ -215,28 +207,23 @@ Warning: failed to download PDF: downloaded content is not a PDF (missing %PDF
 magic bytes) -- this is usually an HTML interstitial, not the paper
 ```
 
-The entry is kept either way — a failed download shouldn't cost you the
-metadata. When the page names a DOI, metadata comes from Crossref rather than
-the page, since publishers abbreviate and Crossref is authoritative.
+The entry is saved either way. When the page lists a DOI, the metadata comes
+from Crossref instead of the page, because Crossref is more reliable.
 
-Measured coverage, from outside any VPN:
+Results from outside any institutional network:
 
-| Publisher | Metadata | PDF |
+| Site | Metadata | PDF |
 | --- | --- | --- |
 | arXiv | yes | yes |
 | PLOS | yes | yes |
 | BioMed Central | yes | yes |
-| Nature (paywalled) | yes | no — paywall interstitial, as expected |
-| Wiley | no — 403s the page to non-browser clients | — |
-| science.org | no — emits no `citation_*` tags | — |
+| Nature (paywalled) | yes | no: you get the paywall page, as expected |
+| Wiley | no: blocks non-browser requests | no |
+| science.org | no: the page has no citation tags | no |
 
-Worth knowing: a bare `--url` also succeeds on some open-access papers `fetch`
-can't get, because Unpaywall lists only a landing page for them. PLOS above is
-exactly that case.
+## 6. Get the text back out
 
-## 8. Get the text back out
-
-This is the point of the whole thing. `show --json` carries the extracted text:
+This is what ferref is for. `show --json` includes each attachment's text:
 
 ```console
 $ ferref show harris2020 --json | jq -r '.attachments[].full_text' | head -3
@@ -245,46 +232,55 @@ Review
 Array programming with NumPy
 ```
 
-`list` and `search` omit full text unless you ask, because otherwise every
-listing would pull every PDF's text into memory:
+`list` and `search` leave the text out unless you pass `--full-text`, so that
+an ordinary listing doesn't load every PDF into memory:
 
 ```sh
-ferref list --json --full-text | jq -r '.[] | "\(.cite_key)\t\(.attachments[0].full_text // "" | length)"'
+ferref list --json --full-text | jq -r '.[] | [.cite_key, (.attachments[0].full_text // "" | length)] | @tsv'
 ```
 
-## 9. Export to BibTeX
+{doc}`scripting` has more recipes.
 
-Formatting citations is LaTeX's job, not ferref's — hand it a `.bib` and let
-biblatex do the work it's better at (it computes `2020a`/`2020b` across the
-whole bibliography, which ferref can't see one entry at a time).
+## 7. BibTeX
+
+ferref doesn't format citations. It hands your LaTeX document a `.bib` file and
+lets BibTeX or biblatex do the formatting.
 
 ```sh
-ferref export > library.bib          # all entries as BibTeX
-ferref export --biblatex > library.bib
-ferref import someone-elses.bib      # entries you already hold are skipped, not fatal
+ferref export > library.bib                          # the whole library
+ferref export --collection "Information Theory" --recursive --out it.bib
+ferref import colleague.bib                          # papers you already have are skipped
 ```
 
-Tags travel in the `keywords` field, so they survive a round trip:
+Tags are written to the `keywords` field and read back from it, so they survive
+an export and re-import. Collections do not.
+
+If your document uses the `biblatex` package, add `--biblatex`. It keeps entry
+types like `@online` and `@dataset`, which plain BibTeX turns into `@misc`.
+
+## 8. Keep the library tidy
+
+**Missing files.** If you delete a PDF by hand, ferref still remembers it.
+`doctor` lists attachments whose file is gone, and `doctor --fix` removes those
+records:
 
 ```console
-$ ferref export
-@article{jaynes1957,
-author = {Jaynes, E. T.},
-year = {1957},
-journal = {{Physical Review}},
-keywords = {{entropy, statistical mechanics}},
-title = {{Information Theory and Statistical Mechanics}},
-}
+$ ferref doctor
+1 of 3 attachments do not resolve on disk:
+  shannon1948: ~/.ferref/pdfs/shannon1948.pdf
+$ ferref doctor --fix
+Fixed 1 of 1 broken attachments.
+  shannon1948: ~/.ferref/pdfs/shannon1948.pdf
 ```
 
-Use `--biblatex` if your document loads the `biblatex` package. Legacy BibTeX
-has no `@online` or `@dataset`, so those come out as `@misc` without it, and it
-writes `date`/`journaltitle` where plain BibTeX wants `year`/`journal`:
+`ferref open` does the same cleanup for one paper when it finds a missing file,
+and attaching or fetching a new PDF clears out that paper's missing ones first.
+
+**Duplicates.** If the same paper was added twice, fold one into the other.
+Tags, collections, and PDFs move to the entry you keep; its own fields are left
+as they are.
 
 ```console
-$ ferref export --biblatex
-@online{blog2024,
-title = {{A Web Thing}},
-url = {{https://example.org}},
-}
+$ ferref merge shannon1948 shannon1948b
+Merged 'shannon1948b' into 'shannon1948', deleting 'shannon1948b'
 ```
