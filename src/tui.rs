@@ -1646,14 +1646,10 @@ impl App {
 
         match crate::fetch_pdf_for_entry(conn, &cite_key, None) {
             Ok(crate::FetchOutcome::NoPdfFound { is_oa, .. }) => {
-                self.status = Some(match is_oa {
-                    Some(true) => {
-                        format!("'{cite_key}' is open access, but no direct PDF link was found")
-                    }
-                    Some(false) => format!("No open-access copy found for '{cite_key}'"),
-                    None => format!(
-                        "Could not determine open-access status for '{cite_key}'; no PDF found"
-                    ),
+                self.status = Some(if is_oa {
+                    format!("'{cite_key}' is open access, but no direct PDF link was found")
+                } else {
+                    format!("No open-access copy found for '{cite_key}'")
                 });
             }
             Ok(crate::FetchOutcome::Downloaded {

@@ -36,7 +36,9 @@ Design principles that follow from that, and constrain every phase below:
 - **Stable IDs.** `cite_key` (and DB `id`) are what external tools key
   embeddings, graphs, or analysis results against ferref entries. Don't
   redesign these casually once other tools depend on them.
-- UI is CLI now, TUI later, never a GUI — out of scope, not deferred.
+- UI is CLI now, TUI later, never a GUI — out of scope, not deferred. (The
+  Phase 27 browser extension is a button that hands a page to the CLI, not
+  a GUI; see that phase.)
 - **Both front ends are first-class.** A rough edge in the TUI (an
   unreadable field, a keybinding that's one accidental press from
   destructive, a popup that doesn't visually pop) is a real bug, not
@@ -118,11 +120,12 @@ All fifteen phases are complete.
   real fork, not a quality setting: BibLaTeX keeps `@online`/`@dataset` and
   writes `date`/`journaltitle`, which legacy BibTeX styles don't read. Tags
   round-trip through `keywords`; collections don't round-trip at all.
-- `fetch` only reads `best_oa_location.url_for_pdf`. Plenty of genuinely open
-  papers are linked only as landing pages, so "open access" and "fetchable PDF"
-  are reported as separate facts. Scanning the other `oa_locations` was tried
-  and reverted: on live DOIs the extra candidates were landing pages too, so it
-  turned a clean "no PDF available" into a download failure.
+- `fetch` (Phase 26) tries every PDF URL Unpaywall lists, not just
+  `best_oa_location`, plus PMC's own open-access S3 copy when a location names
+  one, plus the Phase 19 pattern sources -- but a paper can still be
+  genuinely open with none of those turning up a direct PDF, only a landing
+  page, so "open access" and "fetchable PDF" are still reported as separate
+  facts.
 - The Unpaywall contact email is never compiled in. It comes from `--email`,
   `FERREF_EMAIL`, or the config file, and is sent to Unpaywall and nowhere else.
 - SSRF protection resolves the host and then lets `ureq` resolve it again to
@@ -343,7 +346,7 @@ Add `ureq` (sync HTTP client — no async runtime needed for a handful of blocki
 
 New `src/doi.rs`:
 - `fetch_metadata(doi: &str) -> Result<Entry>` — parses Crossref JSON into an `Entry`.
-- `fetch_oa_pdf_url(doi: &str, email: &str) -> Result<Option<String>>` — parses Unpaywall's `best_oa_location.url_for_pdf`.
+- `fetch_oa_pdf_url(doi: &str, email: &str) -> Result<OaStatus>` — parses Unpaywall's OA status, every listed PDF URL, and a PMC id if any (as of Phase 26; originally just `best_oa_location.url_for_pdf`).
 - `fetch_and_attach(conn, cite_key, doi, email) -> Result<()>` — downloads the PDF if one was found, saves it, inserts an `attachments` row, runs it through Phase 7's `extract_text`.
 
 CLI:
@@ -2057,6 +2060,368 @@ correct.
 
 ---
 
+## Phase 26 — `fetch`: every Unpaywall copy, plus PubMed Central
+
+### Why
+
+Many publisher sites now sit behind bot checks (Cloudflare, Akamai,
+reCAPTCHA) that answer any script with HTTP 403. The Phase 27 section below
+has the survey. ferref will not try to get past them. But for most of these
+papers a free copy exists somewhere that isn't blocked, and `fetch` never
+looks for it:
+
+- **`fetch` only tries Unpaywall's first pick (`best_oa_location`).** For
+  the APS and OUP papers in the survey, that pick is the blocked publisher
+  PDF, while the same response also lists an arXiv copy that downloads
+  fine. The first-pick-only rule is recorded under Known limitations: trying
+  the other locations was reverted because their links were often web pages,
+  which turned a clean "no PDF" into a "not a PDF" error. That was a problem with
+  stopping at the first failure, not with trying more copies. Moving on
+  after a failed download removes it.
+- **PubMed Central's open-access copies are reachable, just not through
+  the website.** PMC's article and PDF pages serve a reCAPTCHA, and Europe
+  PMC returns 403. NCBI also publishes the PMC open-access subset as a
+  public Amazon S3 data set (`pmc-oa-opendata`), with no bot check. The
+  Royal Society and MDPI papers in the survey, whose other copies were all
+  blocked, both downloaded from there. Unpaywall already names the PMC
+  record in `oa_locations[].pmh_id` (`oai:pubmedcentral.nih.gov:9131462`),
+  so finding the PMC ID costs no extra request.
+
+### What changes
+
+**Candidates, in order.** `fetch` builds a list of candidate PDF URLs and
+tries them one at a time until one downloads and passes the `%PDF` check.
+Unpaywall is still queried first regardless -- it's where the PMC id comes
+from -- but PMC's own copy is tried *before* Unpaywall's links, since the
+`pmc-oa-opendata` S3 bucket has no bot check and its copy is usually the
+published version, while Unpaywall's picks are often the same publisher
+links that get blocked:
+
+1. PMC, if any location's `pmh_id` names a PMC record (see below).
+2. Unpaywall's `best_oa_location.url_for_pdf`.
+3. Every other `oa_locations[].url_for_pdf`, in Unpaywall's order. Only
+   `url_for_pdf`, never `url_for_landing_page`. Drop duplicates.
+4. arXiv, bioRxiv/medRxiv, OSF and preprints.org, as in Phase 19. The
+   pure ones cost nothing. bioRxiv's API call only runs if everything
+   before it failed.
+
+**Outcomes:**
+- The first candidate that lands wins.
+- **No candidates at all** is `NoPdfFound`, exit 0, as before.
+- **Candidates existed but none downloaded** is an error, exit 1, as a
+  failed download is today. The message lists each attempt and why it
+  failed, so a paper that needs downloading in a browser is obvious from
+  the output.
+- A PDF the entry already has attached is still reused without
+  downloading, as before.
+
+**PMC source (`doi.rs`):**
+- Take the numeric id from `oai:pubmedcentral.nih.gov:<digits>`, giving
+  `PMC<digits>`. Anything else in `pmh_id` is ignored.
+- List the article's versions with
+  `GET https://pmc-oa-opendata.s3.amazonaws.com/?list-type=2&prefix=PMC<id>.&delimiter=/`.
+  This is an S3 XML listing whose `<CommonPrefixes><Prefix>PMC<id>.<v>/</Prefix>`
+  entries are the versions. There is no XML dependency: a pure
+  `parse_pmc_versions(xml, pmcid) -> Option<u32>` scans for those prefixes.
+- The PDF is `https://pmc-oa-opendata.s3.amazonaws.com/PMC<id>.<v>/PMC<id>.<v>.pdf`
+  at the highest version.
+- An empty listing (`KeyCount` 0) means the article isn't in the
+  open-access subset. That is `None`, not an error.
+
+Traps in the listing, all seen in real responses:
+- **The trailing dot in `prefix=PMC<id>.` is required.** Without it,
+  `PMC1000034` also lists `PMC10000341.1/`, `PMC10000342.2/`, and so on,
+  and a different paper's PDF would be downloaded without complaint.
+- **The response echoes the query's own `<Prefix>PMC<id>.</Prefix>`**
+  outside `CommonPrefixes`. It has no version and must be skipped.
+- **S3 sorts keys as text**, so version 10 lists before version 2. Take
+  the numeric maximum, not the last entry.
+- **A prefix for a different id** (defence in depth) must be ignored, not
+  parsed.
+
+**Clearer 403s.** When `fetch_guarded` gets a 403 carrying
+`cf-mitigated: challenge`, say that the site blocks automated downloads
+rather than just "HTTP 403". The same applies to `add --url`. Other 403s
+keep their plain message.
+
+**Shape changes:**
+- `OaStatus` carries every PDF URL in order plus the PMC id, not one URL.
+- `FetchOutcome::Downloaded.source` gains `"PMC"`.
+- `attempted` entries may now carry the reason a download failed.
+- `--json` field names are unchanged.
+
+**Testing.** The candidate loop is written against a download function
+passed in, so a `#[test]` can check the order and the moving-on
+behaviour without the network. Parsing tests use responses captured on
+2026-09-25:
+- the APS paper's Unpaywall response (a blocked first pick, then arXiv);
+- the Royal Society paper's (no PDF link, a PMC `pmh_id`);
+- S3 listings with no versions, one version and two versions.
+
+### What review found
+
+A Sonnet review confirmed the PMC traps above are handled and every new
+request still goes through `fetch_guarded` and the `%PDF` check. It
+found two real defects, both fixed:
+
+- **A lookup that failed looked like "no free copy" (exit 0).** If the
+  PMC listing or bioRxiv API errored and nothing else turned up, `fetch`
+  reported "no open-access copy". Now exit 0 means every source answered
+  and none had a copy. If any source errored and nothing downloaded, it's
+  an error (exit 1). This includes Unpaywall itself, reversing Phase 19's
+  "an Unpaywall error isn't fatal" for the case where nothing else
+  succeeds. As a result, `is_oa` in `fetch --json` is never null.
+- **Local failures were treated as bad downloads.** A database or disk
+  error while saving the PDF made `fetch` move on and download the next
+  copy, which failed the same way. `land_downloaded_pdf` is now split:
+  - a per-candidate `doi::download_pdf`, whose failure moves on;
+  - `land_pdf_bytes`, run once, whose failure stops the fetch;
+  - `already_landed_pdf`, the "entry already has its PDF" check.
+  
+  `try_candidates` takes a `DownloadOutcome` of `Landed`, `Retry` or
+  `Fatal`.
+
+Also fixed: the "download it in a browser" advice now appears only when
+a PDF or landing page is blocked, not an API lookup, and has a test.
+
+Left for later: with `--json`, `fetch` errors still print as plain text
+(pre-existing, but now hit more often).
+
+---
+
+## Phase 27 — Firefox extension: save the page you're looking at
+
+*Status: designed, deferred.* Phase 26 recovers many blocked papers
+without touching the browser. The remaining gap may also be closed more
+simply by adding a paper from a PDF downloaded by hand (DOI read from its
+first page). Revisit this only if that still leaves too much friction:
+it adds a second language, Mozilla signing, and a host program launched
+outside the user's shell.
+
+### Why
+
+`add --url` and `fetch` keep hitting HTTP 403 on papers that are openly
+available. A survey on 2026-09-25 found the cause: bot-protection services
+in front of the publisher sites, not access control. PNAS, Wiley, OUP, APS
+and the Royal Society return Cloudflare's `cf-mitigated: challenge`
+("Just a moment…") page. MDPI returns an Akamai "Access Denied". PMC serves
+a reCAPTCHA page with status 200. Nature, PLOS, Frontiers, arXiv, bioRxiv
+and OSF were fine.
+
+A browser `User-Agent` changes nothing: every blocked site returned the
+same 403 to a Chrome UA. These checks exist to tell a real browser from a
+script. Getting past them from a script means impersonating a browser
+(its TLS fingerprint, or running the challenge JavaScript). That is
+fragile and against those sites' terms, and it sits on the wrong side of
+the "no circumvention" non-goal. ferref will not do it.
+
+The user's own browser has already passed the check. It also carries
+whatever institutional access they have. A browser extension that hands
+the current page, and the PDF the browser can already see, to ferref
+gets the paper without circumventing anything. It is the same as
+downloading the file by hand and running `ferref attach`, minus the
+clicks. This is the Zotero Connector model.
+
+### Scope
+
+**In:**
+- A Firefox toolbar button that saves the current tab to the library:
+  - metadata, via the same `citation_*` meta tags `add --url` reads;
+  - the paper's PDF when one is reachable, attached and text-extracted.
+- The same button on a PDF open in Firefox's own viewer: it saves that
+  file.
+- A short success or error message in the extension (cite key, or why
+  it failed).
+
+**Out, for now:**
+- a popup to choose a collection or tags;
+- Chrome;
+- translators for pages without meta tags;
+- publishing on addons.mozilla.org.
+
+Chrome is cheap later: the same native-messaging API, with the host
+manifest in a different directory.
+
+### Transport: native messaging, not a local server
+
+The Zotero Connector talks to Zotero over `localhost:23119`. ferref should
+use Firefox's **native messaging** instead:
+
+- The extension calls `browser.runtime.sendNativeMessage("ferref", msg)`.
+- Firefox spawns the program named in a host manifest, writes one
+  length-prefixed JSON message to its stdin, and reads one back from its
+  stdout. Each message is a 4-byte native-endian length followed by
+  UTF-8 JSON.
+
+Why native messaging over a local HTTP server:
+- **Security.** There is no listening port. Only the extension IDs in the
+  manifest's `allowed_extensions` can reach the host. A local server would
+  need its own origin and token checks, and it becomes an attack surface
+  for every page the user visits.
+- **Fits "stateless".** One process per save, which then exits. Nothing
+  sits in the background, and there is no daemon lifecycle to manage.
+  SQLite handles a TUI running at the same time exactly as it already
+  handles two CLI commands.
+- **Size limits.** Extension → host messages may be up to 4 GB. Host →
+  extension messages are capped at 1 MB, which is plenty for a reply.
+
+### Protocol (version 1)
+
+Request, extension → ferref:
+
+```json
+{
+  "version": 1,
+  "action": "save",
+  "page_url": "https://www.pnas.org/doi/10.1073/pnas.1718942115",
+  "html": "<!doctype html>…",
+  "pdf": { "url": "https://…/pdf", "base64": "JVBERi0…" }
+}
+```
+
+`html` is `document.documentElement.outerHTML`. `pdf` is optional. When
+the tab is showing a PDF, `html` is absent and `pdf` is the tab's file.
+
+Reply, ferref → extension:
+
+```json
+{ "ok": true, "cite_key": "james2018", "created": true, "attached": true,
+  "warning": null }
+{ "ok": false, "error": "…" }
+```
+
+`version` is checked first. An unknown version or action gets an
+`ok: false` reply naming the versions this binary understands, so an
+extension newer than the installed binary fails with a clear message
+rather than a strange one.
+
+**The extension sends raw HTML, not parsed metadata.** `doi.rs` already
+has `parse_citation_meta(html, base)`, which is tested and handles relative
+`citation_pdf_url`s, encoding quirks and multiple authors. Parsing in
+JavaScript would give ferref two meta-tag parsers that drift apart. The
+host enforces the existing `MAX_HTML_BYTES` cap on `html`.
+
+### Host side: `ferref native-host`
+
+A hidden subcommand (`#[command(hide = true)]`) that:
+1. reads exactly one framed message;
+2. dispatches it;
+3. writes exactly one framed reply;
+4. exits.
+
+It never prints anything else to stdout: a stray byte corrupts the frame
+and Firefox drops the connection. Errors go into the reply, and panics
+must be caught and turned into an `ok: false` reply.
+
+Saving reuses the `add --url` and `attach` code paths rather than copying
+them:
+- **Metadata.** Factor the landing-page half of `cmd_add` (page metadata →
+  Crossref if there's a DOI, otherwise the page's own tags → cite key) into
+  a function that returns `Result<Entry, String>` instead of calling
+  `die`. `cmd_add` and the host both call it. This is the one real
+  refactor in the phase.
+- **Duplicate DOI.** If the DOI is already in the library, don't fail.
+  Reply with the existing cite key, `created: false`, and attach the PDF
+  if that entry has none. Clicking the button on a paper already in the
+  library is normal, not an error.
+- **The PDF.** Split `land_downloaded_pdf` into "download" and "land these
+  bytes". The host calls the second with the decoded bytes and gets the
+  existing `pdf_target`/`claim_free_name` race-safe naming and the `%PDF`
+  magic-byte check for free. Text extraction is the same as
+  `add_pdf_from_page`. A PDF that fails to land or extract does not undo
+  the entry: the reply is `ok: true` with a `warning`, matching `add --url`
+  today.
+- **Decoding.** Uses the existing `base64` dependency (added in Phase 18
+  for OSC 52), so no new crate is needed.
+
+**Trust boundary.** Everything in the request is page-controlled: HTML,
+URLs and bytes. The host treats it exactly as `add --url` treats a fetched
+page:
+- the same parser and the same caps;
+- the `%PDF` check on the bytes;
+- no network request except the Crossref lookup by DOI.
+
+The host never fetches `page_url` or `pdf.url` itself, which would bring
+back the very 403 this phase exists to avoid. They are recorded, not
+followed.
+
+### Extension side (`extension/`, plain JavaScript, no build step)
+
+- **`manifest.json`.** Uses Manifest V3 with these permissions:
+  - `nativeMessaging`, `activeTab` and `scripting`;
+  - a fixed `browser_specific_settings.gecko.id` (e.g.
+    `ferref@thosvarley`), because the host manifest's `allowed_extensions`
+    names it.
+- **Background script.** On a toolbar click, it injects a content script
+  into the active tab, gets back `{html, pdf}`, calls `sendNativeMessage`,
+  and shows the reply as the badge text plus a notification.
+- **Content script.**
+  - Reads `outerHTML`.
+  - Finds `citation_pdf_url` and fetches it *from inside the page*, so the
+    request carries the page's cookies and its Cloudflare clearance.
+  - Checks that the response starts with `%PDF` before base64-encoding it.
+    If it doesn't, it sends no `pdf` and ferref saves the metadata alone.
+- **PDF tabs.** Content scripts can't run inside Firefox's PDF viewer.
+  When the tab's URL serves a PDF, the background script fetches it
+  directly. `activeTab` grants that origin on click, and Firefox sends the
+  user's cookies with it.
+
+### Install
+
+Firefox launches the host with a minimal environment, not the user's
+shell. `FERREF_HOME` set in `.bashrc` is therefore **not** visible, and the
+host would silently open (and create) a library at the default location.
+
+`install.sh` fixes this. It writes:
+1. `~/.local/share/ferref/native-host`, a two-line wrapper that exports the
+   chosen `FERREF_HOME` and `exec`s `ferref native-host`;
+2. `~/.mozilla/native-messaging-hosts/ferref.json`, with `"name": "ferref"`,
+   `"type": "stdio"`, `path` set to that wrapper, and
+   `"allowed_extensions": ["ferref@thosvarley"]`.
+
+**Signing.** Release Firefox only installs signed extensions. Mozilla signs
+self-distributed ("unlisted") add-ons automatically and for free via
+`web-ext sign`, which needs an AMO API key the user creates once. During
+development, load it with `about:debugging` → "Load Temporary Add-on"; it
+unloads when Firefox restarts. Document both in `docs/installation.md`.
+
+### Non-goals, revisited
+
+The Vision says "never a GUI", and a toolbar button is arguably one. The
+line's intent is that ferref's interfaces are the CLI and the TUI, with no
+windowed app to maintain. The extension keeps that intent: it has no UI
+beyond a button and a status message, and every decision it makes is
+ferref's. The Vision line and the non-goal list are amended to say so.
+
+### Order of work
+
+Each step leaves something testable:
+
+1. **Refactors, no behavior change.** Pull the metadata half out of
+   `cmd_add`; split `land_downloaded_pdf`. `cargo test` stays green, and
+   `add --url` behaves identically.
+2. **`ferref native-host`.** Framing, dispatch and the save action.
+   Testable with no browser at all: a `#[test]` for the framing
+   round-trip, plus piping a hand-built framed message into the binary
+   against a scratch `FERREF_HOME`.
+3. **Extension**, loaded temporarily from `about:debugging`.
+4. **`install.sh`** host manifest and wrapper, plus docs.
+
+### Risks to check early
+
+- **The PDF fetch from inside the page.** Does it actually carry the
+  Cloudflare clearance on the sites above? Check PNAS, OUP and Wiley by
+  hand before building the rest. If Cloudflare challenges the PDF URL
+  separately, the fallback is "open the PDF in the tab, click again", and
+  the extension's message should say so.
+- **PDF links that are HTML viewers.** Wiley's `epdf` is one. The
+  content-script `%PDF` check catches these, and the entry is saved
+  without the PDF plus a warning.
+- **The environment gotcha above.** Test with a non-default
+  `FERREF_HOME`, launched from Firefox, not a terminal.
+
+---
+
 ## Roadmap (not yet scoped)
 
 Ideas worth doing sometime, deliberately not designed in detail yet — see
@@ -2084,11 +2449,12 @@ one yet.
 - Circumventing paywalls — full-text fetch is strictly limited to what Unpaywall reports as legally open access. No scraping, no Sci-Hub-style fallbacks.
 - Full CSL styling engine / arbitrary citation styles
 - Sync or multi-user access
-- GUI (TUI is a real future goal, GUI is not)
+- GUI (TUI is a real future goal, GUI is not). The Phase 27 browser extension
+  is a save button with no interface of its own, which is within this line.
 
 ## Order of work
 
-Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17 → 18 → 19 → 20 → 21 → 22 → 23 → 24 → 25. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
+Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17 → 18 → 19 → 20 → 21 → 22 → 23 → 24 → 25 → 26. Phase 27 (browser extension) is deferred. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
 
 ---
 
@@ -2124,6 +2490,8 @@ Which phases get farmed out to a `coder` subagent, and which get an
 | 23 — Self-healing attachments, `doctor --fix`, `detach` | **yes** | **yes** | Touches the `O_EXCL`-sensitive attach/fetch write paths plus a new bulk-delete path (`doctor --fix`) whose failure mode is data loss if it's wrong. |
 | 24 — TUI: collection export, mark-all, input cursor | no | no | Three small, mechanical additions, each extending an existing pattern. Still reviewed (Sonnet-high) since two of the three are only verifiable by actually running the TUI. |
 | 25 — TUI: scrollable DETAILS pane | no | **yes** | Small, but real correctness risk in the scroll-clamp math -- one bug caught live during implementation, two more caught by a review requested after the fact. Selection-tracking-by-position bugs like this one recur easily; worth a look even on "small" changes. |
+| 26 — `fetch`: all Unpaywall copies + PMC | **yes** | **yes** | Network, remote XML/JSON not under our control, and a real silent-failure trap: an S3 prefix without its trailing dot downloads a *different paper's* PDF that passes every check. Same shape as Phases 8 and 19. |
+| 27 — Firefox extension *(deferred)* | **yes** | **yes** | New trust boundary (page-controlled HTML and PDF bytes arriving on stdin), a byte-exact framing protocol where one stray stdout write breaks everything, and a refactor of `cmd_add` that must not change `add --url`. The extension half can only be verified in a real Firefox, so the user runs that check. |
 
 The table is a default, not a rule. The reasoning behind it, which outlives the
 table if the phases change:

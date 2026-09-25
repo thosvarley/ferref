@@ -952,22 +952,25 @@ fn cmd_import(conn: &rusqlite::Connection, path: PathBuf, json: bool) {
 }
 
 // What happened when trying to fetch an open-access PDF for an entry.
-// Unpaywall is tried first (it's the one source with a real legal-OA
-// determination); if it comes up empty, four pattern-derived sources
-// (arXiv, bioRxiv, OSF, preprints.org) are tried in that fixed order. `doi`
-// rides along in both branches since every caller reports it regardless of
-// outcome, and `fetch_pdf_for_entry` is the only place that looked it up.
+// Unpaywall is queried first -- it's the one source with a real legal-OA
+// determination, and it's where a PMC id comes from -- but the *download*
+// order tries PMC before Unpaywall's own links (PMC's S3 copy has no bot
+// check and is usually the published version, while Unpaywall's picks are
+// often the same publisher link that gets blocked), then falls through to
+// four pattern-derived sources (arXiv, bioRxiv, OSF, preprints.org) in that
+// fixed order. `doi` rides along in both branches since every caller
+// reports it regardless of outcome, and `fetch_pdf_for_entry` is the only
+// place that looked it up.
 enum FetchOutcome {
-    // No source produced a PDF URL. `is_oa` is Unpaywall's own
-    // determination -- `Some(true)` means OA with no direct PDF link,
-    // `Some(false)` means not OA, `None` means Unpaywall itself errored
-    // (no longer fatal to the whole fetch, unlike before this phase).
-    // `attempted` lists every source that was tried and came up empty or
-    // failed, in the order tried, so a wrong guess is visible rather than
-    // silently indistinguishable from "no PDF anywhere".
+    // No candidate PDF URL existed anywhere, and every source that was
+    // asked came back with a real "nothing here" answer -- not an error.
+    // `is_oa` is Unpaywall's own determination. `attempted` lists every
+    // source that was tried and came up empty, in the order tried, so a
+    // wrong guess is visible rather than silently indistinguishable from
+    // "no PDF anywhere".
     NoPdfFound {
         doi: String,
-        is_oa: Option<bool>,
+        is_oa: bool,
         attempted: Vec<String>,
     },
     // A PDF was landed at `path` (or was already there, per
@@ -983,10 +986,107 @@ enum FetchOutcome {
     },
 }
 
+// A source in the candidate list: a name plus a thunk that resolves it to
+// zero or more PDF URLs to try, in order, or an error. The thunk runs
+// lazily -- only as far as `try_candidates` needs it -- so a source with a
+// real network call of its own (PMC, bioRxiv) is never reached once
+// something earlier has already landed a PDF.
+type CandidateSource = (&'static str, Box<dyn FnOnce() -> Result<Vec<String>, String>>);
+
+// What trying one candidate URL came back with. `Retry` and `Fatal` are
+// both failures, but only `Retry` means "this candidate didn't pan out, try
+// the next one" -- a blocked or missing PDF. `Fatal` is a systemic problem
+// (disk full, a database error) that trying a different URL wouldn't fix,
+// so it aborts the whole fetch instead of silently landing on whichever
+// candidate happened to come after the real failure.
+enum DownloadOutcome<T> {
+    Landed(T),
+    Retry(String),
+    Fatal(String),
+}
+
+// Tries each source in order: resolve it (lazily) to its candidate URLs,
+// then try each one against `download` until one succeeds. A `Retry`
+// records a short, host-only reason and moves to the next URL/source; a
+// `Fatal` aborts immediately as `Err`. A source whose own resolution failed
+// (the PMC listing, the bioRxiv API, Unpaywall itself) is recorded too and
+// flips the returned `any_resolver_error`, since a real failure there must
+// not read as "no OA copy exists" if nothing else pans out either.
+//
+// Returns, on success, the winning value plus its source name, the attempt
+// log, whether any URL was ever handed to `download`, and whether any
+// resolver errored -- the last two are how the caller tells "every source
+// had nothing" (NoPdfFound) apart from "something was tried, or something
+// errored, and nothing came of it" (an error).
+//
+// Generic over `download` so a #[test] can drive the ordering, moving-on,
+// and fatal-abort behaviour without the network.
+//
+// The winning value plus its source name, the attempt log, whether any URL
+// was ever handed to `download`, and whether any resolver errored.
+type CandidateOutcome<T> = (Option<(T, &'static str)>, Vec<String>, bool, bool);
+
+fn try_candidates<T>(
+    sources: Vec<CandidateSource>,
+    mut download: impl FnMut(&str) -> DownloadOutcome<T>,
+) -> Result<CandidateOutcome<T>, String> {
+    let mut attempted: Vec<String> = Vec::new();
+    let mut any_download_attempted = false;
+    let mut any_resolver_error = false;
+
+    for (source, resolve) in sources {
+        let urls = match resolve() {
+            Ok(urls) => urls,
+            Err(e) => {
+                attempted.push(format!("{source} (error: {e})"));
+                any_resolver_error = true;
+                continue;
+            }
+        };
+        if urls.is_empty() {
+            attempted.push(source.to_string());
+            continue;
+        }
+        for url in urls {
+            any_download_attempted = true;
+            match download(&url) {
+                DownloadOutcome::Landed(value) => {
+                    return Ok((
+                        Some((value, source)),
+                        attempted,
+                        any_download_attempted,
+                        any_resolver_error,
+                    ));
+                }
+                DownloadOutcome::Retry(e) => {
+                    attempted.push(format!("{source} ({}: {e})", url_host(&url)))
+                }
+                DownloadOutcome::Fatal(e) => return Err(e),
+            }
+        }
+    }
+
+    Ok((None, attempted, any_download_attempted, any_resolver_error))
+}
+
+// A short label for a failed candidate: its host, not the whole URL -- long
+// enough to tell a bot-blocked link from a wrong domain, short enough that
+// an "attempted" list of six sources still reads as one line.
+fn url_host(url: &str) -> &str {
+    let without_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme)
+}
+
 // The actual work of `fetch`: DOI lookup on the entry, email resolution,
-// then Unpaywall followed by the four pattern-derived sources (arXiv,
-// bioRxiv, OSF, preprints.org), download+land+extract on whichever candidate
-// is found first. Pulled out of cmd_fetch so the TUI can call it too without
+// then a candidate list tried in order until one downloads. Unpaywall is
+// queried eagerly (it's where a PMC id comes from), but the *download*
+// order is PMC, then Unpaywall's own pdf_urls, then arXiv, bioRxiv (an API
+// call, made only if reached), OSF, and preprints.org -- see FetchOutcome's
+// doc comment for why PMC
+// goes first. Pulled out of cmd_fetch so the TUI can call it too without
 // dying on failure -- every error path here returns Err instead of calling
 // die()/process::exit, which cmd_fetch alone still does, at the same
 // messages it always has.
@@ -1007,51 +1107,117 @@ fn fetch_pdf_for_entry(
 
     let resolved_email = config::resolve_email(email)?;
 
-    let mut attempted: Vec<String> = Vec::new();
-    let mut is_oa: Option<bool> = None;
-    let mut found: Option<(String, &'static str)> = None;
-
-    // Unpaywall first, unchanged priority. A failure here is recorded, not
-    // fatal -- the four pattern-derived sources still get tried.
-    match doi::fetch_oa_pdf_url(&doi_value, &resolved_email) {
-        Ok(oa) => {
-            is_oa = Some(oa.is_oa);
-            match oa.pdf_url {
-                Some(url) => found = Some((url, "Unpaywall")),
-                None => attempted.push("Unpaywall".to_string()),
+    // Unpaywall runs right away -- everything else in the candidate list
+    // either comes from its response (PMC's id) or is independent of it, so
+    // there's no laziness to buy by deferring this one. A failure here
+    // isn't recorded specially: it becomes the "Unpaywall" source's own
+    // resolver error below, same as any other source's.
+    let mut is_oa = false;
+    let mut pmcid: Option<String> = None;
+    let unpaywall_urls: Result<Vec<String>, String> =
+        match doi::fetch_oa_pdf_url(&doi_value, &resolved_email) {
+            Ok(oa) => {
+                is_oa = oa.is_oa;
+                pmcid = oa.pmcid;
+                Ok(oa.pdf_urls)
             }
-        }
-        Err(e) => attempted.push(format!("Unpaywall (error: {e})")),
-    }
+            Err(e) => Err(e),
+        };
 
-    if found.is_none() {
-        match doi::arxiv_pdf_url(&doi_value) {
-            Some(url) => found = Some((url, "arXiv")),
-            None => attempted.push("arXiv".to_string()),
-        }
-    }
-    if found.is_none() {
-        match doi::biorxiv_pdf_url(&doi_value) {
-            Ok(Some(url)) => found = Some((url, "bioRxiv")),
-            Ok(None) => attempted.push("bioRxiv".to_string()),
-            Err(e) => attempted.push(format!("bioRxiv (error: {e})")),
-        }
-    }
-    if found.is_none() {
-        match doi::osf_pdf_url(&doi_value) {
-            Some(url) => found = Some((url, "OSF")),
-            None => attempted.push("OSF".to_string()),
-        }
-    }
-    if found.is_none() {
-        match doi::preprints_org_pdf_url(&doi_value) {
-            Some(url) => found = Some((url, "preprints.org")),
-            None => attempted.push("preprints.org".to_string()),
-        }
-    }
+    let doi_for_arxiv = doi_value.clone();
+    let doi_for_biorxiv = doi_value.clone();
+    let doi_for_osf = doi_value.clone();
+    let doi_for_preprints = doi_value.clone();
 
-    // Having no PDF to fetch is a normal, legitimate answer, not an error.
-    let Some((pdf_url, source)) = found else {
+    let sources: Vec<CandidateSource> = vec![
+        (
+            "PMC",
+            Box::new(move || match pmcid {
+                Some(id) => doi::pmc_pdf_url(&id).map(|opt| opt.into_iter().collect()),
+                None => Ok(Vec::new()),
+            }),
+        ),
+        ("Unpaywall", Box::new(move || unpaywall_urls)),
+        (
+            "arXiv",
+            Box::new(move || Ok(doi::arxiv_pdf_url(&doi_for_arxiv).into_iter().collect())),
+        ),
+        (
+            "bioRxiv",
+            Box::new(move || {
+                doi::biorxiv_pdf_url(&doi_for_biorxiv).map(|opt| opt.into_iter().collect())
+            }),
+        ),
+        (
+            "OSF",
+            Box::new(move || Ok(doi::osf_pdf_url(&doi_for_osf).into_iter().collect())),
+        ),
+        (
+            "preprints.org",
+            Box::new(move || {
+                Ok(doi::preprints_org_pdf_url(&doi_for_preprints)
+                    .into_iter()
+                    .collect())
+            }),
+        ),
+    ];
+
+    // Checked once, before any candidate is tried, since it doesn't depend
+    // on which URL wins: if the entry already has its PDF landed, reuse it
+    // without ever touching the network. `Option` here (rather than calling
+    // `already_landed_pdf` unconditionally up front) keeps the DB/filesystem
+    // check -- and its side effect of re-attaching/pruning -- from running
+    // at all when no candidate is ever actually tried (e.g. no DOI match
+    // anywhere).
+    let mut cached_existing: Option<Option<(String, i64)>> = None;
+
+    let (found, attempted, any_download_attempted, any_resolver_error) =
+        try_candidates(sources, |url| {
+            let existing = match &cached_existing {
+                Some(v) => v.clone(),
+                None => match already_landed_pdf(conn, cite_key) {
+                    Ok(v) => {
+                        cached_existing = Some(v.clone());
+                        v
+                    }
+                    Err(e) => return DownloadOutcome::Fatal(e),
+                },
+            };
+            if let Some((path, id)) = existing {
+                return DownloadOutcome::Landed((path, id, true));
+            }
+
+            // Only the actual download is retried against the next
+            // candidate on failure -- a blocked or missing PDF is exactly
+            // the "this source didn't have it" case. Landing the bytes
+            // (claiming a name, writing, attaching) is a filesystem/DB
+            // operation that happens once a download has actually
+            // succeeded; failing there is systemic, not a reason to try a
+            // different URL.
+            let bytes = match doi::download_pdf(url) {
+                Ok(b) => b,
+                Err(e) => return DownloadOutcome::Retry(format!("failed to download PDF: {e}")),
+            };
+            match land_pdf_bytes(conn, cite_key, &bytes) {
+                Ok((path, id)) => DownloadOutcome::Landed((path, id, false)),
+                Err(e) => DownloadOutcome::Fatal(e),
+            }
+        })?;
+
+    let Some(((path_str, attachment_id, already_present), source)) = found else {
+        // Having no candidate anywhere, with every source giving a clean
+        // "nothing here", is a normal, legitimate answer, not an error --
+        // but a candidate that existed and failed every download, or a
+        // source that errored outright (including Unpaywall itself) rather
+        // than answering, is, so a network outage or a paper needing a
+        // browser is obvious from the output instead of reading as "not
+        // open access".
+        if any_download_attempted || any_resolver_error {
+            return Err(format!(
+                "no open-access PDF could be downloaded for '{cite_key}' (DOI {doi_value}): {}",
+                attempted.join("; ")
+            ));
+        }
         return Ok(FetchOutcome::NoPdfFound {
             doi: doi_value,
             is_oa,
@@ -1059,7 +1225,6 @@ fn fetch_pdf_for_entry(
         });
     };
 
-    let (path_str, attachment_id, already_present) = land_downloaded_pdf(conn, cite_key, &pdf_url)?;
     let abs_path = PathBuf::from(&path_str);
 
     // Partial failure: the attachment persists even if extraction fails --
@@ -1099,18 +1264,15 @@ fn cmd_fetch(conn: &rusqlite::Connection, cite_key: String, email: Option<String
                 emit_json(&out);
             } else {
                 let tried = attempted.join(", ");
-                match is_oa {
-                    Some(true) => emit(&format!(
+                if is_oa {
+                    emit(&format!(
                         "'{cite_key}' (DOI {doi}) is open access, but no direct PDF link \
                              was found (tried: {tried})"
-                    )),
-                    Some(false) => emit(&format!(
+                    ));
+                } else {
+                    emit(&format!(
                         "No open-access copy found for '{cite_key}' (DOI {doi}) (tried: {tried})"
-                    )),
-                    None => emit(&format!(
-                        "Could not determine open-access status for '{cite_key}' (DOI {doi}); \
-                             no PDF found from other sources either (tried: {tried})"
-                    )),
+                    ));
                 }
             }
         }
@@ -1546,51 +1708,82 @@ fn add_pdf_from_page(
     }
 }
 
-// Downloads a PDF and lands it in ./pdfs/ under the entry's cite_key, then
-// attaches it. Shared by `fetch` (URL from Unpaywall) and `add --url` in
-// landing-page mode (URL from a landing page's citation_pdf_url) -- the two
-// differ only in where the URL came from, and writing it twice is how two
-// copies drift apart.
-//
-// Returns (stored path, attachment id, whether the file was already there).
-fn land_downloaded_pdf(
+// Whether `cite_key` already has its PDF landed at the name `fetch`/`attach`
+// would use, without downloading anything -- and if so, re-attaches/prunes
+// it (idempotent) and hands back its path. Split out so `fetch` can check
+// this once, before trying any candidate URL, since the answer doesn't
+// depend on which URL wins.
+fn already_landed_pdf(
     conn: &rusqlite::Connection,
     cite_key: &str,
-    pdf_url: &str,
-) -> Result<(String, i64, bool), String> {
+) -> Result<Option<(String, i64)>, String> {
     let filename = doi::sanitize_filename(cite_key)?;
     let root = config::library_root()?;
     let dir = root.join("pdfs");
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("failed to create '{}': {e}", dir.display()))?;
 
-    let (mut target, already_present) = pdf_target(conn, cite_key, &dir, &filename, "pdf", None)?;
-
+    let (target, already_present) = pdf_target(conn, cite_key, &dir, &filename, "pdf", None)?;
     if !already_present {
-        let bytes =
-            doi::download_pdf(pdf_url).map_err(|e| format!("failed to download PDF: {e}"))?;
-        // B9: the download already happened above, so discarding it on a
-        // name conflict (another process claiming `target` in the meantime)
-        // and telling the user to run the command again threw away
-        // completed work. claim_free_name is the same atomic-claim-with-
-        // retry-to-the-next-name primitive copy_into_library already uses
-        // for the identical race -- fall through to whatever name it hands
-        // back instead of failing on the first conflict.
-        target = claim_free_name(&dir, &filename, "pdf")
-            .map_err(|e| format!("failed to claim a filename for '{filename}' in {}: {e}", dir.display()))?;
-        if let Err(e) = std::fs::write(&target, &bytes) {
-            let _ = std::fs::remove_file(&target);
-            return Err(format!("failed to save PDF to '{}': {e}", target.display()));
-        }
+        return Ok(None);
+    }
+
+    let abs = target
+        .canonicalize()
+        .map_err(|e| format!("failed to resolve saved PDF path '{}': {e}", target.display()))?;
+    let path_str = abs
+        .to_str()
+        .ok_or_else(|| format!("path {} is not valid UTF-8", abs.display()))?
+        .to_string();
+
+    prune_dangling_attachments(conn, cite_key)?;
+
+    let (attachment_id, _changed) = db::attach(conn, cite_key, &path_str)
+        .map_err(|e| friendly(Some(cite_key), "attach downloaded PDF", e))?;
+
+    Ok(Some((path_str, attachment_id)))
+}
+
+// The filesystem+DB half of landing a freshly downloaded PDF: claim a free
+// name, write the bytes, attach, prune. Split out of the old
+// land_downloaded_pdf so a failure here -- disk full, a DB error -- can be
+// told apart from a failed *download*: this runs once a download has
+// actually succeeded, so any error here is systemic, not a reason to try a
+// different candidate URL (see try_candidates' DownloadOutcome::Fatal).
+fn land_pdf_bytes(
+    conn: &rusqlite::Connection,
+    cite_key: &str,
+    bytes: &[u8],
+) -> Result<(String, i64), String> {
+    let filename = doi::sanitize_filename(cite_key)?;
+    let root = config::library_root()?;
+    let dir = root.join("pdfs");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("failed to create '{}': {e}", dir.display()))?;
+
+    // B9: the download already happened before this is called, so
+    // discarding it on a name conflict (another process claiming a name in
+    // the meantime) and telling the user to run the command again would
+    // throw away completed work. claim_free_name is the same atomic-claim-
+    // with-retry-to-the-next-name primitive copy_into_library already uses
+    // for the identical race -- it falls through to whatever name it hands
+    // back instead of failing on the first conflict.
+    let target = claim_free_name(&dir, &filename, "pdf").map_err(|e| {
+        format!(
+            "failed to claim a filename for '{filename}' in {}: {e}",
+            dir.display()
+        )
+    })?;
+    if let Err(e) = std::fs::write(&target, bytes) {
+        let _ = std::fs::remove_file(&target);
+        return Err(format!("failed to save PDF to '{}': {e}", target.display()));
     }
 
     // Every failure from here on has to clean up too, not just the attach: a
     // file this run wrote but never attached is invisible to `pdf_target`'s
     // "is it mine?" check, so it would squat on the name forever.
     let cleanup = |e: String| {
-        if !already_present {
-            let _ = std::fs::remove_file(&target);
-        }
+        let _ = std::fs::remove_file(&target);
         e
     };
 
@@ -1610,7 +1803,31 @@ fn land_downloaded_pdf(
     let (attachment_id, _changed) = db::attach(conn, cite_key, &path_str)
         .map_err(|e| cleanup(friendly(Some(cite_key), "attach downloaded PDF", e)))?;
 
-    Ok((path_str, attachment_id, already_present))
+    Ok((path_str, attachment_id))
+}
+
+// Downloads a PDF and lands it in ./pdfs/ under the entry's cite_key, then
+// attaches it -- reusing an already-landed file without downloading if the
+// entry already has one. Shared by `add --url` in landing-page mode (URL
+// from a landing page's citation_pdf_url); `fetch` composes
+// `already_landed_pdf`/`land_pdf_bytes` itself instead of calling this
+// directly, since it needs the already-present check done once regardless
+// of which candidate wins, and the download/landing split so a failed
+// download (retryable) doesn't abort the fetch the way a failed attach
+// does.
+//
+// Returns (stored path, attachment id, whether the file was already there).
+fn land_downloaded_pdf(
+    conn: &rusqlite::Connection,
+    cite_key: &str,
+    pdf_url: &str,
+) -> Result<(String, i64, bool), String> {
+    if let Some((path, attachment_id)) = already_landed_pdf(conn, cite_key)? {
+        return Ok((path, attachment_id, true));
+    }
+    let bytes = doi::download_pdf(pdf_url).map_err(|e| format!("failed to download PDF: {e}"))?;
+    let (path, attachment_id) = land_pdf_bytes(conn, cite_key, &bytes)?;
+    Ok((path, attachment_id, false))
 }
 
 // Picks where a PDF goes under ./pdfs/, and says whether the file is already
@@ -1659,10 +1876,12 @@ fn nth_candidate_name(dir: &Path, base: &str, ext: &str, n: u32) -> std::path::P
 }
 
 // The filename choice on its own, so it can be tested without a database.
-// `source` is the file about to be copied in, if any: `fetch` re-downloads one
-// fixed URL per entry, so any file of this entry's already sitting at the name
-// is that same PDF, but `attach` can be handed a second, different file for
-// the same entry -- reusing the name there would silently drop it.
+// `source` is the file about to be copied in, if any: `fetch` reuses
+// whatever PDF an entry already has attached without downloading anything
+// (regardless of which candidate URL it originally came from), so any file
+// of this entry's already sitting at the name counts as "already there",
+// but `attach` can be handed a second, different file for the same entry --
+// reusing the name there would silently drop it.
 fn pick_target(
     dir: &Path,
     base: &str,
@@ -2486,5 +2705,162 @@ mod tests {
 
         let text2 = "ß appears here, and SS appears there too";
         let (_snippets2, _count2) = find_snippets(text2, "ss", 5, 3);
+    }
+
+    // try_candidates drives fetch_pdf_for_entry's candidate loop; these
+    // exercise ordering, moving on after a failed download, stopping at the
+    // first success, the all-failed/resolver-error cases, and the
+    // fatal-abort distinction, all with a fake `download` that never
+    // touches the network.
+    fn src(name: &'static str, urls: &[&str]) -> CandidateSource {
+        let urls: Vec<String> = urls.iter().map(|s| s.to_string()).collect();
+        (name, Box::new(move || Ok(urls)))
+    }
+
+    fn failing_src(name: &'static str, error: &'static str) -> CandidateSource {
+        (name, Box::new(move || Err(error.to_string())))
+    }
+
+    #[test]
+    fn try_candidates_stops_at_the_first_success() {
+        let sources = vec![src("A", &["a1"]), src("B", &["b1"])];
+        let mut calls: Vec<String> = Vec::new();
+        let (found, attempted, any_download, any_resolver_error) =
+            try_candidates(sources, |url| {
+                calls.push(url.to_string());
+                if url == "a1" {
+                    DownloadOutcome::Landed(42)
+                } else {
+                    panic!("B should never be tried once A succeeds")
+                }
+            })
+            .unwrap();
+        assert_eq!(calls, vec!["a1".to_string()]);
+        assert_eq!(found, Some((42, "A")));
+        assert!(attempted.is_empty());
+        assert!(any_download);
+        assert!(!any_resolver_error);
+    }
+
+    #[test]
+    fn try_candidates_moves_on_after_a_failed_download() {
+        let sources = vec![src("A", &["a1"]), src("B", &["b1"])];
+        let (found, attempted, any_download, any_resolver_error) =
+            try_candidates(sources, |url: &str| -> DownloadOutcome<i32> {
+                if url == "a1" {
+                    DownloadOutcome::Retry("boom".to_string())
+                } else {
+                    DownloadOutcome::Landed(7)
+                }
+            })
+            .unwrap();
+        assert_eq!(found, Some((7, "B")));
+        assert_eq!(attempted.len(), 1);
+        assert!(attempted[0].contains('A'));
+        assert!(attempted[0].contains("boom"));
+        assert!(any_download);
+        assert!(!any_resolver_error);
+    }
+
+    #[test]
+    fn try_candidates_tries_every_url_of_a_source_before_moving_on() {
+        let sources = vec![src("A", &["a1", "a2"]), src("B", &["b1"])];
+        let mut calls: Vec<String> = Vec::new();
+        let (found, _attempted, _any_download, _any_resolver_error) =
+            try_candidates(sources, |url| {
+                calls.push(url.to_string());
+                if url == "a2" {
+                    DownloadOutcome::Landed(1)
+                } else {
+                    DownloadOutcome::Retry("no".to_string())
+                }
+            })
+            .unwrap();
+        assert_eq!(calls, vec!["a1".to_string(), "a2".to_string()]);
+        assert_eq!(found.map(|(_, s)| s), Some("A"));
+    }
+
+    #[test]
+    fn try_candidates_all_failed_is_distinguishable_from_nothing_to_try() {
+        // Every source empty: nothing was ever attempted, no resolver
+        // errored -- a clean "no PDF anywhere".
+        let empty_sources = vec![src("A", &[]), src("B", &[])];
+        let (found, attempted, any_download, any_resolver_error) =
+            try_candidates(empty_sources, |_: &str| -> DownloadOutcome<i32> {
+                DownloadOutcome::Landed(0)
+            })
+            .unwrap();
+        assert!(found.is_none());
+        assert_eq!(attempted, vec!["A".to_string(), "B".to_string()]);
+        assert!(!any_download);
+        assert!(!any_resolver_error);
+
+        // Candidates existed, but every download failed.
+        let real_sources = vec![src("A", &["a1"]), src("B", &["b1"])];
+        let (found, attempted, any_download, any_resolver_error) =
+            try_candidates(real_sources, |_: &str| -> DownloadOutcome<i32> {
+                DownloadOutcome::Retry("nope".to_string())
+            })
+            .unwrap();
+        assert!(found.is_none());
+        assert_eq!(attempted.len(), 2);
+        assert!(any_download);
+        assert!(!any_resolver_error);
+    }
+
+    // A resolver erroring (the PMC listing, the bioRxiv API, Unpaywall
+    // itself) must not read the same as that source cleanly having nothing:
+    // if nothing else pans out either, the caller has to be able to tell
+    // "a source actually failed" from "no OA copy exists", which is what
+    // any_resolver_error is for.
+    #[test]
+    fn try_candidates_a_resolver_error_is_distinguishable_from_a_clean_empty_source() {
+        let sources = vec![failing_src("A", "network unreachable"), src("B", &[])];
+        let (found, attempted, any_download, any_resolver_error) =
+            try_candidates(sources, |_: &str| -> DownloadOutcome<i32> {
+                panic!("no URL was ever produced, download must not be called")
+            })
+            .unwrap();
+        assert!(found.is_none());
+        assert!(!any_download);
+        assert!(any_resolver_error);
+        assert_eq!(attempted.len(), 2);
+        assert!(attempted[0].contains('A'));
+        assert!(attempted[0].contains("network unreachable"));
+
+        // A later source succeeding still wins, despite the earlier error.
+        let sources = vec![failing_src("A", "boom"), src("B", &["b1"])];
+        let (found, _attempted, _any_download, any_resolver_error) =
+            try_candidates(sources, |_: &str| -> DownloadOutcome<i32> {
+                DownloadOutcome::Landed(9)
+            })
+            .unwrap();
+        assert_eq!(found, Some((9, "B")));
+        assert!(any_resolver_error);
+    }
+
+    // A Fatal outcome (a systemic failure landing the bytes, not a
+    // per-candidate download problem) aborts the whole loop immediately as
+    // an Err, rather than being recorded as "this candidate failed, try the
+    // next" the way Retry is.
+    #[test]
+    fn try_candidates_a_fatal_outcome_aborts_immediately() {
+        let sources = vec![src("A", &["a1"]), src("B", &["b1"])];
+        let mut calls: Vec<String> = Vec::new();
+        let result = try_candidates(sources, |url| {
+            calls.push(url.to_string());
+            DownloadOutcome::Fatal::<i32>("disk full".to_string())
+        });
+        assert_eq!(result, Err("disk full".to_string()));
+        // B never gets tried: a fatal error is not "move on to the next
+        // candidate".
+        assert_eq!(calls, vec!["a1".to_string()]);
+    }
+
+    #[test]
+    fn url_host_extracts_just_the_host() {
+        assert_eq!(url_host("https://journals.aps.org/pdf/x?y=1"), "journals.aps.org");
+        assert_eq!(url_host("http://example.org/a/b#frag"), "example.org");
+        assert_eq!(url_host("not-a-url"), "not-a-url");
     }
 }

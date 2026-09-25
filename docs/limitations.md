@@ -24,6 +24,11 @@
   (`10.48550/arXiv.*`) are not among them, so add arXiv papers with
   `add --url https://arxiv.org/abs/...` instead.
 - `fetch` only downloads free, legal copies. It will not get around a paywall.
+  It tries every copy Unpaywall lists plus PubMed Central's, moving on after a
+  failed download, but some publisher sites answer scripts with a bot check
+  (Cloudflare, Akamai, reCAPTCHA); `fetch` reports those clearly rather than
+  trying to solve them -- download the PDF in a browser and attach it with
+  `ferref attach` instead.
 
 **Text**
 

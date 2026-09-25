@@ -48,7 +48,7 @@ require `--json`.
 | `attach <key> <file>` | Copy a file into the library and attach it. `--extract` also converts it to text |
 | `extract <key>` | Convert a paper's PDFs to text (again) |
 | `open <key>` | Open a paper's PDFs in your default viewer |
-| `fetch <key>` | Find and download a free, legal copy using the paper's DOI. Tries Unpaywall, then arXiv, bioRxiv/medRxiv, OSF, and preprints.org. `--email` sets the contact address Unpaywall requires |
+| `fetch <key>` | Find and download a free, legal copy using the paper's DOI. Tries every copy Unpaywall lists (PubMed Central's copy first, if the paper has one, then Unpaywall's own PDF links), then arXiv, bioRxiv/medRxiv, OSF, and preprints.org, moving on after any failed download. `--email` sets the contact address Unpaywall requires |
 | `doctor` | List attachments whose file is missing. Exits 1 if it finds any. `--fix` removes those records |
 
 ## BibTeX

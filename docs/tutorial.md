@@ -175,16 +175,19 @@ Downloaded open-access PDF for 'harris2020' from Unpaywall to '~/.ferref/pdfs/ha
 Extracted 41013 characters from '~/.ferref/pdfs/harris2020.pdf'
 ```
 
-ferref asks Unpaywall first. If Unpaywall has nothing, it tries the preprint
-server the DOI belongs to: arXiv, bioRxiv/medRxiv, OSF (including PsyArXiv,
-SocArXiv, and others), or preprints.org.
+ferref queries Unpaywall first, then tries every copy it comes back with:
+PubMed Central's own open-access copy first (if the paper has a PMC record --
+PMC has no bot check, unlike its website), then Unpaywall's own PDF links in
+its order, then whichever preprint server the DOI belongs to: arXiv,
+bioRxiv/medRxiv, OSF (including PsyArXiv, SocArXiv, and others), or
+preprints.org. A failed download just moves on to the next candidate.
 
 Finding nothing is a normal result, not an error:
 
 ```console
 $ ferref fetch piwowar2018
 'piwowar2018' (DOI 10.7717/peerj.4375) is open access, but no direct PDF link
-was found (tried: Unpaywall, arXiv, bioRxiv, OSF, preprints.org)
+was found (tried: PMC, Unpaywall, arXiv, bioRxiv, OSF, preprints.org)
 ```
 
 ferref never works around a paywall.

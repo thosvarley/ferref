@@ -226,9 +226,12 @@ pub enum Command {
         recursive: bool,
     },
     /// Look up an open-access PDF for an entry's DOI and attach + extract it
-    /// if one exists. Tries Unpaywall, then arXiv, bioRxiv/medRxiv, OSF, and
-    /// preprints.org. No OA copy found is a normal outcome (exit 0), not an
-    /// error.
+    /// if one exists. Tries every copy Unpaywall lists -- PubMed Central's
+    /// own copy first if the paper has one, then Unpaywall's own PDF links --
+    /// then arXiv, bioRxiv/medRxiv, OSF, and preprints.org, moving on to the
+    /// next candidate after a failed download. No OA copy found anywhere is
+    /// a normal outcome (exit 0), not an error; a candidate that existed but
+    /// never downloaded is an error (exit 1).
     Fetch {
         cite_key: String,
         /// Contact email for Unpaywall's polite-pool policy. Falls back to

@@ -14,7 +14,7 @@ use std::time::Duration;
 use std::net::{IpAddr, ToSocketAddrs};
 
 use ureq::Agent;
-use ureq::http::Uri;
+use ureq::http::{Response, Uri};
 
 use crate::models::{Author, Entry};
 
@@ -45,12 +45,14 @@ const MAX_REDIRECTS: usize = 10;
 pub fn fetch_metadata(doi: &str) -> Result<Entry, String> {
     validate_doi(doi)?;
     let url = format!("{CROSSREF_BASE}/{}", percent_encode(doi));
-    let body = get_json(&url, "Crossref")?;
+    let body = get_text(&url, "Crossref")?;
     parse_crossref(&body)
 }
 
-/// Looks up an open-access PDF URL for `doi` via Unpaywall. `Ok(None)` means
-/// Unpaywall has no legal OA copy on record -- a normal answer, not an error.
+/// Looks up everything Unpaywall knows about `doi`: every PDF URL it lists
+/// (not just `best_oa_location`) and, if present, a PMC id to try
+/// separately. An empty `pdf_urls` is a normal answer, not an error --
+/// plenty of genuinely open papers are linked only as landing pages.
 pub fn fetch_oa_pdf_url(doi: &str, email: &str) -> Result<OaStatus, String> {
     validate_doi(doi)?;
     let url = format!(
@@ -58,7 +60,7 @@ pub fn fetch_oa_pdf_url(doi: &str, email: &str) -> Result<OaStatus, String> {
         percent_encode(doi),
         percent_encode(email)
     );
-    let body = get_json(&url, "Unpaywall")?;
+    let body = get_text(&url, "Unpaywall")?;
     parse_unpaywall(&body)
 }
 
@@ -141,6 +143,88 @@ pub fn preprints_org_pdf_url(doi: &str) -> Option<String> {
     ))
 }
 
+const PMC_S3_BASE: &str = "https://pmc-oa-opendata.s3.amazonaws.com";
+
+/// PMC id (e.g. "PMC9131462") -> its highest-version PDF URL, via the public
+/// `pmc-oa-opendata` S3 bucket -- PMC's own article/PDF pages serve a
+/// reCAPTCHA to scripts, and Europe PMC returns 403, but this bucket has no
+/// bot check. `Ok(None)` means the article isn't in the open-access subset,
+/// a normal answer, not an error. Rejects a malformed `pmcid` before making
+/// any request.
+pub fn pmc_pdf_url(pmcid: &str) -> Result<Option<String>, String> {
+    let digits = pmcid
+        .strip_prefix("PMC")
+        .filter(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()));
+    let Some(digits) = digits else {
+        return Err(format!(
+            "'{pmcid}' is not a valid PMC id (expected \"PMC\" followed by digits)"
+        ));
+    };
+
+    // The trailing dot after the id is mandatory: without it, a listing for
+    // PMC1000034 also matches PMC10000341.*, PMC10000342.*, and so on, and a
+    // different paper's PDF would download without complaint. See
+    // parse_pmc_versions for the rest of the defence.
+    let url = format!("{PMC_S3_BASE}/?list-type=2&prefix=PMC{digits}.&delimiter=/");
+    let xml = get_text(&url, "PMC")?;
+    let Some(version) = parse_pmc_versions(&xml, pmcid)? else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
+        "{PMC_S3_BASE}/{pmcid}.{version}/{pmcid}.{version}.pdf"
+    )))
+}
+
+/// Scans an S3 `ListObjectsV2` response's `<Prefix>` values -- both the
+/// query's own top-level echo and each `<CommonPrefixes><Prefix>` -- for
+/// ones shaped exactly `<pmcid>.<digits>/`, and returns the numeric maximum.
+/// Two traps this guards against, both seen in real responses: S3 sorts
+/// keys as text, so "PMC1.10/" lists before "PMC1.2/" (taking the max
+/// numerically, not the last entry, fixes that), and the response echoes the
+/// query's own `<Prefix>PMC<id>.</Prefix>` with no version and no trailing
+/// slash, which must be skipped rather than parsed as version "" or crashed
+/// on. A prefix belonging to a different id (e.g. `PMC10000341.1/` when
+/// asking about `PMC1000034`) is ignored too, on the strength of the
+/// trailing dot in `pmcid`'s own prefix not matching.
+///
+/// A genuine "nothing in the open-access subset" answer is a real
+/// `ListBucketResult` with zero matching prefixes -- `Ok(None)`. A response
+/// that isn't a `ListBucketResult` at all (an error page, a truncated body,
+/// garbage) is `Err`, not silently the same "nothing here": without this
+/// check, unparseable junk and a real empty listing were indistinguishable,
+/// and both counted toward `fetch`'s clean "no PDF anywhere" exit 0.
+fn parse_pmc_versions(xml: &str, pmcid: &str) -> Result<Option<u32>, String> {
+    if !xml.contains("<ListBucketResult") {
+        return Err("PMC's S3 listing did not return a ListBucketResult".to_string());
+    }
+
+    let marker = format!("{pmcid}.");
+    let mut best: Option<u32> = None;
+    let mut rest = xml;
+    while let Some(start) = rest.find("<Prefix>") {
+        rest = &rest[start + "<Prefix>".len()..];
+        let Some(end) = rest.find("</Prefix>") else {
+            break;
+        };
+        let value = &rest[..end];
+        rest = &rest[end + "</Prefix>".len()..];
+
+        let Some(after_marker) = value.strip_prefix(&marker) else {
+            continue;
+        };
+        let Some(version_str) = after_marker.strip_suffix('/') else {
+            continue;
+        };
+        if version_str.is_empty() || !version_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(v) = version_str.parse::<u32>() {
+            best = Some(best.map_or(v, |b| b.max(v)));
+        }
+    }
+    Ok(best)
+}
+
 const BIORXIV_API_BASE: &str = "https://api.biorxiv.org/details";
 
 /// bioRxiv/medRxiv DOI -> PDF URL. Unlike the other three sources, a
@@ -159,8 +243,8 @@ pub fn biorxiv_pdf_url(doi: &str) -> Result<Option<String>, String> {
 
     for host in ["biorxiv", "medrxiv"] {
         let url = format!("{BIORXIV_API_BASE}/{host}/{}", percent_encode(doi));
-        let body = get_json(&url, "bioRxiv")?;
-        if let Some(version) = parse_biorxiv_details(&body) {
+        let body = get_text(&url, "bioRxiv")?;
+        if let Some(version) = parse_biorxiv_details(&body)? {
             return Ok(Some(format!(
                 "https://www.{host}.org/content/{doi}v{version}.full.pdf"
             )));
@@ -170,22 +254,32 @@ pub fn biorxiv_pdf_url(doi: &str) -> Result<Option<String>, String> {
 }
 
 /// Picks the highest `version` out of a bioRxiv/medRxiv `/details` response's
-/// `collection` array. `None` covers both shapes a "no match" response can
-/// take -- no `collection` key at all, or an empty `collection` array --
-/// treating both as the normal "not on this host" case, never a panic or an
-/// error. Parsing is split from I/O here exactly like `parse_crossref`/
-/// `parse_unpaywall`, so this is testable without the network.
-fn parse_biorxiv_details(json: &str) -> Option<u32> {
-    let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    let collection = v.get("collection")?.as_array()?;
-    collection
-        .iter()
-        .filter_map(|item| {
-            item.get("version")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<u32>().ok())
-        })
-        .max()
+/// `collection` array.
+///
+/// Two shapes count as the normal "not on this host" case, `Ok(None)`, never
+/// a panic or an error: no `collection` key at all (bioRxiv's actual "no
+/// posts found" response), or an empty `collection` array. But a response
+/// that fails to parse as JSON, or where `collection` exists with the wrong
+/// type, isn't a real "not found" answer -- it's `Err`, so it can't be
+/// silently indistinguishable from one and count toward `fetch`'s clean "no
+/// PDF anywhere" exit 0. Parsing is split from I/O here exactly like
+/// `parse_crossref`/`parse_unpaywall`, so this is testable without the
+/// network.
+fn parse_biorxiv_details(json: &str) -> Result<Option<u32>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("invalid bioRxiv JSON: {e}"))?;
+    match v.get("collection") {
+        None => Ok(None),
+        Some(serde_json::Value::Array(collection)) => Ok(collection
+            .iter()
+            .filter_map(|item| {
+                item.get("version")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<u32>().ok())
+            })
+            .max()),
+        Some(_) => Err("bioRxiv response's \"collection\" field is not an array".to_string()),
+    }
 }
 
 /// Downloads the bytes at `url`, which must have come from a trusted call
@@ -536,9 +630,33 @@ fn unescape_html(s: &str) -> String {
     out
 }
 
-fn get_json(url: &str, service: &str) -> Result<String, String> {
+// Shared by every small-document caller here (Crossref/Unpaywall/bioRxiv
+// JSON, and the PMC S3 listing, which is XML but tiny -- the JSON
+// timeout/size limits are still the right ones for it).
+fn get_text(url: &str, service: &str) -> Result<String, String> {
     let (bytes, _final_url) = fetch_guarded(url, JSON_TIMEOUT, MAX_JSON_BYTES, service)?;
     String::from_utf8(bytes).map_err(|_| format!("{service} returned invalid UTF-8"))
+}
+
+// Whether `what` names a call fetching bytes meant for a human to read (a
+// PDF, or a landing page scraped for citation_pdf_url) rather than a JSON
+// API this program parses. Only those two get the "download it in a browser
+// and use ferref attach" suggestion -- Crossref, Unpaywall, PMC, and
+// bioRxiv have no PDF for a human to fetch, so that advice would be
+// nonsensical there; they just get told the host blocks automated requests.
+fn suggests_manual_download(what: &str) -> bool {
+    matches!(what, "PDF download" | "landing page")
+}
+
+fn cf_mitigated_message(what: &str, host: &str) -> String {
+    if suggests_manual_download(what) {
+        format!(
+            "{host} blocks automated downloads with a bot check (HTTP 403); \
+             download it in a browser and use `ferref attach` instead"
+        )
+    } else {
+        format!("{host} blocks automated requests with a bot check (HTTP 403)")
+    }
 }
 
 // The one place an HTTP request is made. Redirects are followed BY HAND, one
@@ -565,6 +683,20 @@ fn fetch_guarded(
     timeout: Duration,
     limit: u64,
     what: &str,
+) -> Result<(Vec<u8>, String), String> {
+    fetch_guarded_with(url, timeout, limit, what, read_body_capped)
+}
+
+// Same as `fetch_guarded`, but the final "read the body" step is pulled out
+// as a parameter -- `download_pdf` uses this to peek the first four bytes
+// for the `%PDF` magic number before reading the rest, so an HTML
+// interstitial doesn't get read in full just to be thrown away.
+fn fetch_guarded_with(
+    url: &str,
+    timeout: Duration,
+    limit: u64,
+    what: &str,
+    read_body: impl Fn(Response<ureq::Body>, u64, &str) -> Result<Vec<u8>, String>,
 ) -> Result<(Vec<u8>, String), String> {
     let agent: Agent = Agent::config_builder()
         .timeout_global(Some(timeout))
@@ -600,26 +732,88 @@ fn fetch_guarded(
         }
 
         match status.as_u16() {
+            // "no record for this DOI" is right for the JSON APIs (Crossref,
+            // Unpaywall, PMC, bioRxiv), all keyed on a DOI/id -- but a PDF
+            // download or a landing page 404s on its own URL, nothing to do
+            // with a DOI, so that wording would be actively misleading.
+            404 if suggests_manual_download(what) => return Err(format!("{what} not found (404)")),
             404 => return Err(format!("{what} has no record for this DOI (404)")),
             429 => return Err(format!("{what} rate limit exceeded (429); try again later")),
+            // Cloudflare marks a challenge page it served instead of the
+            // real response with this response header -- a plain "HTTP 403"
+            // reads like a permissions problem ferref could fix by trying
+            // again, when the real answer is "a human has to click through
+            // this in a browser".
+            403 if resp
+                .headers()
+                .get("cf-mitigated")
+                .and_then(|v| v.to_str().ok())
+                == Some("challenge") =>
+            {
+                let host = uri.host().unwrap_or(what);
+                return Err(cf_mitigated_message(what, host));
+            }
             _ if !status.is_success() => return Err(format!("{what} returned HTTP {status}")),
             _ => {}
         }
 
-        let body = resp
-            .into_body()
-            .with_config()
-            .limit(limit + 1)
-            .read_to_vec()
-            .map_err(|e| {
-                format!("failed reading {what} response (over the {limit}-byte cap): {e}")
-            })?;
+        let body = read_body(resp, limit, what)?;
         return Ok((body, current));
     }
 
     Err(format!(
         "{what}: too many redirects (limit {MAX_REDIRECTS})"
     ))
+}
+
+// The default body reader: read up to `limit` bytes, erroring past it.
+fn read_body_capped(resp: Response<ureq::Body>, limit: u64, what: &str) -> Result<Vec<u8>, String> {
+    resp.into_body()
+        .with_config()
+        .limit(limit + 1)
+        .read_to_vec()
+        .map_err(|e| format!("failed reading {what} response (over the {limit}-byte cap): {e}"))
+}
+
+// Peeks the first four bytes for the `%PDF` magic number before reading the
+// rest, so a non-PDF response (an HTML interstitial, a login page) is
+// rejected off the first few bytes instead of reading the whole thing --
+// which, for a large interstitial, is most of what download_pdf's timeout
+// and byte cap are trying to bound in the first place.
+fn read_pdf_body(resp: Response<ureq::Body>, limit: u64, what: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
+    let not_a_pdf = || {
+        "downloaded content is not a PDF (missing %PDF magic bytes) -- \
+         this is usually an HTML interstitial, not the paper"
+            .to_string()
+    };
+
+    let mut reader = resp.into_body().into_reader();
+    let mut magic = [0u8; 4];
+    match reader.read_exact(&mut magic) {
+        Ok(()) if &magic == b"%PDF" => {}
+        // A body shorter than four bytes can't be a PDF either -- treated
+        // the same as a mismatched one, not a distinct I/O error.
+        Ok(()) => return Err(not_a_pdf()),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Err(not_a_pdf()),
+        Err(e) => return Err(format!("failed reading {what} response: {e}")),
+    }
+
+    let mut rest = Vec::new();
+    reader
+        .take(limit.saturating_sub(4) + 1)
+        .read_to_end(&mut rest)
+        .map_err(|e| format!("failed reading {what} response (over the {limit}-byte cap): {e}"))?;
+    if (rest.len() as u64) > limit.saturating_sub(4) {
+        return Err(format!(
+            "failed reading {what} response (over the {limit}-byte cap)"
+        ));
+    }
+
+    let mut bytes = magic.to_vec();
+    bytes.append(&mut rest);
+    Ok(bytes)
 }
 
 // Accepts only http(s) URLs whose host resolves entirely to public addresses.
@@ -640,9 +834,19 @@ fn validate_url(url: &str) -> Result<Uri, String> {
         .port_u16()
         .unwrap_or(if scheme == "https" { 443 } else { 80 });
 
+    // `Uri::host()` keeps an IPv6 literal's brackets (`"[::1]"`), but
+    // `ToSocketAddrs` for `(&str, u16)` only recognises the bracket-free
+    // form -- with brackets left on, it tries (and fails) a DNS lookup on
+    // the literal string "[::1]" instead of parsing it as an address, so an
+    // IPv6 loopback/link-local/etc. literal never reached `is_internal` at
+    // all and was rejected at "could not resolve" instead, for the wrong
+    // reason.
+    let host_for_lookup = host.strip_prefix('[').unwrap_or(host);
+    let host_for_lookup = host_for_lookup.strip_suffix(']').unwrap_or(host_for_lookup);
+
     // A host with no resolvable address is a hard error rather than a pass:
     // "can't tell" must not mean "allow".
-    let addrs: Vec<_> = (host, port)
+    let addrs: Vec<_> = (host_for_lookup, port)
         .to_socket_addrs()
         .map_err(|e| format!("could not resolve {host}: {e}"))?
         .collect();
@@ -890,17 +1094,26 @@ fn parse_crossref(json: &str) -> Result<Entry, String> {
     Ok(entry)
 }
 
-/// Parses an Unpaywall response body, returning the OA PDF URL if one
-/// exists. `best_oa_location` (or its `url_for_pdf`) being `null` means no
-/// legal OA copy exists -- `Ok(None)`, not an error.
-/// What Unpaywall knows about a DOI. `is_oa` without a `pdf_url` is common --
-/// plenty of genuinely open papers are only linked as landing pages -- and the
-/// two cases deserve different messages, so they're kept apart here.
+/// What Unpaywall knows about a DOI. `is_oa` with an empty `pdf_urls` is
+/// common -- plenty of genuinely open papers are only linked as landing
+/// pages -- and the two cases deserve different messages, so they're kept
+/// apart here.
 pub struct OaStatus {
     pub is_oa: bool,
-    pub pdf_url: Option<String>,
+    pub pdf_urls: Vec<String>,
+    pub pmcid: Option<String>,
 }
 
+/// Parses an Unpaywall response body into every PDF URL it lists, in order,
+/// plus a PMC id if one of its locations names one.
+///
+/// `best_oa_location.url_for_pdf` comes first, then every other
+/// `oa_locations[].url_for_pdf`, deduplicated. Trying only the first pick
+/// was tried once (see DESIGN.md's history of this) and reverted, because
+/// stopping at the first *failed download* turned a clean "no PDF" into a
+/// "not a PDF" error -- but that was a bug in stopping at the first
+/// failure, not in having more candidates. Phase 26's caller moves on to the
+/// next one instead, so every location Unpaywall lists is worth carrying.
 fn parse_unpaywall(json: &str) -> Result<OaStatus, String> {
     let v: serde_json::Value =
         serde_json::from_str(json).map_err(|e| format!("invalid Unpaywall JSON: {e}"))?;
@@ -914,17 +1127,52 @@ fn parse_unpaywall(json: &str) -> Result<OaStatus, String> {
             .map(str::to_string)
     };
 
-    // Only best_oa_location, deliberately. Scanning the other oa_locations for
-    // a url_for_pdf was tried and reverted: on live data the extra candidates
-    // it turned up were landing pages, so it converted a clean "no PDF
-    // available" into a "downloaded content is not a PDF" failure without
-    // fetching anything new.
-    let pdf_url = v
+    let mut pdf_urls: Vec<String> = Vec::new();
+    if let Some(url) = v
         .get("best_oa_location")
         .filter(|loc| !loc.is_null())
-        .and_then(pdf_of);
+        .and_then(pdf_of)
+    {
+        pdf_urls.push(url);
+    }
+    if let Some(locations) = v.get("oa_locations").and_then(|l| l.as_array()) {
+        for loc in locations {
+            if let Some(url) = pdf_of(loc)
+                && !pdf_urls.contains(&url)
+            {
+                pdf_urls.push(url);
+            }
+        }
+    }
 
-    Ok(OaStatus { is_oa, pdf_url })
+    // A PMC id, if any location names one via its OAI-PMH identifier
+    // (`oai:pubmedcentral.nih.gov:9131462` -> "PMC9131462"). Anything else
+    // in pmh_id is ignored.
+    let pmcid = v
+        .get("oa_locations")
+        .and_then(|l| l.as_array())
+        .and_then(|locs| {
+            locs.iter().find_map(|loc| {
+                loc.get("pmh_id")
+                    .and_then(|p| p.as_str())
+                    .and_then(pmcid_from_pmh_id)
+            })
+        });
+
+    Ok(OaStatus {
+        is_oa,
+        pdf_urls,
+        pmcid,
+    })
+}
+
+fn pmcid_from_pmh_id(pmh_id: &str) -> Option<String> {
+    let digits = pmh_id.strip_prefix("oai:pubmedcentral.nih.gov:")?;
+    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+        Some(format!("PMC{digits}"))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1095,20 +1343,20 @@ mod tests {
         }
         "#;
         assert_eq!(
-            parse_unpaywall(json).unwrap().pdf_url,
-            Some(
+            parse_unpaywall(json).unwrap().pdf_urls,
+            vec![
                 "https://journals.plos.org/plosone/article/file?id=10.1371/journal.pone.0000308&type=printable"
                     .to_string()
-            )
+            ]
         );
     }
 
-    // No legal OA copy: best_oa_location is null. This is Ok(None), not an
+    // No legal OA copy: best_oa_location is null. This is Ok(empty), not an
     // error.
     #[test]
     fn parses_unpaywall_response_with_no_oa_copy() {
         let json = r#"{ "doi": "10.1/paywalled", "is_oa": false, "best_oa_location": null }"#;
-        assert_eq!(parse_unpaywall(json).unwrap().pdf_url, None);
+        assert!(parse_unpaywall(json).unwrap().pdf_urls.is_empty());
     }
 
     // url_for_pdf itself can be null even when best_oa_location isn't.
@@ -1117,7 +1365,7 @@ mod tests {
         let json = r#"
         { "best_oa_location": { "url_for_pdf": null, "host_type": "repository" } }
         "#;
-        assert_eq!(parse_unpaywall(json).unwrap().pdf_url, None);
+        assert!(parse_unpaywall(json).unwrap().pdf_urls.is_empty());
     }
 
     fn meta_of(html: &str) -> PageMetadata {
@@ -1295,6 +1543,23 @@ mod tests {
         assert_eq!(percent_encode("10.1/has space"), "10.1/has%20space");
     }
 
+    // The "download it in a browser" advice only makes sense for the two
+    // callers fetching something a human could open (a PDF, a landing
+    // page); a Crossref/Unpaywall/PMC/bioRxiv 403 gets the plain version.
+    #[test]
+    fn cf_mitigated_message_only_suggests_manual_download_for_pdf_and_page_callers() {
+        for what in ["PDF download", "landing page"] {
+            let msg = cf_mitigated_message(what, "example.org");
+            assert!(msg.contains("example.org"));
+            assert!(msg.contains("ferref attach"), "{what}: {msg}");
+        }
+        for what in ["Crossref", "Unpaywall", "PMC", "bioRxiv"] {
+            let msg = cf_mitigated_message(what, "example.org");
+            assert!(msg.contains("example.org"));
+            assert!(!msg.contains("ferref attach"), "{what}: {msg}");
+        }
+    }
+
     // Regression: the scheme check used to run only on the URL we were handed,
     // while ureq followed up to 10 redirects on its own, so an Unpaywall URL
     // could redirect us onto loopback or the cloud metadata address.
@@ -1344,8 +1609,26 @@ mod tests {
         assert!(validate_url("javascript:alert(1)").is_err());
         assert!(validate_url("http://127.0.0.1:8080/x").is_err());
         assert!(validate_url("http://169.254.169.254/latest/meta-data/").is_err());
-        assert!(validate_url("https://[::1]/x").is_err());
         assert!(validate_url("not a url").is_err());
+    }
+
+    // Regression: `Uri::host()` keeps an IPv6 literal's brackets
+    // ("[::1]"), but `ToSocketAddrs` only parses the bracket-free form --
+    // left un-stripped, "[::1]" failed as an unresolvable DNS name instead
+    // of ever reaching is_internal, so the loopback check never actually
+    // ran for an IPv6 literal. Both sides here resolve with no network
+    // access (a literal IP address is parsed directly, never looked up),
+    // so this is safe to assert on without touching the network.
+    #[test]
+    fn validate_url_checks_ipv6_literals_against_is_internal_not_just_dns() {
+        let err = validate_url("https://[::1]/x").unwrap_err();
+        assert!(
+            err.contains("internal address"),
+            "expected an is_internal rejection, got: {err}"
+        );
+
+        // A real public IPv6 literal (Cloudflare's 1.1.1.1) must pass.
+        assert!(validate_url("https://[2606:4700:4700::1111]/x").is_ok());
     }
 
     #[test]
@@ -1410,30 +1693,207 @@ mod tests {
         }"#;
         let oa = parse_unpaywall(json).unwrap();
         assert!(oa.is_oa);
-        assert_eq!(oa.pdf_url, None);
+        assert!(oa.pdf_urls.is_empty());
 
         let closed = parse_unpaywall(r#"{"is_oa": false, "best_oa_location": null}"#).unwrap();
         assert!(!closed.is_oa);
-        assert_eq!(closed.pdf_url, None);
+        assert!(closed.pdf_urls.is_empty());
     }
 
-    // Only best_oa_location is consulted; other oa_locations are ignored on
-    // purpose (see the comment in parse_unpaywall).
+    // best_oa_location comes first, then every other oa_locations[]
+    // url_for_pdf in order, deduplicated -- Phase 26 reverted the earlier
+    // "only best_oa_location" rule (see parse_unpaywall's doc comment).
     #[test]
-    fn other_oa_locations_are_not_consulted() {
+    fn every_oa_location_pdf_url_is_collected_in_order_and_deduped() {
         let json = r#"{
             "is_oa": true,
-            "best_oa_location": {"url_for_pdf": null},
-            "oa_locations": [{"url_for_pdf": "https://repo.example/paper.pdf"}]
+            "best_oa_location": {"url_for_pdf": "https://best.example/a.pdf"},
+            "oa_locations": [
+                {"url_for_pdf": "https://best.example/a.pdf"},
+                {"url_for_pdf": null},
+                {"url_for_pdf": "https://repo.example/paper.pdf"}
+            ]
         }"#;
-        assert_eq!(parse_unpaywall(json).unwrap().pdf_url, None);
-
-        let both = r#"{"is_oa": true,
-            "best_oa_location": {"url_for_pdf": "https://best.example/a.pdf"}}"#;
         assert_eq!(
-            parse_unpaywall(both).unwrap().pdf_url.as_deref(),
-            Some("https://best.example/a.pdf")
+            parse_unpaywall(json).unwrap().pdf_urls,
+            vec![
+                "https://best.example/a.pdf".to_string(),
+                "https://repo.example/paper.pdf".to_string(),
+            ]
         );
+    }
+
+    // Real APS paper (Phase 26 fixture, captured 2026-09-25): the best pick
+    // is a publisher PDF that's blocked in practice, but the same response
+    // also lists an arXiv copy as a second oa_locations entry, and a
+    // repository entry that's landing-page-only (url_for_pdf null) and must
+    // be skipped, not turned into a "not a PDF" candidate.
+    const UNPAYWALL_APS: &str = r#"
+    {
+      "is_oa": true,
+      "best_oa_location": {
+        "pmh_id": null,
+        "url_for_pdf": "http://link.aps.org/pdf/10.1103/PhysRevE.100.032305"
+      },
+      "oa_locations": [
+        {
+          "pmh_id": null,
+          "url_for_pdf": "http://link.aps.org/pdf/10.1103/PhysRevE.100.032305"
+        },
+        {
+          "pmh_id": "oai:arXiv.org:1902.11239",
+          "url_for_pdf": "https://arxiv.org/pdf/1902.11239"
+        },
+        {
+          "pmh_id": "oai:infoscience.epfl.ch:270413",
+          "url_for_pdf": null
+        }
+      ]
+    }
+    "#;
+
+    #[test]
+    fn parses_aps_response_blocked_pick_then_arxiv_fallback() {
+        let oa = parse_unpaywall(UNPAYWALL_APS).unwrap();
+        assert_eq!(
+            oa.pdf_urls,
+            vec![
+                "http://link.aps.org/pdf/10.1103/PhysRevE.100.032305".to_string(),
+                "https://arxiv.org/pdf/1902.11239".to_string(),
+            ]
+        );
+        // arXiv.org's own pmh_id is not a PMC one.
+        assert_eq!(oa.pmcid, None);
+    }
+
+    // Real Royal Society paper (Phase 26 fixture, captured 2026-09-25): no
+    // url_for_pdf anywhere, but a PMC pmh_id that fetch_pdf_for_entry can
+    // still try.
+    const UNPAYWALL_RSTA: &str = r#"
+    {
+      "is_oa": true,
+      "best_oa_location": {
+        "pmh_id": null,
+        "url_for_pdf": null
+      },
+      "oa_locations": [
+        {
+          "pmh_id": null,
+          "url_for_pdf": null
+        },
+        {
+          "pmh_id": "oai:pubmedcentral.nih.gov:9131462",
+          "url_for_pdf": null
+        }
+      ]
+    }
+    "#;
+
+    #[test]
+    fn parses_rsta_response_no_pdf_but_a_pmc_id() {
+        let oa = parse_unpaywall(UNPAYWALL_RSTA).unwrap();
+        assert!(oa.pdf_urls.is_empty());
+        assert_eq!(oa.pmcid.as_deref(), Some("PMC9131462"));
+    }
+
+    #[test]
+    fn pmh_id_shapes_that_are_not_a_pmc_record_are_ignored() {
+        assert_eq!(pmcid_from_pmh_id("oai:arXiv.org:1902.11239"), None);
+        assert_eq!(pmcid_from_pmh_id("oai:pubmedcentral.nih.gov:"), None);
+        assert_eq!(
+            pmcid_from_pmh_id("oai:pubmedcentral.nih.gov:abc"),
+            None
+        );
+        assert_eq!(
+            pmcid_from_pmh_id("oai:pubmedcentral.nih.gov:9131462"),
+            Some("PMC9131462".to_string())
+        );
+    }
+
+    // The two real S3 listings captured 2026-09-25.
+    const S3_NO_VERSIONS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+    <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+      <Prefix>PMC6112690.</Prefix><KeyCount>0</KeyCount>
+    </ListBucketResult>"#;
+
+    const S3_ONE_VERSION: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+    <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+      <Prefix>PMC9131462.</Prefix><KeyCount>1</KeyCount>
+      <CommonPrefixes><Prefix>PMC9131462.1/</Prefix></CommonPrefixes>
+    </ListBucketResult>"#;
+
+    const S3_TWO_VERSIONS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+    <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+      <Prefix>PMC10000341.</Prefix><KeyCount>2</KeyCount>
+      <CommonPrefixes><Prefix>PMC10000341.1/</Prefix></CommonPrefixes>
+      <CommonPrefixes><Prefix>PMC10000341.2/</Prefix></CommonPrefixes>
+    </ListBucketResult>"#;
+
+    #[test]
+    fn parse_pmc_versions_empty_listing_is_none() {
+        assert_eq!(
+            parse_pmc_versions(S3_NO_VERSIONS, "PMC6112690").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_pmc_versions_single_version() {
+        assert_eq!(
+            parse_pmc_versions(S3_ONE_VERSION, "PMC9131462").unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn parse_pmc_versions_two_versions_takes_the_max() {
+        assert_eq!(
+            parse_pmc_versions(S3_TWO_VERSIONS, "PMC10000341").unwrap(),
+            Some(2)
+        );
+    }
+
+    // S3 sorts keys as text, so version 10 lists before version 2 -- the
+    // numeric maximum (10) must win, not the last entry seen.
+    #[test]
+    fn parse_pmc_versions_takes_the_numeric_not_textual_maximum() {
+        let xml = r#"<ListBucketResult>
+            <Prefix>PMC1.</Prefix>
+            <CommonPrefixes><Prefix>PMC1.10/</Prefix></CommonPrefixes>
+            <CommonPrefixes><Prefix>PMC1.2/</Prefix></CommonPrefixes>
+        </ListBucketResult>"#;
+        assert_eq!(parse_pmc_versions(xml, "PMC1").unwrap(), Some(10));
+    }
+
+    // A neighbouring id's prefix (PMC10000341 contains PMC1000034 as a
+    // textual prefix, but not as "PMC1000034." followed by a version) must
+    // be ignored, or PMC1000034 would silently download a different paper.
+    #[test]
+    fn parse_pmc_versions_ignores_a_neighbouring_ids_prefix() {
+        let xml = r#"<ListBucketResult>
+            <Prefix>PMC1000034.</Prefix>
+            <CommonPrefixes><Prefix>PMC10000341.1/</Prefix></CommonPrefixes>
+        </ListBucketResult>"#;
+        assert_eq!(parse_pmc_versions(xml, "PMC1000034").unwrap(), None);
+    }
+
+    // L3: garbage (not a ListBucketResult at all -- an error page, a
+    // truncated body) must not be silently indistinguishable from a real
+    // empty listing. Both used to read as "no PDF here", the normal exit-0
+    // case; only a genuine empty-but-valid listing should.
+    #[test]
+    fn parse_pmc_versions_rejects_input_that_is_not_a_list_bucket_result() {
+        assert!(parse_pmc_versions("<html>Service Unavailable</html>", "PMC1").is_err());
+        assert!(parse_pmc_versions("", "PMC1").is_err());
+        assert!(parse_pmc_versions("not xml at all", "PMC1").is_err());
+    }
+
+    #[test]
+    fn pmc_pdf_url_rejects_a_malformed_pmcid() {
+        assert!(pmc_pdf_url("9131462").is_err());
+        assert!(pmc_pdf_url("PMC").is_err());
+        assert!(pmc_pdf_url("PMCabc").is_err());
+        assert!(pmc_pdf_url("PMC123abc").is_err());
     }
 
     #[test]
@@ -1519,32 +1979,41 @@ mod tests {
             {"doi":"10.1101/2020.01.01.900000","version":"2"}
         ],"messages":[{"status":"ok","count":"2"}]}
         "#;
-        assert_eq!(parse_biorxiv_details(json), Some(2));
+        assert_eq!(parse_biorxiv_details(json).unwrap(), Some(2));
     }
 
-    // "no posts found" shape: no `collection` key at all. Must be None, not
-    // an error or a panic.
+    // "no posts found" shape: no `collection` key at all. Must be Ok(None),
+    // not an error or a panic -- this is bioRxiv's own real "not found"
+    // response.
     #[test]
     fn parse_biorxiv_details_no_collection_key_is_none() {
         let json = r#"{"messages":[{"status":"no posts found matching the DOI"}]}"#;
-        assert_eq!(parse_biorxiv_details(json), None);
+        assert_eq!(parse_biorxiv_details(json).unwrap(), None);
     }
 
     // An empty collection array is the same "not found" case as a missing key.
     #[test]
     fn parse_biorxiv_details_empty_collection_is_none() {
         let json = r#"{"collection":[],"messages":[{"status":"ok","count":"0"}]}"#;
-        assert_eq!(parse_biorxiv_details(json), None);
+        assert_eq!(parse_biorxiv_details(json).unwrap(), None);
     }
 
-    // Malformed JSON and a non-numeric version must never panic.
+    // A non-numeric version on one item is just skipped, not garbage --
+    // the rest of the response is still a well-formed collection.
     #[test]
-    fn parse_biorxiv_details_malformed_input_is_none_not_panic() {
-        assert_eq!(parse_biorxiv_details("not json"), None);
-        assert_eq!(
-            parse_biorxiv_details(r#"{"collection":[{"version":"not-a-number"}]}"#),
-            None
-        );
-        assert_eq!(parse_biorxiv_details(r#"{"collection":"oops"}"#), None);
+    fn parse_biorxiv_details_a_non_numeric_version_is_skipped_not_an_error() {
+        let json = r#"{"collection":[{"version":"not-a-number"},{"version":"3"}]}"#;
+        assert_eq!(parse_biorxiv_details(json).unwrap(), Some(3));
+    }
+
+    // L3: malformed JSON, or a "collection" field of the wrong type, is not
+    // a real "not found" answer -- it must be Err, not silently None, or a
+    // network blip/API change reads as "no PDF anywhere" (fetch's clean
+    // exit 0) instead of the error it actually is.
+    #[test]
+    fn parse_biorxiv_details_rejects_unparseable_input() {
+        assert!(parse_biorxiv_details("not json").is_err());
+        assert!(parse_biorxiv_details(r#"{"collection":"oops"}"#).is_err());
+        assert!(parse_biorxiv_details(r#"{"collection":42}"#).is_err());
     }
 }
