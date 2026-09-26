@@ -8,6 +8,7 @@ mod text;
 mod tui;
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 
@@ -118,6 +119,9 @@ fn main() {
             // reassign the whole Option -- it has to unwrap and move the
             // String out of Some.
             if let Some(title) = title {
+                if let Err(e) = cli::validate_title(&title) {
+                    die(&e);
+                }
                 entry.title = title;
             }
             if year.is_some() {
@@ -378,6 +382,23 @@ fn main() {
                         "'{cite_key}' has no attachments that resolve on disk"
                     ));
                 } else {
+                    // Every attachment was dangling: nothing was opened, and
+                    // this exits 1 same as any other failure -- so, like
+                    // die(), the human-readable message belongs on stderr,
+                    // not stdout, --json included. Used to print to stdout
+                    // and exit 1, which reads as success to anything
+                    // checking the exit code alone.
+                    eprintln!(
+                        "removed {} dangling attachment(s) for '{}'; nothing left to open",
+                        cleaned.len(),
+                        sanitize_control_chars(&cite_key)
+                    );
+                    for path in &cleaned {
+                        eprintln!(
+                            "  removed dangling attachment '{}' -- file no longer exists",
+                            sanitize_control_chars(path)
+                        );
+                    }
                     if json {
                         let out = serde_json::json!({
                             "cite_key": cite_key,
@@ -385,14 +406,6 @@ fn main() {
                             "cleaned": cleaned,
                         });
                         emit_json(&out);
-                    } else {
-                        emit(&format!(
-                            "removed {} dangling attachment(s) for '{cite_key}'; nothing left to open",
-                            cleaned.len()
-                        ));
-                        for path in &cleaned {
-                            emit(&format!("  removed dangling attachment '{path}' -- file no longer exists"));
-                        }
                     }
                     std::process::exit(1);
                 }
@@ -495,7 +508,10 @@ fn resolve_cite_key(
     entry: &Entry,
 ) -> String {
     match explicit {
-        Some(key) => key,
+        Some(key) => match cli::validate_cite_key(&key) {
+            Ok(()) => key,
+            Err(e) => die(&e),
+        },
         None => match derive_cite_key(conn, entry) {
             Ok(key) => key,
             Err(e) => die(&e),
@@ -536,6 +552,30 @@ fn apply_manual_overrides(
         entry.authors = parsed;
     }
     Ok(())
+}
+
+// Builds an Entry from a scraped landing page's own meta tags (no DOI
+// lookup) -- the manual-fallback path shared by a page with no DOI at all
+// and, since M5, a page whose DOI Crossref has no record for (DataCite DOIs:
+// Zenodo, Figshare, arXiv's 10.48550, ...).
+fn entry_from_page_metadata(found: &doi::PageMetadata) -> Entry {
+    let mut entry = Entry::new(
+        "article".to_string(),
+        String::new(),
+        found.title.clone().unwrap_or_default(),
+    );
+    for raw in &found.authors {
+        // citation_author is "Last, First" by convention; parse_author
+        // treats a comma-less name as all surname, which degrades
+        // sensibly for the publishers that ignore that.
+        match cli::parse_author(raw) {
+            Ok(author) => entry.add_author(author),
+            Err(_) => continue,
+        }
+    }
+    entry.year = found.year;
+    entry.journal = found.journal.clone();
+    entry
 }
 
 #[allow(clippy::too_many_arguments)] // one per --flag on `ferref add`, same shape as Command::Add itself
@@ -598,9 +638,29 @@ fn cmd_add(
     // cite_key) and every other manual flag -- --year/--journal/--volume/
     // --pages/--abstract/--url/--author -- override whatever Crossref
     // supplied, via apply_manual_overrides below.
+    // --doi came from the page's own citation_doi tag (scrape mode), not
+    // from an explicit --doi flag -- so a Crossref 404 on it is a DataCite
+    // DOI (Zenodo, Figshare, arXiv's 10.48550, ...) that just isn't in
+    // Crossref's index, not a typo the user needs to fix. Falling back to
+    // the page's own meta tags is the difference between working on those
+    // hosts and refusing to; a 404 on an explicit --doi is still fatal, same
+    // as any other Crossref error here (network, rate limit, ...).
+    let doi_from_page = scrape_url;
+
     let mut entry = if let Some(doi_value) = doi {
         let mut entry = match doi::fetch_metadata(&doi_value) {
             Ok(e) => e,
+            Err(e) if doi_from_page && doi::is_no_record_404(&e) => {
+                eprintln!(
+                    "Note: {}",
+                    sanitize_control_chars(&format!(
+                        "Crossref has no record for DOI '{doi_value}'; using the page's own details instead"
+                    ))
+                );
+                entry_from_page_metadata(
+                    page.as_ref().expect("doi_from_page implies page is Some"),
+                )
+            }
             Err(e) => die(&format!(
                 "failed to fetch metadata for DOI '{doi_value}': {e}"
             )),
@@ -626,22 +686,7 @@ fn cmd_add(
         // A page with no DOI: fall back to what it told us directly.
         // Weaker than Crossref, but it's the difference between working
         // on a preprint server and refusing to.
-        let mut entry = Entry::new(
-            "article".to_string(),
-            String::new(),
-            found.title.clone().unwrap_or_default(),
-        );
-        for raw in &found.authors {
-            // citation_author is "Last, First" by convention; parse_author
-            // treats a comma-less name as all surname, which degrades
-            // sensibly for the publishers that ignore that.
-            match cli::parse_author(raw) {
-                Ok(author) => entry.add_author(author),
-                Err(_) => continue,
-            }
-        }
-        entry.year = found.year;
-        entry.journal = found.journal.clone();
+        let mut entry = entry_from_page_metadata(&found);
         // Explicit flags always win over whatever the page's meta tags
         // supplied -- used to be silently dropped here for everything but
         // --url.
@@ -674,6 +719,12 @@ fn cmd_add(
                  --title) to fetch from a landing page",
             ),
         };
+        if let Err(e) = cli::validate_cite_key(&cite_key) {
+            die(&e);
+        }
+        if let Err(e) = cli::validate_title(&title) {
+            die(&e);
+        }
         let mut entry = Entry::new(entry_type, cite_key, title);
         for raw in authors {
             match cli::parse_author(&raw) {
@@ -700,13 +751,26 @@ fn cmd_add(
     // just fetched. Same partial-failure rule as `attach --extract`.
     let pdf = pending_pdf.map(|url| add_pdf_from_page(conn, &entry.cite_key, &url));
 
+    // Re-read the entry so a successful attach shows up in `attachments`
+    // before output -- `entry` above still reflects the pre-attach insert,
+    // so printing it as-is left --json reporting "attachments": [] even
+    // when the attach worked (`show` right afterward would list the PDF).
+    if matches!(pdf, Some(Ok(_)))
+        && let Ok(Some(refreshed)) = db::get_entry(conn, &entry.cite_key)
+    {
+        entry = refreshed;
+    }
+
     output_entry(&entry, json);
-    if !json {
-        match &pdf {
-            Some(Ok(path)) => emit(&format!("Attached '{path}'")),
-            Some(Err(e)) => eprintln!("Warning: {e}"),
-            None => {}
-        }
+    if let Some(Err(e)) = &pdf {
+        // Always to stderr, --json included: docs/scripting.md promises
+        // "exit 1 = message on stderr", but this used to only print when
+        // not --json, so a failed download under --json exited 1 silent.
+        eprintln!("Warning: {}", sanitize_control_chars(e));
+    } else if let Some(Ok(path)) = &pdf
+        && !json
+    {
+        emit(&format!("Attached '{path}'"));
     }
     if matches!(pdf, Some(Err(_))) {
         std::process::exit(1);
@@ -824,7 +888,11 @@ fn cmd_attach(
     }
 
     if let Some(Err(e)) = &extraction {
-        eprintln!("Warning: extraction failed for '{resolved}': {e}");
+        eprintln!(
+            "Warning: extraction failed for '{}': {}",
+            sanitize_control_chars(&resolved),
+            sanitize_control_chars(e)
+        );
         std::process::exit(1);
     } else if let Some(Ok(chars)) = &extraction {
         if !json {
@@ -965,33 +1033,40 @@ enum FetchOutcome {
     // No candidate PDF URL existed anywhere, and every source that was
     // asked came back with a real "nothing here" answer -- not an error.
     // `is_oa` is Unpaywall's own determination. `attempted` lists every
-    // source that was tried and came up empty, in the order tried, so a
-    // wrong guess is visible rather than silently indistinguishable from
-    // "no PDF anywhere".
+    // source that was actually consulted and came up empty, in the order
+    // tried -- a source that plainly didn't apply (PMC with no pmcid, a
+    // pattern source whose DOI didn't match) is never listed, since it was
+    // never asked anything.
     NoPdfFound {
         doi: String,
         is_oa: bool,
         attempted: Vec<String>,
     },
     // A PDF was landed at `path` (or was already there, per
-    // `already_present`) from `source`. Extraction is a separate, partial
-    // step -- a failed extraction still leaves the attachment in place, so
-    // it travels inside `Ok` rather than failing the whole fetch.
+    // `already_present`) from `source`. `source` is `None` only when the
+    // entry already had its PDF -- reused with no network at all, so there
+    // is no "source" to name. Extraction is a separate, partial step -- a
+    // failed extraction still leaves the attachment in place, so it travels
+    // inside `Ok` rather than failing the whole fetch.
     Downloaded {
         doi: String,
         path: String,
         already_present: bool,
         extraction: Result<usize, String>,
-        source: &'static str,
+        source: Option<&'static str>,
     },
 }
 
-// A source in the candidate list: a name plus a thunk that resolves it to
-// zero or more PDF URLs to try, in order, or an error. The thunk runs
-// lazily -- only as far as `try_candidates` needs it -- so a source with a
-// real network call of its own (PMC, bioRxiv) is never reached once
-// something earlier has already landed a PDF.
-type CandidateSource = (&'static str, Box<dyn FnOnce() -> Result<Vec<String>, String>>);
+// A source in the candidate list: a name plus a thunk that resolves it,
+// lazily, to `Ok(None)` if the source plainly doesn't apply to this DOI/id
+// (never actually consulted -- PMC with no pmcid, a pattern source whose
+// DOI didn't match), `Ok(Some(urls))` if it was consulted (urls may be
+// empty: checked and genuinely had nothing), or `Err` on a real failure.
+// The thunk runs lazily -- only as far as `try_candidates` needs it -- so a
+// source with a real network call of its own (PMC, bioRxiv) is never
+// reached once something earlier has already landed a PDF, or once the
+// overall deadline has passed.
+type CandidateSource = (&'static str, Box<dyn FnOnce() -> Result<Option<Vec<String>>, String>>);
 
 // What trying one candidate URL came back with. `Retry` and `Fatal` are
 // both failures, but only `Retry` means "this candidate didn't pan out, try
@@ -1005,40 +1080,78 @@ enum DownloadOutcome<T> {
     Fatal(String),
 }
 
+// Classifies what happened while landing one candidate's bytes: a failed
+// download is retryable (the next candidate might work); a failed `land`
+// (claim a name, write, attach) is fatal -- see `DownloadOutcome`'s doc
+// comment for why. Split out of the download closure inside
+// `fetch_pdf_for_entry` (which needs a live `Connection` and the network)
+// so a #[test] can drive the Retry/Fatal distinction on its own.
+fn classify_download<T>(
+    download_result: Result<Vec<u8>, String>,
+    land: impl FnOnce(&[u8]) -> Result<T, String>,
+) -> DownloadOutcome<T> {
+    match download_result {
+        Ok(bytes) => match land(&bytes) {
+            Ok(value) => DownloadOutcome::Landed(value),
+            Err(e) => DownloadOutcome::Fatal(e),
+        },
+        Err(e) => DownloadOutcome::Retry(e),
+    }
+}
+
+// Everything `try_candidates` has to report back: the winning value plus
+// its source name (on success), the attempt log, whether any URL was ever
+// handed to `download`, whether any resolver errored, and whether any
+// candidate was rejected by a bot check -- the middle two are how the
+// caller tells "every source had nothing" (NoPdfFound) apart from
+// "something was tried, or something errored, and nothing came of it" (an
+// error); the last is whether that error should end with the "download it
+// in a browser" advice.
+struct CandidateOutcome<T> {
+    landed: Option<(T, &'static str)>,
+    attempted: Vec<String>,
+    any_download_attempted: bool,
+    any_resolver_error: bool,
+    any_bot_blocked: bool,
+}
+
 // Tries each source in order: resolve it (lazily) to its candidate URLs,
 // then try each one against `download` until one succeeds. A `Retry`
-// records a short, host-only reason and moves to the next URL/source; a
-// `Fatal` aborts immediately as `Err`. A source whose own resolution failed
-// (the PMC listing, the bioRxiv API, Unpaywall itself) is recorded too and
-// flips the returned `any_resolver_error`, since a real failure there must
-// not read as "no OA copy exists" if nothing else pans out either.
+// records a short, host-only reason (no advice, no repeated wording -- see
+// `short_download_reason`) and moves to the next URL/source; a `Fatal`
+// aborts immediately as `Err`. A source whose own resolution failed (the
+// PMC listing, the bioRxiv API, Unpaywall itself) is recorded too and flips
+// `any_resolver_error`, since a real failure there must not read as "no OA
+// copy exists" if nothing else pans out either. `deadline` bounds the whole
+// loop: once passed, no new source is resolved and no new URL is tried --
+// the LIGO DOI lists 14 Unpaywall PDF URLs, and without a cap, a run of
+// blocked or slow ones can leave `fetch` hanging for many minutes.
 //
-// Returns, on success, the winning value plus its source name, the attempt
-// log, whether any URL was ever handed to `download`, and whether any
-// resolver errored -- the last two are how the caller tells "every source
-// had nothing" (NoPdfFound) apart from "something was tried, or something
-// errored, and nothing came of it" (an error).
-//
-// Generic over `download` so a #[test] can drive the ordering, moving-on,
-// and fatal-abort behaviour without the network.
-//
-// The winning value plus its source name, the attempt log, whether any URL
-// was ever handed to `download`, and whether any resolver errored.
-type CandidateOutcome<T> = (Option<(T, &'static str)>, Vec<String>, bool, bool);
-
+// Generic over `download` (and, for tests, over what "now" and "deadline"
+// mean) so a #[test] can drive the ordering, moving-on, fatal-abort, and
+// deadline behaviour without the network or a real sleep.
 fn try_candidates<T>(
     sources: Vec<CandidateSource>,
+    deadline: Instant,
     mut download: impl FnMut(&str) -> DownloadOutcome<T>,
 ) -> Result<CandidateOutcome<T>, String> {
     let mut attempted: Vec<String> = Vec::new();
     let mut any_download_attempted = false;
     let mut any_resolver_error = false;
+    let mut any_bot_blocked = false;
 
     for (source, resolve) in sources {
+        if Instant::now() >= deadline {
+            attempted.push("stopped: 60s time limit reached".to_string());
+            break;
+        }
+
         let urls = match resolve() {
-            Ok(urls) => urls,
+            Ok(Some(urls)) => urls,
+            // Not applicable -- never actually asked, so not listed either.
+            Ok(None) => continue,
             Err(e) => {
-                attempted.push(format!("{source} (error: {e})"));
+                attempted.push(format!("{source}: {e}"));
                 any_resolver_error = true;
                 continue;
             }
@@ -1048,25 +1161,45 @@ fn try_candidates<T>(
             continue;
         }
         for url in urls {
+            if Instant::now() >= deadline {
+                attempted.push("stopped: 60s time limit reached".to_string());
+                return Ok(CandidateOutcome {
+                    landed: None,
+                    attempted,
+                    any_download_attempted,
+                    any_resolver_error,
+                    any_bot_blocked,
+                });
+            }
+
             any_download_attempted = true;
             match download(&url) {
                 DownloadOutcome::Landed(value) => {
-                    return Ok((
-                        Some((value, source)),
+                    return Ok(CandidateOutcome {
+                        landed: Some((value, source)),
                         attempted,
                         any_download_attempted,
                         any_resolver_error,
-                    ));
+                        any_bot_blocked,
+                    });
                 }
                 DownloadOutcome::Retry(e) => {
-                    attempted.push(format!("{source} ({}: {e})", url_host(&url)))
+                    let (reason, blocked) = short_download_reason(&e);
+                    any_bot_blocked |= blocked;
+                    attempted.push(format!("{source} ({}): {reason}", url_host(&url)));
                 }
                 DownloadOutcome::Fatal(e) => return Err(e),
             }
         }
     }
 
-    Ok((None, attempted, any_download_attempted, any_resolver_error))
+    Ok(CandidateOutcome {
+        landed: None,
+        attempted,
+        any_download_attempted,
+        any_resolver_error,
+        any_bot_blocked,
+    })
 }
 
 // A short label for a failed candidate: its host, not the whole URL -- long
@@ -1080,16 +1213,106 @@ fn url_host(url: &str) -> &str {
         .unwrap_or(without_scheme)
 }
 
-// The actual work of `fetch`: DOI lookup on the entry, email resolution,
-// then a candidate list tried in order until one downloads. Unpaywall is
-// queried eagerly (it's where a PMC id comes from), but the *download*
-// order is PMC, then Unpaywall's own pdf_urls, then arXiv, bioRxiv (an API
-// call, made only if reached), OSF, and preprints.org -- see FetchOutcome's
-// doc comment for why PMC
-// goes first. Pulled out of cmd_fetch so the TUI can call it too without
-// dying on failure -- every error path here returns Err instead of calling
-// die()/process::exit, which cmd_fetch alone still does, at the same
-// messages it always has.
+// Collapses a download error down to one short, advice-free reason: a bot
+// check's HTTP 403 gets its host repeated (already in the line's `(host)`
+// label) and a "download it in a browser..." suggestion tacked on by
+// `doi::cf_mitigated_message` -- useful once, on a single download, but
+// noise repeated across a dozen failed candidates. The advice itself is
+// shown once at the end of the whole attempt list, only if this returns
+// `true` for at least one of them (see `fetch_pdf_for_entry`).
+fn short_download_reason(err: &str) -> (String, bool) {
+    if err.contains("blocks automated downloads with a bot check (HTTP 403)") {
+        return ("blocked by a bot check (HTTP 403)".to_string(), true);
+    }
+    // "PDF download not found (404)" repeats the source's own label with a
+    // fixed prefix every download error carries; strip it once here rather
+    // than at every call site.
+    (
+        err.strip_prefix("PDF download ").unwrap_or(err).to_string(),
+        false,
+    )
+}
+
+const FETCH_DEADLINE: Duration = Duration::from_secs(60);
+
+// Builds the ordered candidate list -- PMC, Unpaywall, arXiv, bioRxiv, OSF,
+// preprints.org -- as lazy thunks (see `CandidateSource`). Pulled out of
+// `fetch_pdf_for_entry` so a #[test] can check the order without the
+// network. `unpaywall_urls` is already resolved by the caller (Unpaywall
+// runs eagerly, since PMC's id comes from its response); every other
+// source's own network call, if it has one, only happens when
+// `try_candidates` actually reaches it. `deadline` bounds PMC's and
+// bioRxiv's own JSON calls too, not just the download loop around them --
+// each is given whatever's left of the 60s budget at the moment
+// `try_candidates` actually calls its thunk (capped at doi::JSON_TIMEOUT,
+// same as every other JSON call here), rather than always waiting the full
+// 30s regardless of how much of the deadline is already gone.
+fn candidate_sources(
+    doi_value: &str,
+    pmcid: Option<String>,
+    unpaywall_urls: Result<Vec<String>, String>,
+    deadline: Instant,
+) -> Vec<CandidateSource> {
+    let doi_for_arxiv = doi_value.to_string();
+    let doi_for_biorxiv = doi_value.to_string();
+    let doi_for_osf = doi_value.to_string();
+    let doi_for_preprints = doi_value.to_string();
+    // `deadline` is `Copy`, so each `move` closure below captures its own
+    // copy rather than fighting over one shared value.
+    let remaining_json_timeout =
+        move || deadline.saturating_duration_since(Instant::now()).min(doi::JSON_TIMEOUT);
+
+    vec![
+        (
+            "PMC",
+            Box::new(move || match pmcid {
+                Some(id) => doi::pmc_pdf_url(&id, remaining_json_timeout())
+                    .map(|opt| Some(opt.into_iter().collect())),
+                None => Ok(None),
+            }) as Box<dyn FnOnce() -> Result<Option<Vec<String>>, String>>,
+        ),
+        ("Unpaywall", Box::new(move || unpaywall_urls.map(Some))),
+        (
+            "arXiv",
+            Box::new(move || Ok(doi::arxiv_pdf_url(&doi_for_arxiv).map(|u| vec![u]))),
+        ),
+        (
+            "bioRxiv",
+            Box::new(move || {
+                if !doi_for_biorxiv.starts_with("10.1101/") {
+                    return Ok(None);
+                }
+                let timeout = deadline.saturating_duration_since(Instant::now()).min(doi::JSON_TIMEOUT);
+                doi::biorxiv_pdf_url(&doi_for_biorxiv, timeout)
+                    .map(|opt| Some(opt.into_iter().collect()))
+            }),
+        ),
+        (
+            "OSF",
+            Box::new(move || Ok(doi::osf_pdf_url(&doi_for_osf).map(|u| vec![u]))),
+        ),
+        (
+            "preprints.org",
+            Box::new(move || {
+                Ok(doi::preprints_org_pdf_url(&doi_for_preprints).map(|u| vec![u]))
+            }),
+        ),
+    ]
+}
+
+// The actual work of `fetch`: reuse the entry's PDF if it already has one
+// (no network at all -- checked first, see FetchOutcome's doc comment on
+// `source: None`), otherwise DOI lookup, email resolution, then a candidate
+// list tried in order until one downloads. Unpaywall is queried eagerly
+// (it's where a PMC id comes from), but the *download* order is PMC, then
+// Unpaywall's own pdf_urls, then arXiv, bioRxiv (an API call, made only if
+// reached), OSF, and preprints.org -- see FetchOutcome's doc comment for
+// why PMC goes first. The whole candidate loop is bounded by
+// `FETCH_DEADLINE` (60s): the LIGO DOI alone lists 14 Unpaywall PDF URLs,
+// each capable of blocking for the old 120s download timeout. Pulled out of
+// cmd_fetch so the TUI can call it too without dying on failure -- every
+// error path here returns Err instead of calling die()/process::exit, which
+// cmd_fetch alone still does, at the same messages it always has.
 fn fetch_pdf_for_entry(
     conn: &rusqlite::Connection,
     cite_key: &str,
@@ -1105,7 +1328,31 @@ fn fetch_pdf_for_entry(
         ));
     };
 
+    // Checked before anything else, network included: if the entry already
+    // has its PDF landed, that's the whole answer. Re-running Unpaywall (or
+    // anything else) to re-derive a source name nobody asked for would just
+    // be a network round trip -- or several -- with `HTTPS_PROXY` down or
+    // Unpaywall unreachable turning a no-op into a failure.
+    if let Some((path, attachment_id)) = already_landed_pdf(conn, cite_key)? {
+        let abs_path = PathBuf::from(&path);
+        let extraction: Result<usize, String> = text::extract_text(&abs_path)
+            .and_then(|extracted| save_extracted(conn, attachment_id, &extracted));
+        return Ok(FetchOutcome::Downloaded {
+            doi: doi_value,
+            path,
+            already_present: true,
+            extraction,
+            source: None,
+        });
+    }
+
     let resolved_email = config::resolve_email(email)?;
+
+    // Started here, before Unpaywall's own (eager) call, not after it --
+    // Unpaywall can itself be slow, and the 60s budget in the docs/comments
+    // below is meant to cover the whole search, not just what comes after
+    // the first network call.
+    let deadline = Instant::now() + FETCH_DEADLINE;
 
     // Unpaywall runs right away -- everything else in the candidate list
     // either comes from its response (PMC's id) or is independent of it, so
@@ -1114,8 +1361,11 @@ fn fetch_pdf_for_entry(
     // resolver error below, same as any other source's.
     let mut is_oa = false;
     let mut pmcid: Option<String> = None;
-    let unpaywall_urls: Result<Vec<String>, String> =
-        match doi::fetch_oa_pdf_url(&doi_value, &resolved_email) {
+    let unpaywall_urls: Result<Vec<String>, String> = match doi::fetch_oa_pdf_url(
+        &doi_value,
+        &resolved_email,
+        deadline.saturating_duration_since(Instant::now()).min(doi::JSON_TIMEOUT),
+    ) {
             Ok(oa) => {
                 is_oa = oa.is_oa;
                 pmcid = oa.pmcid;
@@ -1124,87 +1374,17 @@ fn fetch_pdf_for_entry(
             Err(e) => Err(e),
         };
 
-    let doi_for_arxiv = doi_value.clone();
-    let doi_for_biorxiv = doi_value.clone();
-    let doi_for_osf = doi_value.clone();
-    let doi_for_preprints = doi_value.clone();
+    let sources = candidate_sources(&doi_value, pmcid, unpaywall_urls, deadline);
 
-    let sources: Vec<CandidateSource> = vec![
-        (
-            "PMC",
-            Box::new(move || match pmcid {
-                Some(id) => doi::pmc_pdf_url(&id).map(|opt| opt.into_iter().collect()),
-                None => Ok(Vec::new()),
-            }),
-        ),
-        ("Unpaywall", Box::new(move || unpaywall_urls)),
-        (
-            "arXiv",
-            Box::new(move || Ok(doi::arxiv_pdf_url(&doi_for_arxiv).into_iter().collect())),
-        ),
-        (
-            "bioRxiv",
-            Box::new(move || {
-                doi::biorxiv_pdf_url(&doi_for_biorxiv).map(|opt| opt.into_iter().collect())
-            }),
-        ),
-        (
-            "OSF",
-            Box::new(move || Ok(doi::osf_pdf_url(&doi_for_osf).into_iter().collect())),
-        ),
-        (
-            "preprints.org",
-            Box::new(move || {
-                Ok(doi::preprints_org_pdf_url(&doi_for_preprints)
-                    .into_iter()
-                    .collect())
-            }),
-        ),
-    ];
+    let outcome = try_candidates(sources, deadline, |url| {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout = remaining.min(doi::DEFAULT_PDF_TIMEOUT);
+        classify_download(doi::download_pdf(url, timeout), |bytes| {
+            land_pdf_bytes(conn, cite_key, bytes).map(|(path, id)| (path, id, false))
+        })
+    })?;
 
-    // Checked once, before any candidate is tried, since it doesn't depend
-    // on which URL wins: if the entry already has its PDF landed, reuse it
-    // without ever touching the network. `Option` here (rather than calling
-    // `already_landed_pdf` unconditionally up front) keeps the DB/filesystem
-    // check -- and its side effect of re-attaching/pruning -- from running
-    // at all when no candidate is ever actually tried (e.g. no DOI match
-    // anywhere).
-    let mut cached_existing: Option<Option<(String, i64)>> = None;
-
-    let (found, attempted, any_download_attempted, any_resolver_error) =
-        try_candidates(sources, |url| {
-            let existing = match &cached_existing {
-                Some(v) => v.clone(),
-                None => match already_landed_pdf(conn, cite_key) {
-                    Ok(v) => {
-                        cached_existing = Some(v.clone());
-                        v
-                    }
-                    Err(e) => return DownloadOutcome::Fatal(e),
-                },
-            };
-            if let Some((path, id)) = existing {
-                return DownloadOutcome::Landed((path, id, true));
-            }
-
-            // Only the actual download is retried against the next
-            // candidate on failure -- a blocked or missing PDF is exactly
-            // the "this source didn't have it" case. Landing the bytes
-            // (claiming a name, writing, attaching) is a filesystem/DB
-            // operation that happens once a download has actually
-            // succeeded; failing there is systemic, not a reason to try a
-            // different URL.
-            let bytes = match doi::download_pdf(url) {
-                Ok(b) => b,
-                Err(e) => return DownloadOutcome::Retry(format!("failed to download PDF: {e}")),
-            };
-            match land_pdf_bytes(conn, cite_key, &bytes) {
-                Ok((path, id)) => DownloadOutcome::Landed((path, id, false)),
-                Err(e) => DownloadOutcome::Fatal(e),
-            }
-        })?;
-
-    let Some(((path_str, attachment_id, already_present), source)) = found else {
+    let Some(((path_str, attachment_id, already_present), source)) = outcome.landed else {
         // Having no candidate anywhere, with every source giving a clean
         // "nothing here", is a normal, legitimate answer, not an error --
         // but a candidate that existed and failed every download, or a
@@ -1212,16 +1392,21 @@ fn fetch_pdf_for_entry(
         // than answering, is, so a network outage or a paper needing a
         // browser is obvious from the output instead of reading as "not
         // open access".
-        if any_download_attempted || any_resolver_error {
+        if outcome.any_download_attempted || outcome.any_resolver_error {
+            let advice = if outcome.any_bot_blocked {
+                "; download a blocked one in a browser and use `ferref attach` instead"
+            } else {
+                ""
+            };
             return Err(format!(
-                "no open-access PDF could be downloaded for '{cite_key}' (DOI {doi_value}): {}",
-                attempted.join("; ")
+                "no open-access PDF could be downloaded for '{cite_key}' (DOI {doi_value}): {}{advice}",
+                outcome.attempted.join("; ")
             ));
         }
         return Ok(FetchOutcome::NoPdfFound {
             doi: doi_value,
             is_oa,
-            attempted,
+            attempted: outcome.attempted,
         });
     };
 
@@ -1237,8 +1422,35 @@ fn fetch_pdf_for_entry(
         path: path_str,
         already_present,
         extraction,
-        source,
+        source: Some(source),
     })
+}
+
+// A short, one-line summary of a fetch failure for the TUI's status line,
+// where `fetch_pdf_for_entry`'s full per-candidate detail (useful on the
+// CLI, which `cmd_fetch` shows as-is) doesn't fit one footer line. Parses
+// the error's own shape -- `fetch_pdf_for_entry` is the only thing that
+// produces it -- rather than threading a second, richer error type through
+// every early return in that function (a missing DOI, a DB error, ...) for
+// the one caller that wants less detail, not more.
+fn summarize_fetch_error(cite_key: &str, e: &str) -> String {
+    let Some((_, rest)) = e.split_once("): ") else {
+        // Not the "candidates existed" shape -- a DB error, a missing DOI,
+        // an unresolved email -- those are already one line, show as-is.
+        return e.to_string();
+    };
+    let blocked_advice =
+        "; download a blocked one in a browser and use `ferref attach` instead";
+    let rest = rest.strip_suffix(blocked_advice).unwrap_or(rest);
+    let attempts = rest.split("; ").filter(|s| !s.is_empty()).count();
+    let blocked = rest.matches("blocked by a bot check").count();
+    if blocked == 0 {
+        format!("no PDF could be downloaded ({attempts} copies tried) -- see `ferref fetch {cite_key}`")
+    } else {
+        format!(
+            "no PDF could be downloaded ({attempts} copies tried, {blocked} blocked by bot checks) -- see `ferref fetch {cite_key}`"
+        )
+    }
 }
 
 fn cmd_fetch(conn: &rusqlite::Connection, cite_key: String, email: Option<String>, json: bool) {
@@ -1299,9 +1511,12 @@ fn cmd_fetch(conn: &rusqlite::Connection, cite_key: String, email: Option<String
                 }
                 emit_json(&out);
             } else {
-                emit(&format!(
-                    "Downloaded open-access PDF for '{cite_key}' from {source} to '{path}'"
-                ));
+                match source {
+                    Some(source) => emit(&format!(
+                        "Downloaded open-access PDF for '{cite_key}' from {source} to '{path}'"
+                    )),
+                    None => emit(&format!("'{cite_key}' already has its PDF at '{path}'")),
+                }
                 match &extraction {
                     Ok(chars) => emit(&format!("Extracted {chars} characters from '{path}'")),
                     Err(e) => emit(&format!("Warning: extraction failed for '{path}': {e}")),
@@ -1577,8 +1792,21 @@ fn derive_cite_key(conn: &rusqlite::Connection, entry: &Entry) -> Result<String,
     ))
 }
 
+// Strips C0/C1 control characters (keeping `\n` and `\t`) from text that may
+// carry untrusted bytes -- a .bib import, Crossref JSON, or a landing page's
+// `unescape_html`'d meta tags can all smuggle a raw ESC or other escape
+// sequence into a title/author/abstract, which a plain-text terminal would
+// then execute (e.g. `\x1b]52;c;...\x07` sets the clipboard). `--json` output
+// doesn't need this -- serde already escapes control characters -- so this is
+// only applied at the plain-text choke points, `emit`/`die`.
+fn sanitize_control_chars(s: &str) -> String {
+    s.chars()
+        .filter(|&c| c == '\n' || c == '\t' || !(c.is_control()))
+        .collect()
+}
+
 fn die(msg: &str) -> ! {
-    eprintln!("Error: {msg}");
+    eprintln!("Error: {}", sanitize_control_chars(msg));
     std::process::exit(1);
 }
 
@@ -1588,12 +1816,25 @@ fn die(msg: &str) -> ! {
 fn emit(s: &str) {
     use std::io::{ErrorKind, Write};
 
-    if let Err(e) = writeln!(std::io::stdout(), "{s}") {
+    if let Err(e) = writeln!(std::io::stdout(), "{}", sanitize_control_chars(s)) {
         if e.kind() == ErrorKind::BrokenPipe {
             std::process::exit(0);
         }
         die(&format!("failed writing to stdout: {e}"));
     }
+}
+
+#[test]
+fn test_sanitize_control_chars() {
+    // ESC (clipboard-setting OSC 52 sequence), a C1 control (U+009B, CSI),
+    // and \r are all stripped; \n and \t survive.
+    let raw = "Title\x1b]52;c;AAAA\x07\u{9b}2J\r\nLine two\tindented";
+    assert_eq!(
+        sanitize_control_chars(raw),
+        "Title]52;c;AAAA2J\nLine two\tindented"
+    );
+    // Ordinary text is untouched.
+    assert_eq!(sanitize_control_chars("plain text"), "plain text");
 }
 
 // All JSON output goes through here, streamed straight to stdout rather than
@@ -1825,7 +2066,8 @@ fn land_downloaded_pdf(
     if let Some((path, attachment_id)) = already_landed_pdf(conn, cite_key)? {
         return Ok((path, attachment_id, true));
     }
-    let bytes = doi::download_pdf(pdf_url).map_err(|e| format!("failed to download PDF: {e}"))?;
+    let bytes = doi::download_pdf(pdf_url, doi::DEFAULT_PDF_TIMEOUT)
+        .map_err(|e| format!("failed to download PDF: {e}"))?;
     let (path, attachment_id) = land_pdf_bytes(conn, cite_key, &bytes)?;
     Ok((path, attachment_id, false))
 }
@@ -2709,75 +2951,83 @@ mod tests {
 
     // try_candidates drives fetch_pdf_for_entry's candidate loop; these
     // exercise ordering, moving on after a failed download, stopping at the
-    // first success, the all-failed/resolver-error cases, and the
-    // fatal-abort distinction, all with a fake `download` that never
-    // touches the network.
+    // first success, the all-failed/resolver-error/not-applicable cases,
+    // the fatal-abort distinction, and the deadline, all with a fake
+    // `download` that never touches the network, and deadlines built from
+    // `Instant::now()` with no real sleep involved.
     fn src(name: &'static str, urls: &[&str]) -> CandidateSource {
         let urls: Vec<String> = urls.iter().map(|s| s.to_string()).collect();
-        (name, Box::new(move || Ok(urls)))
+        (name, Box::new(move || Ok(Some(urls))))
+    }
+
+    // A source that plainly doesn't apply (PMC with no pmcid, a pattern
+    // source whose DOI didn't match) -- never actually consulted.
+    fn not_applicable_src(name: &'static str) -> CandidateSource {
+        (name, Box::new(move || Ok(None)))
     }
 
     fn failing_src(name: &'static str, error: &'static str) -> CandidateSource {
         (name, Box::new(move || Err(error.to_string())))
     }
 
+    fn far_future() -> Instant {
+        Instant::now() + Duration::from_secs(1000)
+    }
+
     #[test]
     fn try_candidates_stops_at_the_first_success() {
         let sources = vec![src("A", &["a1"]), src("B", &["b1"])];
         let mut calls: Vec<String> = Vec::new();
-        let (found, attempted, any_download, any_resolver_error) =
-            try_candidates(sources, |url| {
-                calls.push(url.to_string());
-                if url == "a1" {
-                    DownloadOutcome::Landed(42)
-                } else {
-                    panic!("B should never be tried once A succeeds")
-                }
-            })
-            .unwrap();
+        let outcome = try_candidates(sources, far_future(), |url| {
+            calls.push(url.to_string());
+            if url == "a1" {
+                DownloadOutcome::Landed(42)
+            } else {
+                panic!("B should never be tried once A succeeds")
+            }
+        })
+        .unwrap();
         assert_eq!(calls, vec!["a1".to_string()]);
-        assert_eq!(found, Some((42, "A")));
-        assert!(attempted.is_empty());
-        assert!(any_download);
-        assert!(!any_resolver_error);
+        assert_eq!(outcome.landed, Some((42, "A")));
+        assert!(outcome.attempted.is_empty());
+        assert!(outcome.any_download_attempted);
+        assert!(!outcome.any_resolver_error);
     }
 
     #[test]
     fn try_candidates_moves_on_after_a_failed_download() {
         let sources = vec![src("A", &["a1"]), src("B", &["b1"])];
-        let (found, attempted, any_download, any_resolver_error) =
-            try_candidates(sources, |url: &str| -> DownloadOutcome<i32> {
-                if url == "a1" {
-                    DownloadOutcome::Retry("boom".to_string())
-                } else {
-                    DownloadOutcome::Landed(7)
-                }
-            })
-            .unwrap();
-        assert_eq!(found, Some((7, "B")));
-        assert_eq!(attempted.len(), 1);
-        assert!(attempted[0].contains('A'));
-        assert!(attempted[0].contains("boom"));
-        assert!(any_download);
-        assert!(!any_resolver_error);
+        let outcome = try_candidates(sources, far_future(), |url: &str| -> DownloadOutcome<i32> {
+            if url == "a1" {
+                DownloadOutcome::Retry("boom".to_string())
+            } else {
+                DownloadOutcome::Landed(7)
+            }
+        })
+        .unwrap();
+        assert_eq!(outcome.landed, Some((7, "B")));
+        assert_eq!(outcome.attempted.len(), 1);
+        assert!(outcome.attempted[0].contains('A'));
+        assert!(outcome.attempted[0].contains("boom"));
+        assert!(outcome.any_download_attempted);
+        assert!(!outcome.any_resolver_error);
     }
 
     #[test]
     fn try_candidates_tries_every_url_of_a_source_before_moving_on() {
         let sources = vec![src("A", &["a1", "a2"]), src("B", &["b1"])];
         let mut calls: Vec<String> = Vec::new();
-        let (found, _attempted, _any_download, _any_resolver_error) =
-            try_candidates(sources, |url| {
-                calls.push(url.to_string());
-                if url == "a2" {
-                    DownloadOutcome::Landed(1)
-                } else {
-                    DownloadOutcome::Retry("no".to_string())
-                }
-            })
-            .unwrap();
+        let outcome = try_candidates(sources, far_future(), |url| {
+            calls.push(url.to_string());
+            if url == "a2" {
+                DownloadOutcome::Landed(1)
+            } else {
+                DownloadOutcome::Retry("no".to_string())
+            }
+        })
+        .unwrap();
         assert_eq!(calls, vec!["a1".to_string(), "a2".to_string()]);
-        assert_eq!(found.map(|(_, s)| s), Some("A"));
+        assert_eq!(outcome.landed.map(|(_, s)| s), Some("A"));
     }
 
     #[test]
@@ -2785,27 +3035,41 @@ mod tests {
         // Every source empty: nothing was ever attempted, no resolver
         // errored -- a clean "no PDF anywhere".
         let empty_sources = vec![src("A", &[]), src("B", &[])];
-        let (found, attempted, any_download, any_resolver_error) =
-            try_candidates(empty_sources, |_: &str| -> DownloadOutcome<i32> {
-                DownloadOutcome::Landed(0)
-            })
-            .unwrap();
-        assert!(found.is_none());
-        assert_eq!(attempted, vec!["A".to_string(), "B".to_string()]);
-        assert!(!any_download);
-        assert!(!any_resolver_error);
+        let outcome = try_candidates(empty_sources, far_future(), |_: &str| -> DownloadOutcome<i32> {
+            DownloadOutcome::Landed(0)
+        })
+        .unwrap();
+        assert!(outcome.landed.is_none());
+        assert_eq!(outcome.attempted, vec!["A".to_string(), "B".to_string()]);
+        assert!(!outcome.any_download_attempted);
+        assert!(!outcome.any_resolver_error);
 
         // Candidates existed, but every download failed.
         let real_sources = vec![src("A", &["a1"]), src("B", &["b1"])];
-        let (found, attempted, any_download, any_resolver_error) =
-            try_candidates(real_sources, |_: &str| -> DownloadOutcome<i32> {
-                DownloadOutcome::Retry("nope".to_string())
-            })
-            .unwrap();
-        assert!(found.is_none());
-        assert_eq!(attempted.len(), 2);
-        assert!(any_download);
-        assert!(!any_resolver_error);
+        let outcome = try_candidates(real_sources, far_future(), |_: &str| -> DownloadOutcome<i32> {
+            DownloadOutcome::Retry("nope".to_string())
+        })
+        .unwrap();
+        assert!(outcome.landed.is_none());
+        assert_eq!(outcome.attempted.len(), 2);
+        assert!(outcome.any_download_attempted);
+        assert!(!outcome.any_resolver_error);
+    }
+
+    // L4: a source that plainly doesn't apply (PMC with no pmcid, here
+    // stood in for by `not_applicable_src`) was never actually consulted,
+    // so it must not appear in `attempted` at all -- unlike a source that
+    // was consulted and genuinely had nothing (`src("B", &[])`), which
+    // still does.
+    #[test]
+    fn try_candidates_omits_sources_that_were_never_applicable() {
+        let sources = vec![not_applicable_src("PMC"), src("B", &[])];
+        let outcome = try_candidates(sources, far_future(), |_: &str| -> DownloadOutcome<i32> {
+            panic!("no URL was ever produced, download must not be called")
+        })
+        .unwrap();
+        assert!(outcome.landed.is_none());
+        assert_eq!(outcome.attempted, vec!["B".to_string()]);
     }
 
     // A resolver erroring (the PMC listing, the bioRxiv API, Unpaywall
@@ -2816,27 +3080,25 @@ mod tests {
     #[test]
     fn try_candidates_a_resolver_error_is_distinguishable_from_a_clean_empty_source() {
         let sources = vec![failing_src("A", "network unreachable"), src("B", &[])];
-        let (found, attempted, any_download, any_resolver_error) =
-            try_candidates(sources, |_: &str| -> DownloadOutcome<i32> {
-                panic!("no URL was ever produced, download must not be called")
-            })
-            .unwrap();
-        assert!(found.is_none());
-        assert!(!any_download);
-        assert!(any_resolver_error);
-        assert_eq!(attempted.len(), 2);
-        assert!(attempted[0].contains('A'));
-        assert!(attempted[0].contains("network unreachable"));
+        let outcome = try_candidates(sources, far_future(), |_: &str| -> DownloadOutcome<i32> {
+            panic!("no URL was ever produced, download must not be called")
+        })
+        .unwrap();
+        assert!(outcome.landed.is_none());
+        assert!(!outcome.any_download_attempted);
+        assert!(outcome.any_resolver_error);
+        assert_eq!(outcome.attempted.len(), 2);
+        assert!(outcome.attempted[0].contains('A'));
+        assert!(outcome.attempted[0].contains("network unreachable"));
 
         // A later source succeeding still wins, despite the earlier error.
         let sources = vec![failing_src("A", "boom"), src("B", &["b1"])];
-        let (found, _attempted, _any_download, any_resolver_error) =
-            try_candidates(sources, |_: &str| -> DownloadOutcome<i32> {
-                DownloadOutcome::Landed(9)
-            })
-            .unwrap();
-        assert_eq!(found, Some((9, "B")));
-        assert!(any_resolver_error);
+        let outcome = try_candidates(sources, far_future(), |_: &str| -> DownloadOutcome<i32> {
+            DownloadOutcome::Landed(9)
+        })
+        .unwrap();
+        assert_eq!(outcome.landed, Some((9, "B")));
+        assert!(outcome.any_resolver_error);
     }
 
     // A Fatal outcome (a systemic failure landing the bytes, not a
@@ -2847,14 +3109,101 @@ mod tests {
     fn try_candidates_a_fatal_outcome_aborts_immediately() {
         let sources = vec![src("A", &["a1"]), src("B", &["b1"])];
         let mut calls: Vec<String> = Vec::new();
-        let result = try_candidates(sources, |url| {
+        let result = try_candidates(sources, far_future(), |url| {
             calls.push(url.to_string());
             DownloadOutcome::Fatal::<i32>("disk full".to_string())
         });
-        assert_eq!(result, Err("disk full".to_string()));
+        assert!(matches!(result, Err(e) if e == "disk full"));
         // B never gets tried: a fatal error is not "move on to the next
         // candidate".
         assert_eq!(calls, vec!["a1".to_string()]);
+    }
+
+    // T3: an already-passed deadline stops the loop before trying anything
+    // else -- neither a later source's resolver nor a later URL within the
+    // same source gets a chance, and the stop itself is recorded so it's
+    // visible in the output, not silently indistinguishable from "no PDF
+    // anywhere".
+    #[test]
+    fn try_candidates_stops_at_an_already_passed_deadline() {
+        let past = Instant::now() - Duration::from_secs(1);
+        let sources = vec![src("A", &["a1"]), src("B", &["b1"])];
+        let outcome = try_candidates(sources, past, |_: &str| -> DownloadOutcome<i32> {
+            panic!("the deadline already passed; nothing should be tried")
+        })
+        .unwrap();
+        assert!(outcome.landed.is_none());
+        assert_eq!(outcome.attempted, vec!["stopped: 60s time limit reached".to_string()]);
+    }
+
+    // The deadline is also checked between URLs within one source, not
+    // just between sources.
+    #[test]
+    fn try_candidates_stops_mid_source_once_the_deadline_passes() {
+        let sources = vec![src("A", &["a1", "a2"])];
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let outcome = try_candidates(sources, deadline, |_: &str| -> DownloadOutcome<i32> {
+            std::thread::sleep(Duration::from_millis(40));
+            DownloadOutcome::Retry("slow".to_string())
+        })
+        .unwrap();
+        assert!(outcome.landed.is_none());
+        // a1 was tried (and failed slowly); a2 never was, because by then
+        // the deadline had passed.
+        assert_eq!(outcome.attempted.len(), 2);
+        assert!(outcome.attempted[1].contains("time limit"));
+    }
+
+    #[test]
+    fn classify_download_distinguishes_retry_from_fatal() {
+        let retry = classify_download::<i32>(Err("network".to_string()), |_| {
+            panic!("land must not run on a failed download")
+        });
+        assert!(matches!(retry, DownloadOutcome::Retry(e) if e == "network"));
+
+        let fatal = classify_download(Ok(vec![1, 2, 3]), |_: &[u8]| -> Result<i32, String> {
+            Err("disk full".to_string())
+        });
+        assert!(matches!(fatal, DownloadOutcome::Fatal(e) if e == "disk full"));
+
+        let landed = classify_download(Ok(vec![1, 2, 3]), |bytes: &[u8]| -> Result<usize, String> {
+            Ok(bytes.len())
+        });
+        assert!(matches!(landed, DownloadOutcome::Landed(3)));
+    }
+
+    // candidate_sources' whole job is the order -- PMC, Unpaywall, arXiv,
+    // bioRxiv, OSF, preprints.org -- so a #[test] pins it down directly
+    // rather than relying on reading the source. A DOI that matches none of
+    // the pattern sources and carries no pmcid means every resolver here
+    // runs with no network call at all (arXiv/OSF/preprints.org are pure
+    // pattern matches; bioRxiv's own prefix check short-circuits before any
+    // request; PMC and Unpaywall are Ok(None)/pre-resolved).
+    #[test]
+    fn candidate_sources_are_in_the_documented_order() {
+        let sources = candidate_sources(
+            "10.1234/not-a-pattern-match",
+            None,
+            Ok(vec![]),
+            Instant::now() + Duration::from_secs(60),
+        );
+        let names: Vec<&str> = sources.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            vec!["PMC", "Unpaywall", "arXiv", "bioRxiv", "OSF", "preprints.org"]
+        );
+        // Every resolver here is safe to actually run without a network
+        // call, given the inputs above. Unpaywall is always "consulted"
+        // (its result is pre-resolved by the caller, empty here); every
+        // other source correctly sees itself as not applicable.
+        for (name, resolve) in sources {
+            let result = resolve().unwrap();
+            if name == "Unpaywall" {
+                assert_eq!(result, Some(vec![]));
+            } else {
+                assert_eq!(result, None, "{name} should not apply");
+            }
+        }
     }
 
     #[test]
@@ -2862,5 +3211,39 @@ mod tests {
         assert_eq!(url_host("https://journals.aps.org/pdf/x?y=1"), "journals.aps.org");
         assert_eq!(url_host("http://example.org/a/b#frag"), "example.org");
         assert_eq!(url_host("not-a-url"), "not-a-url");
+    }
+
+    // L1: a bot-check 403 collapses to one short phrase with no repeated
+    // wording and no advice (shown once, at the very end, by the caller);
+    // everything else just loses the redundant "PDF download " prefix.
+    #[test]
+    fn short_download_reason_strips_advice_and_the_redundant_prefix() {
+        let (reason, blocked) = short_download_reason(
+            "journals.aps.org blocks automated downloads with a bot check (HTTP 403); \
+             download it in a browser and use `ferref attach` instead",
+        );
+        assert_eq!(reason, "blocked by a bot check (HTTP 403)");
+        assert!(blocked);
+
+        let (reason, blocked) = short_download_reason("PDF download not found (404)");
+        assert_eq!(reason, "not found (404)");
+        assert!(!blocked);
+    }
+
+    #[test]
+    fn summarize_fetch_error_counts_attempts_and_bot_blocks() {
+        let e = "no open-access PDF could be downloaded for 'k' (DOI 10.1/x): \
+                  PMC (host1): not found (404); \
+                  Unpaywall (host2): blocked by a bot check (HTTP 403); \
+                  download a blocked one in a browser and use `ferref attach` instead";
+        let summary = summarize_fetch_error("k", e);
+        assert!(summary.contains("2 copies tried"));
+        assert!(summary.contains("1 blocked by bot checks"));
+        assert!(summary.contains("ferref fetch k"));
+
+        // A plain, non-candidate error (missing DOI, a DB error, ...) is
+        // shown as-is.
+        let plain = "'k' has no DOI on record; set one with `ferref edit k --doi <doi>`";
+        assert_eq!(summarize_fetch_error("k", plain), plain);
     }
 }

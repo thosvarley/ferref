@@ -121,11 +121,22 @@ fn handle_key(
         }
         Mode::EntryPicker {
             keep_id,
-            within,
+            candidates,
+            within_marked,
             filter,
             rows,
             selected,
-        } => handle_entry_picker_key(app, code, keep_id, within, filter, rows, selected),
+        } => handle_entry_picker_key(
+            app,
+            conn,
+            code,
+            keep_id,
+            candidates,
+            within_marked,
+            filter,
+            rows,
+            selected,
+        ),
         Mode::Confirm { action, .. } => handle_confirm_key(app, conn, code, action),
         // any key closes it; app.mode is already Normal from the replace above
         Mode::Help => {}
@@ -516,7 +527,7 @@ fn handle_command_key(
             };
         }
         KeyCode::Char('f') => app.fetch_selected(conn, terminal, entry_id),
-        KeyCode::Char('m') => app.begin_merge(entry_id),
+        KeyCode::Char('m') => app.begin_merge(conn, entry_id),
         KeyCode::Char('d') => app.begin_delete(entry_id),
         KeyCode::Char('t') => {
             let ids = app.bulk_targets(entry_id);
@@ -568,11 +579,14 @@ fn handle_field_picker_key(app: &mut App, code: KeyCode, entry_id: i64, mut sele
 // Merge's fold-in-entry picker: types narrow `filter`, Up/Down move the
 // selection (not j/k -- both are ordinary letters someone might filter by,
 // and this picker has a live text box the collection picker doesn't).
+#[allow(clippy::too_many_arguments)] // one per Mode::EntryPicker field, plus conn
 fn handle_entry_picker_key(
     app: &mut App,
+    conn: &Connection,
     code: KeyCode,
     keep_id: i64,
-    within: Option<Vec<i64>>,
+    candidates: Vec<Entry>,
+    within_marked: bool,
     mut filter: String,
     mut rows: Vec<usize>,
     mut selected: usize,
@@ -590,17 +604,17 @@ fn handle_entry_picker_key(
         }
         KeyCode::Backspace => {
             filter.pop();
-            rows = app.entry_picker_rows(keep_id, &filter, within.as_deref());
+            rows = entry_picker_rows(&candidates, keep_id, &filter);
             selected = 0;
         }
         KeyCode::Char(c) => {
             filter.push(c);
-            rows = app.entry_picker_rows(keep_id, &filter, within.as_deref());
+            rows = entry_picker_rows(&candidates, keep_id, &filter);
             selected = 0;
         }
         KeyCode::Enter => {
-            if let Some(drop_id) = rows.get(selected).and_then(|&i| app.entries[i].id) {
-                app.confirm_merge(keep_id, drop_id);
+            if let Some(drop_id) = rows.get(selected).and_then(|&i| candidates[i].id) {
+                app.confirm_merge(conn, keep_id, drop_id);
                 return;
             }
         }
@@ -609,7 +623,8 @@ fn handle_entry_picker_key(
 
     app.mode = Mode::EntryPicker {
         keep_id,
-        within,
+        candidates,
+        within_marked,
         filter,
         rows,
         selected,
@@ -834,13 +849,18 @@ enum Mode {
         selected: usize,
     },
     // Merge's fold-in-entry picker, opened by ":" -> "m". `keep_id` is fixed
-    // for the picker's lifetime; `rows` are indices into `App::entries`
-    // matching `filter`. `within`, when set (3+ marked -- see MergePlan),
-    // restricts candidates to that marked subset instead of the whole
-    // library.
+    // for the picker's lifetime; `candidates` is resolved once, at open time
+    // (App::begin_merge), from either `App::entries` or the DB -- owned here
+    // rather than indices into `App::entries`, so a marked entry from
+    // another collection never has to be (and, per T1, never is) appended
+    // there just to make it visible to the picker. `rows` are indices into
+    // `candidates` matching `filter`. `within_marked` is display-only (3+
+    // marked -- see MergePlan): whether candidates were narrowed to the
+    // marked subset instead of the whole library, for the popup's title.
     EntryPicker {
         keep_id: i64,
-        within: Option<Vec<i64>>,
+        candidates: Vec<Entry>,
+        within_marked: bool,
         filter: String,
         rows: Vec<usize>,
         selected: usize,
@@ -1501,6 +1521,21 @@ impl App {
             self.entries[idx] = fresh;
         }
         self.rebuild_view();
+        // T2: rebuild_view's clamp_selection only keeps table_selected in
+        // bounds -- it has no notion of "follow the entry that was just
+        // edited", so a sort key that reorders the list (title change under
+        // a title sort) or a filter that drops the entry out (an untag
+        // under an active `/` tag filter) left the highlight and Details
+        // pane on whatever row index the edited entry used to occupy,
+        // showing a different entry. Find its new row by id and select it;
+        // if it's no longer in the view at all, the clamp above already
+        // picked a valid row, but that row is a different entry, so the
+        // stale scroll position from the old entry's Details pane no longer
+        // means anything.
+        match self.view.iter().position(|&i| self.entries[i].id == Some(entry_id)) {
+            Some(row) => self.table_selected = row,
+            None => self.details_scroll = 0,
+        }
         Ok(())
     }
 
@@ -1658,54 +1693,68 @@ impl App {
                 source,
                 ..
             }) => {
+                let landed = match source {
+                    Some(source) => format!("Downloaded '{path}' from {source}"),
+                    None => format!("'{cite_key}' already has its PDF at '{path}'"),
+                };
                 self.status = Some(match extraction {
-                    Ok(chars) => format!("Downloaded '{path}' from {source} ({chars} chars extracted)"),
-                    Err(e) => format!("Downloaded '{path}' from {source}, but extraction failed: {e}"),
+                    Ok(chars) => format!("{landed} ({chars} chars extracted)"),
+                    Err(e) => format!("{landed}, but extraction failed: {e}"),
                 });
                 if let Err(e) = self.refresh_entry(conn, entry_id) {
                     self.status = Some(e);
                 }
             }
-            Err(e) => self.status = Some(e),
+            Err(e) => self.status = Some(crate::summarize_fetch_error(&cite_key, &e)),
         }
     }
 
-    // Builds the rows for the merge entry-picker: every entry except
-    // `keep_id` itself, narrowed by `matches_filter` (the same
-    // case-insensitive substring match "/" search uses).
-    // `within`, when given, restricts candidates to that id set (e.g. a
-    // marked subset) instead of the whole library -- see MergePlan.
-    fn entry_picker_rows(&self, keep_id: i64, filter: &str, within: Option<&[i64]>) -> Vec<usize> {
-        let needle = filter.to_lowercase();
-        (0..self.entries.len())
-            .filter(|&i| {
-                let id = self.entries[i].id;
-                id != Some(keep_id)
-                    && within.is_none_or(|ids| id.is_some_and(|id| ids.contains(&id)))
-                    && matches_filter(&self.entries[i], &needle)
-            })
-            .collect()
+    // T1: `marked` persists across a collection switch (same as export/tag,
+    // B7), but `entries` only holds the currently loaded collection -- a
+    // merge started from marks spanning two collections used to show a
+    // blank title in the confirm prompt and, at 3+ marks, an empty picker.
+    // Resolves one id to a full Entry, `entries` first, `db::get_entry_by_id`
+    // as a fallback -- never writing the result back into `self.entries`, so
+    // a cancelled merge (Esc out of the picker, 'n' at the confirm prompt)
+    // can't leave a foreign-collection entry sitting there for the next
+    // `rebuild_view` to show in the wrong collection's list.
+    fn resolve_merge_entry(&self, conn: &Connection, id: i64) -> Option<Entry> {
+        self.entry_by_id(id)
+            .cloned()
+            .or_else(|| db::get_entry_by_id(conn, id).ok().flatten())
     }
 
     // ":" -> "m": see MergePlan / plan_merge for the branching rule itself.
-    fn begin_merge(&mut self, entry_id: i64) {
+    fn begin_merge(&mut self, conn: &Connection, entry_id: i64) {
         match plan_merge(&self.marked, Some(entry_id)) {
             Some(MergePlan::PickDrop(keep_id)) => {
+                let candidates = self.entries.clone();
+                let rows = entry_picker_rows(&candidates, keep_id, "");
                 self.mode = Mode::EntryPicker {
                     keep_id,
-                    within: None,
+                    candidates,
+                    within_marked: false,
                     filter: String::new(),
-                    rows: self.entry_picker_rows(keep_id, "", None),
+                    rows,
                     selected: 0,
                 };
             }
-            Some(MergePlan::Pair(keep_id, drop_id)) => self.confirm_merge(keep_id, drop_id),
-            Some(MergePlan::PickDropWithin(keep_id, candidates)) => {
+            Some(MergePlan::Pair(keep_id, drop_id)) => self.confirm_merge(conn, keep_id, drop_id),
+            Some(MergePlan::PickDropWithin(keep_id, marked_ids)) => {
+                // Candidates are resolved once, here, into owned Entry
+                // values the picker carries itself -- never appended to
+                // `self.entries` (see resolve_merge_entry).
+                let candidates: Vec<Entry> = marked_ids
+                    .iter()
+                    .filter_map(|&id| self.resolve_merge_entry(conn, id))
+                    .collect();
+                let rows = entry_picker_rows(&candidates, keep_id, "");
                 self.mode = Mode::EntryPicker {
                     keep_id,
-                    rows: self.entry_picker_rows(keep_id, "", Some(&candidates)),
-                    within: Some(candidates),
+                    candidates,
+                    within_marked: true,
                     filter: String::new(),
+                    rows,
                     selected: 0,
                 };
             }
@@ -1713,12 +1762,14 @@ impl App {
         }
     }
 
-    fn confirm_merge(&mut self, keep_id: i64, drop_id: i64) {
+    fn confirm_merge(&mut self, conn: &Connection, keep_id: i64, drop_id: i64) {
         // Titles truncated (not the cite_key, which is short by convention)
         // so a long title plus the trailing "y/n" can't wrap the confirm
-        // box past one line and push the actual prompt off screen.
+        // box past one line and push the actual prompt off screen. Resolved
+        // once, here, into the message string itself -- nothing is kept
+        // around afterward for a cancelled confirm to leak.
         let title_of = |id: i64| {
-            self.entry_by_id(id)
+            self.resolve_merge_entry(conn, id)
                 .map(|e| truncate_display(&e.title, 20))
                 .unwrap_or_default()
         };
@@ -2053,6 +2104,18 @@ fn copy_via_osc52(text: &str) -> Result<(), String> {
         .map_err(|e| format!("failed to write the OSC 52 escape sequence: {e}"))
 }
 
+// Builds the rows for the merge entry-picker: every candidate except
+// `keep_id` itself, narrowed by `matches_filter` (the same case-insensitive
+// substring match "/" search uses). A free function over an explicit
+// `candidates` slice, not an `App` method, since T1's fix is exactly that
+// the picker's candidates are its own owned list, never `App::entries`.
+fn entry_picker_rows(candidates: &[Entry], keep_id: i64, filter: &str) -> Vec<usize> {
+    let needle = filter.to_lowercase();
+    (0..candidates.len())
+        .filter(|&i| candidates[i].id != Some(keep_id) && matches_filter(&candidates[i], &needle))
+        .collect()
+}
+
 // Case-insensitive substring match across every field a user would plausibly
 // search by. An empty needle matches everything, so clearing the search box
 // (or never opening it) is the same code path as "no filter".
@@ -2217,12 +2280,13 @@ fn draw(frame: &mut Frame, app: &App) {
             draw_field_picker(frame, area, app, *entry_id, *selected)
         }
         Mode::EntryPicker {
+            candidates,
             filter,
             rows,
             selected,
-            within,
+            within_marked,
             ..
-        } => draw_entry_picker(frame, area, app, filter, rows, *selected, within.is_some()),
+        } => draw_entry_picker(frame, area, candidates, filter, rows, *selected, *within_marked),
         Mode::Confirm { message, .. } => draw_confirm(frame, area, message),
         Mode::Help => draw_help(frame, area),
         Mode::FileBrowser {
@@ -2678,7 +2742,7 @@ fn draw_help(frame: &mut Frame, frame_area: Rect) {
                 ("Tab / BackTab", "switch pane"),
                 ("j/k, \u{2191}\u{2193}", "move"),
                 ("g / G", "top / bottom"),
-                ("Ctrl-d / Ctrl-u", "half page"),
+                ("Ctrl-d / Ctrl-u", "10 rows"),
                 ("h / l", "fold/unfold (tree) \u{b7} switch pane"),
             ],
         ),
@@ -2827,7 +2891,7 @@ fn draw_field_picker(
 fn draw_entry_picker(
     frame: &mut Frame,
     frame_area: Rect,
-    app: &App,
+    candidates: &[Entry],
     filter: &str,
     rows: &[usize],
     selected: usize,
@@ -2853,7 +2917,7 @@ fn draw_entry_picker(
     let items: Vec<ListItem> = rows
         .iter()
         .map(|&i| {
-            let e = &app.entries[i];
+            let e = &candidates[i];
             let label = format!("{} ({})", e.title, e.cite_key);
             ListItem::new(truncate_display(&label, text_width))
         })
@@ -3378,5 +3442,206 @@ mod tests {
             plan_merge(&[1, 2, 3], Some(9)),
             Some(MergePlan::PickDropWithin(1, vec![2, 3]))
         );
+    }
+
+    // T1: mark an entry, switch collection (so `entries` no longer holds
+    // it), mark another, then merge. Both the 2-marked confirm prompt (blank
+    // title) and the 3+-marked picker (0 rows) used to drop marked entries
+    // that weren't in the currently loaded collection.
+    #[test]
+    fn begin_merge_loads_marked_entries_outside_the_current_view() {
+        let dir = std::env::temp_dir().join("ferref-begin-merge-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = db::init_db(&dir.join("ferref.db")).unwrap();
+
+        let mut visible = mk_entry("Visible Paper", "Smith", Some(2020), "");
+        visible.cite_key = "visible".to_string();
+        let visible_id = db::insert_entry(&conn, &visible).unwrap();
+
+        let mut elsewhere_a = mk_entry("Elsewhere A", "Jones", Some(2021), "");
+        elsewhere_a.cite_key = "elsewherea".to_string();
+        let elsewhere_a_id = db::insert_entry(&conn, &elsewhere_a).unwrap();
+
+        let mut elsewhere_b = mk_entry("Elsewhere B", "Lee", Some(2022), "");
+        elsewhere_b.cite_key = "elsewhereb".to_string();
+        let elsewhere_b_id = db::insert_entry(&conn, &elsewhere_b).unwrap();
+
+        // Only "Visible Paper" is loaded -- as if the other two were marked
+        // in a different collection before switching to this one.
+        let mut app = mk_app(vec![visible.clone()]);
+        app.entries[0].id = Some(visible_id);
+
+        // 2 marked (one loaded, one not): confirm prompt must show the real
+        // title, not blank.
+        app.marked = vec![elsewhere_a_id, visible_id];
+        app.begin_merge(&conn, visible_id);
+        match &app.mode {
+            Mode::Confirm { message, .. } => {
+                assert!(
+                    message.contains("Elsewhere A") && message.contains("Visible Paper"),
+                    "message was: {message}"
+                );
+            }
+            _ => panic!("expected Confirm mode"),
+        }
+
+        // 3+ marked, all outside the loaded set but one: the picker must
+        // list the other marked entries, not come back empty.
+        app.marked = vec![visible_id, elsewhere_a_id, elsewhere_b_id];
+        app.begin_merge(&conn, visible_id);
+        match &app.mode {
+            Mode::EntryPicker { rows, .. } => {
+                assert_eq!(rows.len(), 2, "both other marked entries should be candidates");
+            }
+            _ => panic!("expected EntryPicker mode"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // T1 (review follow-up): a cancelled merge must not leave a
+    // foreign-collection entry sitting in `entries` for the next
+    // `rebuild_view` to show in the wrong collection's list. Esc out of the
+    // picker (candidates were only ever owned by Mode::EntryPicker itself)
+    // and confirm the entry never appears in `view`.
+    #[test]
+    fn cancelled_merge_does_not_leak_foreign_entries_into_view() {
+        let dir = std::env::temp_dir().join("ferref-begin-merge-cancel-test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = db::init_db(&dir.join("ferref.db")).unwrap();
+
+        let mut here = mk_entry("Here Paper", "Smith", Some(2020), "");
+        here.cite_key = "here".to_string();
+        let here_id = db::insert_entry(&conn, &here).unwrap();
+
+        let mut elsewhere = mk_entry("Elsewhere Paper", "Jones", Some(2021), "");
+        elsewhere.cite_key = "elsewhere".to_string();
+        let elsewhere_id = db::insert_entry(&conn, &elsewhere).unwrap();
+
+        let mut other = mk_entry("Other Paper", "Lee", Some(2022), "");
+        other.cite_key = "other".to_string();
+        let other_id = db::insert_entry(&conn, &other).unwrap();
+
+        let mut app = mk_app(vec![here.clone()]);
+        app.entries[0].id = Some(here_id);
+
+        // 3+ marked so plan_merge opens the picker (a 2-marked merge skips
+        // straight to Mode::Confirm, which never touches `entries` either).
+        app.marked = vec![here_id, elsewhere_id, other_id];
+        app.begin_merge(&conn, here_id);
+        let Mode::EntryPicker {
+            keep_id,
+            candidates,
+            within_marked,
+            filter,
+            rows,
+            selected,
+        } = std::mem::replace(&mut app.mode, Mode::Normal)
+        else {
+            panic!("expected EntryPicker mode");
+        };
+        assert_eq!(app.entries.len(), 1, "candidates must not be appended to entries");
+
+        handle_entry_picker_key(
+            &mut app,
+            &conn,
+            KeyCode::Esc,
+            keep_id,
+            candidates,
+            within_marked,
+            filter,
+            rows,
+            selected,
+        );
+
+        app.rebuild_view();
+        assert_eq!(app.entries.len(), 1, "entries must still be just the local collection");
+        assert!(
+            app.view.iter().all(|&i| app.entries[i].id != Some(elsewhere_id)),
+            "the foreign entry must never appear in view"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // T2: sort by title, then edit "Gamma" to "Aardvark" -- it now sorts
+    // first, so the highlight (and Details pane) must follow it to row 0
+    // rather than staying at the old row index (which is now "Beta").
+    #[test]
+    fn refresh_entry_follows_the_edited_entry_after_a_resort() {
+        let dir = std::env::temp_dir().join("ferref-refresh-entry-resort-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = db::init_db(&dir.join("ferref.db")).unwrap();
+
+        let mut alpha = mk_entry("Alpha", "", None, "");
+        alpha.cite_key = "alpha".to_string();
+        let mut beta = mk_entry("Beta", "", None, "");
+        beta.cite_key = "beta".to_string();
+        let mut gamma = mk_entry("Gamma", "", None, "");
+        gamma.cite_key = "gamma".to_string();
+        let alpha_id = db::insert_entry(&conn, &alpha).unwrap();
+        let beta_id = db::insert_entry(&conn, &beta).unwrap();
+        let gamma_id = db::insert_entry(&conn, &gamma).unwrap();
+        alpha.id = Some(alpha_id);
+        beta.id = Some(beta_id);
+        gamma.id = Some(gamma_id);
+
+        let mut app = mk_app(vec![alpha, beta, gamma]);
+        app.sort_key = SortKey::Title;
+        app.rebuild_view(); // Alpha, Beta, Gamma
+        app.table_selected = app.view.iter().position(|&i| app.entries[i].id == Some(gamma_id)).unwrap();
+        app.details_scroll = 7; // an old, now-meaningless scroll offset
+
+        app.apply_field_edit(&conn, gamma_id, EditField::Title, "Aardvark");
+
+        let selected_id = app.view.get(app.table_selected).map(|&i| app.entries[i].id);
+        assert_eq!(
+            selected_id,
+            Some(Some(gamma_id)),
+            "highlight should follow the renamed entry to its new (first) row"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The other half of T2: an untag that drops the edited entry out of an
+    // active `/` filter. The entry vanishes from `view` entirely, so there's
+    // no row to follow it to -- `details_scroll` must still be reset rather
+    // than kept pointed at content that's no longer shown.
+    #[test]
+    fn refresh_entry_resets_details_scroll_when_the_entry_drops_out_of_the_filter() {
+        let dir = std::env::temp_dir().join("ferref-refresh-entry-filter-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = db::init_db(&dir.join("ferref.db")).unwrap();
+
+        let mut tagged = mk_entry("Tagged Paper", "", None, "");
+        tagged.cite_key = "tagged".to_string();
+        let tagged_id = db::insert_entry(&conn, &tagged).unwrap();
+        db::add_tag(&conn, "tagged", "keep").unwrap();
+        tagged.id = Some(tagged_id);
+        tagged.tags = vec!["keep".to_string()];
+
+        let mut other = mk_entry("Other Paper", "", None, "");
+        other.cite_key = "other".to_string();
+        let other_id = db::insert_entry(&conn, &other).unwrap();
+        other.id = Some(other_id);
+
+        let mut app = mk_app(vec![tagged, other]);
+        app.filter = "keep".to_string();
+        app.rebuild_view(); // only "Tagged Paper" matches
+        app.table_selected = 0;
+        app.details_scroll = 12;
+
+        db::remove_tag(&conn, "tagged", "keep").unwrap();
+        app.refresh_entry(&conn, tagged_id).unwrap();
+
+        assert!(
+            app.view.iter().all(|&i| app.entries[i].id != Some(tagged_id)),
+            "the untagged entry should have dropped out of the active filter"
+        );
+        assert_eq!(app.details_scroll, 0);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

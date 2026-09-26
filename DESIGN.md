@@ -2422,6 +2422,103 @@ Each step leaves something testable:
 
 ---
 
+## Phase 28 — Second full audit (Opus): fixes
+
+An Opus review of the whole codebase, the first since Phase 22. It
+found nothing critical or high. Its medium and low findings were all
+fixed in two coder batches, then checked by a Sonnet review, which found
+four more problems (marked *review* below). Those were fixed too.
+
+**`fetch` (mostly Phase 26 follow-ups):**
+- **An attached PDF is now reused before any network request.**
+  Previously the check ran only once some source offered a URL, so with
+  the network down, `fetch` on an already-fetched entry exited 1. Now it
+  returns at once with `already_present: true` and `source: null`, and
+  says "already has its PDF" rather than "Downloaded … from X".
+- **A 60-second limit on the whole search.** An entry can have many
+  Unpaywall links (the LIGO paper has 14), each allowed 120s, and the TUI
+  blocks while it waits.
+  - The limit covers every request: Unpaywall, the PMC listing, the
+    bioRxiv API, and the downloads. Each request's timeout is capped at
+    the time remaining.
+  - *Review:* the first version started the clock after Unpaywall and
+    left the resolver lookups on a fixed 30s. That was fixed and checked
+    against a proxy that never answers: 60.2s.
+- **The `%PDF` check reads the first 4 bytes before the rest**, so an
+  HTML interstitial isn't downloaded in full.
+- **Garbage from PMC or bioRxiv is an error, not "not there".** Exit 0
+  must mean every source answered (Phase 26's rule).
+- **Quieter failure output.**
+  - One short reason per copy tried.
+  - The "download it in a browser and use `ferref attach`" advice
+    appears once, and only if something was bot-blocked.
+  - `attempted` lists only the sources actually consulted.
+  - The TUI shows a one-line summary.
+- **Tests that could pass against broken code were fixed.**
+  - The source order is now a function (`candidate_sources`) with a test.
+  - The Retry/Fatal classification has a test.
+  - The IPv6 test was passing because DNS failed on `[::1]`, brackets
+    included, not because of `is_internal`. The brackets are now
+    stripped, so IPv6 literals are actually checked.
+
+**Input and output:**
+- **Control characters are stripped from plain-text output**, in
+  `emit()`, `die()` and the few direct `eprintln!`s (*review* caught two
+  that were missed).
+  - A title carrying `ESC ] 52` could set the clipboard; `ESC [ 2J`
+    could clear the screen.
+  - Sources: an imported .bib, Crossref JSON, or a landing page's
+    `&#27;`.
+  - `--json` and the TUI were already safe.
+- **Cite keys and titles are validated** (`cli::validate_cite_key`,
+  `cli::validate_title`).
+  - `add --key "weird key,x"` used to succeed and then make every
+    `export` unreadable, including by ferref's own `import`.
+  - Keys must be non-empty and free of whitespace and
+    `{ } ( ) , " # % ' = \ /`. `:` and `+` stay allowed.
+  - Bad keys in an imported .bib are skipped and reported. Existing rows
+    aren't touched.
+- **A `crossref`/`xdata` cycle in a .bib no longer crashes `import`.**
+  The biblatex crate recursed until the stack overflowed. ferref now
+  reads the file with `RawBibliography` first and rejects cycles with an
+  iterative check.
+- **Organization authors are braced on export**, so "LIGO Scientific
+  Collaboration and Virgo Collaboration" stays one author.
+
+**`add --url`:**
+- **When Crossref has no record of a DOI the page gave**, ferref uses the
+  page's own metadata and keeps the DOI. This covers Zenodo, Figshare,
+  arXiv and other DataCite DOIs. An explicit `--doi` still fails.
+- **`--json` now shows the attachment**, and a failed PDF download is
+  always reported on stderr.
+
+**TUI:**
+- **Merging marks from several collections** showed a blank title in the
+  confirm prompt (two marked) or an empty picker (three or more).
+  - The merge now loads its own candidate list, from the view or the
+    database, held by the picker mode.
+  - *Review:* the first fix appended the other collections' entries to
+    `App::entries`. A cancelled merge left them there, and the next sort
+    showed them in the wrong collection. The redesign never touches
+    `App::entries`, and a test covers the cancel.
+- **An edit that re-sorts the list now keeps the edited entry
+  selected.** If the entry leaves the view, the selection is clamped and
+  the Details scroll resets.
+
+**Small fixes:**
+- `open` sends its error to stderr.
+- `--email ""` counts as unset.
+- The help screen and docs say Ctrl-d/u move 10 rows, which is what they
+  do.
+- The docs examples were checked against live output.
+
+**Left alone:**
+- `--json` errors still print as plain text.
+- The TUI author editor's `;`/`,` round-trip is noted in
+  docs/limitations.md rather than redesigned.
+
+---
+
 ## Roadmap (not yet scoped)
 
 Ideas worth doing sometime, deliberately not designed in detail yet — see
@@ -2454,7 +2551,7 @@ one yet.
 
 ## Order of work
 
-Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17 → 18 → 19 → 20 → 21 → 22 → 23 → 24 → 25 → 26. Phase 27 (browser extension) is deferred. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
+Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17 → 18 → 19 → 20 → 21 → 22 → 23 → 24 → 25 → 26 → 28. Phase 27 (browser extension) is deferred. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
 
 ---
 
@@ -2492,6 +2589,7 @@ Which phases get farmed out to a `coder` subagent, and which get an
 | 25 — TUI: scrollable DETAILS pane | no | **yes** | Small, but real correctness risk in the scroll-clamp math -- one bug caught live during implementation, two more caught by a review requested after the fact. Selection-tracking-by-position bugs like this one recur easily; worth a look even on "small" changes. |
 | 26 — `fetch`: all Unpaywall copies + PMC | **yes** | **yes** | Network, remote XML/JSON not under our control, and a real silent-failure trap: an S3 prefix without its trailing dot downloads a *different paper's* PDF that passes every check. Same shape as Phases 8 and 19. |
 | 27 — Firefox extension *(deferred)* | **yes** | **yes** | New trust boundary (page-controlled HTML and PDF bytes arriving on stdin), a byte-exact framing protocol where one stray stdout write breaks everything, and a refactor of `cmd_add` that must not change `add --url`. The extension half can only be verified in a real Firefox, so the user runs that check. |
+| 28 — Second audit (Opus): fixes | **yes** | **yes** | Fixes across every module, several at trust boundaries (terminal output, .bib parsing, network deadlines). The follow-up review caught a TUI state leak and an incomplete deadline, both in the first round of fixes. |
 
 The table is a default, not a rule. The reasoning behind it, which outlives the
 table if the phases change:

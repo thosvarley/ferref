@@ -6,9 +6,10 @@ use std::path::Path;
 
 use biblatex::{
     Bibliography, ChunksExt, Date, DateValue, Datetime, Entry as BibEntry, EntryType,
-    PermissiveType, Person, Type,
+    PermissiveType, Person, RawBibliography, RawChunk, RawEntry, Type,
 };
 
+use crate::cli::validate_cite_key;
 use crate::models::{Author, Entry};
 
 // Entries parsed successfully, and entries rejected during parsing itself
@@ -26,6 +27,15 @@ pub fn import(path: &Path) -> Result<ImportResult, String> {
 // Factored out of `import` so tests can feed a string directly instead of
 // writing a temp file.
 fn parse_bibtex_str(src: &str) -> Result<ImportResult, String> {
+    // `Bibliography::parse` resolves `crossref`/`xdata` by recursing straight
+    // down the reference chain with no cycle check -- a self-reference
+    // (`crossref={a}` on entry `a`) or a longer cycle overflows the stack and
+    // takes the whole process down with it. Parse to the crate's raw,
+    // unresolved representation first and reject a cycle there, before the
+    // resolving parse ever runs.
+    let raw = RawBibliography::parse(src).map_err(|e| format!("failed to parse BibTeX: {e}"))?;
+    check_crossref_cycles(&raw)?;
+
     let bib = Bibliography::parse(src).map_err(|e| format!("failed to parse BibTeX: {e}"))?;
     let mut entries = Vec::new();
     let mut rejected = Vec::new();
@@ -36,6 +46,113 @@ fn parse_bibtex_str(src: &str) -> Result<ImportResult, String> {
         }
     }
     Ok((entries, rejected))
+}
+
+// Concatenates a raw field's chunks into plain text -- good enough for a
+// `crossref`/`xdata` value, which is always a bare key or comma-separated
+// list of keys, never rich text worth distinguishing normal text from an
+// abbreviation reference.
+fn raw_field_text(field: &[biblatex::Spanned<RawChunk>]) -> String {
+    field
+        .iter()
+        .map(|c| match &c.v {
+            RawChunk::Normal(s) => *s,
+            RawChunk::Abbreviation(s) => *s,
+        })
+        .collect::<String>()
+}
+
+// The keys one entry points at via `crossref` (a single key) and `xdata` (a
+// comma-separated list) -- the two fields `Bibliography::parse` recurses
+// through without a cycle check.
+fn crossref_targets(e: &RawEntry) -> Vec<String> {
+    let mut targets = Vec::new();
+    for pair in &e.fields {
+        match pair.key.v.to_ascii_lowercase().as_str() {
+            "crossref" => {
+                let text = raw_field_text(&pair.value.v);
+                if !text.trim().is_empty() {
+                    targets.push(text.trim().to_string());
+                }
+            }
+            "xdata" => {
+                for part in raw_field_text(&pair.value.v).split(',') {
+                    let part = part.trim();
+                    if !part.is_empty() {
+                        targets.push(part.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    targets
+}
+
+// Detects a self-reference or longer cycle in the `crossref`/`xdata` graph
+// before the recursive resolver ever runs. Iterative (not recursive) DFS on
+// purpose -- this is exactly the "don't trust recursion depth on untrusted
+// input" boundary that's being fixed, so it would be self-defeating to write
+// the check itself recursively.
+fn check_crossref_cycles(raw: &RawBibliography) -> Result<(), String> {
+    use std::collections::HashMap;
+
+    let mut edges: HashMap<String, Vec<String>> = HashMap::new();
+    for e in &raw.entries {
+        edges
+            .entry(e.v.key.v.to_string())
+            .or_default()
+            .extend(crossref_targets(&e.v));
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum State {
+        Visiting,
+        Done,
+    }
+    let mut state: HashMap<String, State> = HashMap::new();
+
+    let starts: Vec<String> = edges.keys().cloned().collect();
+    for start in starts {
+        if state.get(&start) == Some(&State::Done) {
+            continue;
+        }
+
+        let mut path: Vec<String> = vec![start.clone()];
+        let mut stack: Vec<(String, usize)> = vec![(start.clone(), 0)];
+        state.insert(start, State::Visiting);
+
+        while let Some((node, idx)) = stack.last().cloned() {
+            let children = edges.get(&node).cloned().unwrap_or_default();
+            if idx >= children.len() {
+                state.insert(node, State::Done);
+                path.pop();
+                stack.pop();
+                continue;
+            }
+            stack.last_mut().unwrap().1 = idx + 1;
+
+            let child = &children[idx];
+            match state.get(child) {
+                Some(State::Visiting) => {
+                    let mut cycle = path.clone();
+                    cycle.push(child.clone());
+                    return Err(format!(
+                        "crossref/xdata cycle detected: {}",
+                        cycle.join(" -> ")
+                    ));
+                }
+                Some(State::Done) => {}
+                None => {
+                    state.insert(child.clone(), State::Visiting);
+                    path.push(child.clone());
+                    stack.push((child.clone(), 0));
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // Two output formats, because they are genuinely two formats and not a
@@ -65,6 +182,13 @@ pub fn export(entries: &[Entry], biblatex_syntax: bool) -> String {
 // same "bad data" treatment cmd_import already gives an entry that fails
 // db::insert_entry.
 fn from_biblatex(e: &BibEntry) -> Result<Entry, String> {
+    // A .bib key that fails our validation (blank, whitespace, or a BibTeX
+    // delimiter like the comma in `weird key,x`) would round-trip right back
+    // out unreadable on the next `export` -- reject it here the same way a
+    // missing title already is, rather than importing a key ferref itself
+    // can never re-emit correctly.
+    validate_cite_key(&e.key).map_err(|msg| format!("entry '{}': {msg}", e.key))?;
+
     let entry_type = entry_type_to_string(&e.entry_type);
     let title = e
         .title()
@@ -186,8 +310,7 @@ fn to_biblatex(entry: &Entry) -> BibEntry {
     e.set_title(entry.title.to_chunks());
 
     if !entry.authors.is_empty() {
-        let persons: Vec<Person> = entry.authors.iter().map(author_to_person).collect();
-        e.set_author(persons);
+        e.set("author", authors_to_chunks(&entry.authors));
     }
 
     if let Some(year) = entry.year {
@@ -256,6 +379,37 @@ fn author_to_person(a: &Author) -> Person {
         given_initials: None,
         use_prefix: None,
     }
+}
+
+// L2: an author with no first_name is a single-name/organization author
+// (e.g. Crossref's "LIGO Scientific Collaboration and Virgo Collaboration"),
+// whose whole name lives in `last_name`. biblatex's own `Vec<Person>`
+// serializer writes that name as a bare `Chunk::Normal`, so a literal
+// " and " or "," inside it (there's no separator convention that could
+// avoid this -- an org name is free text) reads back on import as two or
+// three authors instead of one.
+//
+// The fix is the standard BibTeX one: brace-protect the whole name.
+// `Chunk::Verbatim` is what makes the writer add that extra brace pair
+// (`{{...}}`, see biblatex's `ChunksExt::to_biblatex_string`), and the
+// resolver reads anything inside a nested brace back as protected content
+// that keyword-splitting (the `Vec<Person>`/`Vec<Chunks>` "and" split) skips
+// over -- so it round-trips as one author again. An author that does have a
+// first name is unaffected, still built through the normal `Person` path.
+fn authors_to_chunks(authors: &[Author]) -> biblatex::Chunks {
+    let per_author: Vec<biblatex::Chunks> = authors
+        .iter()
+        .map(|a| {
+            if a.first_name.is_none() {
+                vec![biblatex::Spanned::detached(biblatex::Chunk::Verbatim(
+                    a.last_name.clone(),
+                ))]
+            } else {
+                vec![author_to_person(a)].to_chunks()
+            }
+        })
+        .collect();
+    per_author.to_chunks()
 }
 
 fn parse_volume(s: &str) -> PermissiveType<i64> {
@@ -371,10 +525,65 @@ mod tests {
         assert_eq!(entries[0].authors[0].last_name, "Smith");
     }
 
+    // M3: a key like `weird key,x` would export back out as
+    // `@article{weird key,x,`, unreadable by any BibTeX parser -- reject it
+    // at import instead of writing it to the DB.
+    #[test]
+    fn bad_cite_key_is_rejected_but_sibling_entry_still_imports() {
+        let src = r#"@article{weird#key2020,
+            title = {Bad Key},
+        }
+        @article{goodkey2021,
+            title = {Good Key},
+        }"#;
+        let (entries, rejected) = parse_bibtex_str(src).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cite_key, "goodkey2021");
+        assert_eq!(rejected.len(), 1);
+    }
+
     #[test]
     fn malformed_bib_is_reported_not_panicked() {
         let result = parse_bibtex_str("@article{unterminated,");
         assert!(result.is_err());
+    }
+
+    // M4: `Bibliography::parse` (the biblatex crate) resolves `crossref` by
+    // recursing straight down the chain with no cycle check -- a
+    // self-reference used to overflow the stack and crash the process. Must
+    // be rejected as a clean error instead.
+    #[test]
+    fn self_referencing_crossref_is_rejected_cleanly() {
+        let src = "@article{a, crossref={a}, title={x}}";
+        let err = parse_bibtex_str(src).unwrap_err();
+        assert!(err.contains("cycle"), "error was: {err}");
+        assert!(err.contains('a'), "error was: {err}");
+    }
+
+    #[test]
+    fn two_entry_crossref_cycle_is_rejected_cleanly() {
+        let src = "@article{a, crossref={b}, title={x}}\n\
+                    @article{b, crossref={a}, title={y}}";
+        let err = parse_bibtex_str(src).unwrap_err();
+        assert!(err.contains("cycle"), "error was: {err}");
+    }
+
+    // A normal, non-cyclic crossref (a child inheriting from a parent
+    // collection entry) must still import -- the cycle check must not reject
+    // the ordinary case it exists alongside.
+    #[test]
+    fn normal_crossref_still_imports() {
+        let src = r#"@inproceedings{child2020,
+            crossref = {parent2020},
+            title = {A Chapter},
+        }
+        @proceedings{parent2020,
+            title = {The Proceedings},
+            year = {2020},
+        }"#;
+        let (entries, rejected) = parse_bibtex_str(src).unwrap();
+        assert!(rejected.is_empty(), "rejected: {rejected:?}");
+        assert_eq!(entries.len(), 2);
     }
 
     // B5: a missing (or empty) title used to default to "" and import
@@ -429,6 +638,45 @@ mod tests {
         assert_eq!(back.authors[0].first_name, Some("John, Jr.".to_string()));
         assert_eq!(back.authors[1].last_name, "van der Berg");
         assert_eq!(back.authors[1].first_name, Some("Jan".to_string()));
+    }
+
+    // L2: a single-name/organization author's name can contain " and " or
+    // "," as ordinary text (not a separator) -- Crossref's own
+    // "LIGO Scientific Collaboration and Virgo Collaboration" is exactly
+    // this: one author, no given name. Unbraced, that splits into two
+    // authors on re-import; brace-protected, it must come back as one.
+    #[test]
+    fn organization_author_with_and_survives_round_trip() {
+        let mut entry = Entry::new("article".into(), "ligo2016".into(), "T".into());
+        entry.add_author(Author::new(
+            "LIGO Scientific Collaboration and Virgo Collaboration".into(),
+            None,
+        ));
+        entry.add_author(Author::new("Smith".into(), Some("John".into())));
+
+        let back = round_trip(entry);
+        assert_eq!(back.authors.len(), 2);
+        assert_eq!(
+            back.authors[0].last_name,
+            "LIGO Scientific Collaboration and Virgo Collaboration"
+        );
+        assert_eq!(back.authors[0].first_name, None);
+        assert_eq!(back.authors[1].last_name, "Smith");
+        assert_eq!(back.authors[1].first_name, Some("John".to_string()));
+    }
+
+    // An organization name containing a comma is the other half of the same
+    // bug -- BibTeX's plain-Person parser reads an unbraced comma as
+    // "Last, First".
+    #[test]
+    fn organization_author_with_comma_survives_round_trip() {
+        let mut entry = Entry::new("article".into(), "org2020".into(), "T".into());
+        entry.add_author(Author::new("Some Org, Inc.".into(), None));
+
+        let back = round_trip(entry);
+        assert_eq!(back.authors.len(), 1);
+        assert_eq!(back.authors[0].last_name, "Some Org, Inc.");
+        assert_eq!(back.authors[0].first_name, None);
     }
 
     // The two things a BibTeX -> LaTeX pipeline actually loses: tags, which

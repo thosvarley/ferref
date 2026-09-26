@@ -171,7 +171,7 @@ $ ferref add --doi 10.1038/s41586-020-2649-2
 Array programming with NumPy [harris2020]
   ...
 $ ferref fetch harris2020
-Downloaded open-access PDF for 'harris2020' from Unpaywall to '~/.ferref/pdfs/harris2020.pdf'
+Downloaded open-access PDF for 'harris2020' from PMC to '~/.ferref/pdfs/harris2020.pdf'
 Extracted 41013 characters from '~/.ferref/pdfs/harris2020.pdf'
 ```
 
@@ -180,15 +180,23 @@ PubMed Central's own open-access copy first (if the paper has a PMC record --
 PMC has no bot check, unlike its website), then Unpaywall's own PDF links in
 its order, then whichever preprint server the DOI belongs to: arXiv,
 bioRxiv/medRxiv, OSF (including PsyArXiv, SocArXiv, and others), or
-preprints.org. A failed download just moves on to the next candidate.
+preprints.org. A failed download just moves on to the next candidate, and
+the whole search gives up after 60 seconds even if candidates remain.
 
-Finding nothing is a normal result, not an error:
+Finding nothing is a normal result, not an error. The "tried" list only
+names sources actually asked something -- PMC with no PubMed Central record,
+or a preprint server whose DOI pattern doesn't match, is left out rather
+than padding the list with sources that were never contacted:
 
 ```console
 $ ferref fetch piwowar2018
 'piwowar2018' (DOI 10.7717/peerj.4375) is open access, but no direct PDF link
-was found (tried: PMC, Unpaywall, arXiv, bioRxiv, OSF, preprints.org)
+was found (tried: Unpaywall)
 ```
+
+If a real candidate existed but every download failed -- blocked by a bot
+check, gone, whatever -- that's an error (exit 1), not this "not open
+access" shape, and the message lists each attempt's own short reason.
 
 ferref never works around a paywall.
 

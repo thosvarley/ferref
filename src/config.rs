@@ -83,11 +83,17 @@ pub fn library_root() -> Result<PathBuf, String> {
 }
 
 pub fn resolve_email(cli_email: Option<String>) -> Result<String, String> {
-    if let Some(email) = cli_email {
+    // An empty or whitespace-only --email is not "set to nothing" -- it's
+    // the same as not passing --email at all, so it falls through to the
+    // next source instead of being sent to Unpaywall as-is (which comes
+    // back as an HTTP 422).
+    if let Some(email) = cli_email
+        && !email.trim().is_empty()
+    {
         return Ok(email);
     }
     if let Ok(email) = std::env::var("FERREF_EMAIL") {
-        if !email.is_empty() {
+        if !email.trim().is_empty() {
             return Ok(email);
         }
     }
@@ -132,5 +138,22 @@ mod tests {
         assert_eq!(parse_email("junk line with no equals\nother = 1"), None);
         assert_eq!(parse_email(""), None);
         assert_eq!(parse_email("email = "), None);
+    }
+
+    // L6: `fetch --email ""` used to be accepted as-is and sent to
+    // Unpaywall verbatim (an HTTP 422); it must instead be treated exactly
+    // like not passing --email at all, falling through to whatever
+    // FERREF_EMAIL/the config file would otherwise resolve to -- checked
+    // against `resolve_email(None)` rather than a fixed Ok/Err, since the
+    // real fallback outcome depends on the machine's own environment/config
+    // file, which this test must not assume anything about.
+    #[test]
+    fn resolve_email_treats_blank_cli_email_as_unset() {
+        assert_eq!(resolve_email(Some("".to_string())), resolve_email(None));
+        assert_eq!(resolve_email(Some("   ".to_string())), resolve_email(None));
+        assert_eq!(
+            resolve_email(Some("real@example.com".to_string())),
+            Ok("real@example.com".to_string())
+        );
     }
 }

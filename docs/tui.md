@@ -28,7 +28,7 @@ Vim keys and arrow keys both work.
 | `Tab` / `Shift-Tab` | Move focus to the next / previous pane |
 | `j` `k` or `↓` `↑` | Move down / up (in Details, scroll) |
 | `g` / `G` | Jump to the top / bottom |
-| `Ctrl-d` / `Ctrl-u` | Half a page down / up |
+| `Ctrl-d` / `Ctrl-u` | 10 rows down / up |
 | `h` / `l` | In Collections: fold / unfold. Elsewhere: move to the pane on the left / right |
 | `r` | Reload from the database |
 | `q` | Quit |

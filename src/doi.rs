@@ -26,8 +26,15 @@ const UNPAYWALL_BASE: &str = "https://api.unpaywall.org/v2";
 // polite-pool policy -- never in the User-Agent, never hardcoded.
 const USER_AGENT: &str = "ferref/0.1";
 
-const JSON_TIMEOUT: Duration = Duration::from_secs(30);
-const PDF_TIMEOUT: Duration = Duration::from_secs(120);
+// `pub(crate)`, not private: `fetch_pdf_for_entry`'s 60s deadline (main.rs)
+// needs this as the ceiling for `min(JSON_TIMEOUT, remaining)` when it calls
+// the OA-lookup functions below with less than a full JSON_TIMEOUT left.
+pub(crate) const JSON_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default per-request timeout for `download_pdf`, used by callers (like
+/// `add --url`) that download exactly one PDF. `fetch`'s candidate loop
+/// instead caps each attempt at whatever's left of its own overall
+/// deadline, which is always well under this.
+pub const DEFAULT_PDF_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_JSON_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_PDF_BYTES: u64 = 100 * 1024 * 1024;
 // Landing pages are documents, not payloads; 5MB is already a very fat one.
@@ -45,22 +52,36 @@ const MAX_REDIRECTS: usize = 10;
 pub fn fetch_metadata(doi: &str) -> Result<Entry, String> {
     validate_doi(doi)?;
     let url = format!("{CROSSREF_BASE}/{}", percent_encode(doi));
-    let body = get_text(&url, "Crossref")?;
+    let body = get_text(&url, "Crossref", JSON_TIMEOUT)?;
     parse_crossref(&body)
+}
+
+/// True for exactly the error `fetch_metadata` returns when Crossref has no
+/// record for the DOI at all (a real "not indexed here" answer, e.g. every
+/// DataCite DOI -- Zenodo, Figshare, arXiv's 10.48550/... -- since none of
+/// those are Crossref members) -- as opposed to a network failure, rate
+/// limit, or any other error, which callers must still treat as fatal.
+/// String-matched, not a typed error, since `get_text`'s callers all share
+/// one `Result<_, String>` shape; kept as one function so the exact wording
+/// only has to be right in one place.
+pub fn is_no_record_404(err: &str) -> bool {
+    err == "Crossref has no record for this DOI (404)"
 }
 
 /// Looks up everything Unpaywall knows about `doi`: every PDF URL it lists
 /// (not just `best_oa_location`) and, if present, a PMC id to try
 /// separately. An empty `pdf_urls` is a normal answer, not an error --
 /// plenty of genuinely open papers are linked only as landing pages.
-pub fn fetch_oa_pdf_url(doi: &str, email: &str) -> Result<OaStatus, String> {
+/// `timeout` lets `fetch`'s 60s overall deadline (main.rs) cap this call
+/// too, rather than always waiting the full `JSON_TIMEOUT`.
+pub fn fetch_oa_pdf_url(doi: &str, email: &str, timeout: Duration) -> Result<OaStatus, String> {
     validate_doi(doi)?;
     let url = format!(
         "{UNPAYWALL_BASE}/{}?email={}",
         percent_encode(doi),
         percent_encode(email)
     );
-    let body = get_text(&url, "Unpaywall")?;
+    let body = get_text(&url, "Unpaywall", timeout)?;
     parse_unpaywall(&body)
 }
 
@@ -150,8 +171,9 @@ const PMC_S3_BASE: &str = "https://pmc-oa-opendata.s3.amazonaws.com";
 /// reCAPTCHA to scripts, and Europe PMC returns 403, but this bucket has no
 /// bot check. `Ok(None)` means the article isn't in the open-access subset,
 /// a normal answer, not an error. Rejects a malformed `pmcid` before making
-/// any request.
-pub fn pmc_pdf_url(pmcid: &str) -> Result<Option<String>, String> {
+/// any request. `timeout` lets `fetch`'s 60s overall deadline (main.rs) cap
+/// this call too, rather than always waiting the full `JSON_TIMEOUT`.
+pub fn pmc_pdf_url(pmcid: &str, timeout: Duration) -> Result<Option<String>, String> {
     let digits = pmcid
         .strip_prefix("PMC")
         .filter(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()));
@@ -166,7 +188,7 @@ pub fn pmc_pdf_url(pmcid: &str) -> Result<Option<String>, String> {
     // different paper's PDF would download without complaint. See
     // parse_pmc_versions for the rest of the defence.
     let url = format!("{PMC_S3_BASE}/?list-type=2&prefix=PMC{digits}.&delimiter=/");
-    let xml = get_text(&url, "PMC")?;
+    let xml = get_text(&url, "PMC", timeout)?;
     let Some(version) = parse_pmc_versions(&xml, pmcid)? else {
         return Ok(None);
     };
@@ -234,8 +256,10 @@ const BIORXIV_API_BASE: &str = "https://api.biorxiv.org/details";
 /// that reports no match, retries against `.../details/medrxiv/<doi>`.
 /// `Ok(None)` means neither host has this DOI -- the normal "not from this
 /// source" case, not an error. Only a genuine network/parse failure comes
-/// back as `Err`.
-pub fn biorxiv_pdf_url(doi: &str) -> Result<Option<String>, String> {
+/// back as `Err`. `timeout` (applied to each of the up-to-two host calls)
+/// lets `fetch`'s 60s overall deadline (main.rs) cap this too, rather than
+/// always waiting the full `JSON_TIMEOUT` per host.
+pub fn biorxiv_pdf_url(doi: &str, timeout: Duration) -> Result<Option<String>, String> {
     validate_doi(doi)?;
     if !doi.starts_with("10.1101/") {
         return Ok(None);
@@ -243,7 +267,7 @@ pub fn biorxiv_pdf_url(doi: &str) -> Result<Option<String>, String> {
 
     for host in ["biorxiv", "medrxiv"] {
         let url = format!("{BIORXIV_API_BASE}/{host}/{}", percent_encode(doi));
-        let body = get_text(&url, "bioRxiv")?;
+        let body = get_text(&url, "bioRxiv", timeout)?;
         if let Some(version) = parse_biorxiv_details(&body)? {
             return Ok(Some(format!(
                 "https://www.{host}.org/content/{doi}v{version}.full.pdf"
@@ -286,20 +310,18 @@ fn parse_biorxiv_details(json: &str) -> Result<Option<u32>, String> {
 /// site (Unpaywall JSON) and already passed the scheme check the caller is
 /// expected to have done -- this function re-checks it anyway, since a URL
 /// from a third-party API is hostile input regardless of who calls this.
-/// Verifies the `%PDF` magic bytes before returning: Unpaywall's
-/// `url_for_pdf` not infrequently lands on an HTML interstitial instead of
-/// the actual paper.
-pub fn download_pdf(url: &str) -> Result<Vec<u8>, String> {
-    let (bytes, _final_url) = fetch_guarded(url, PDF_TIMEOUT, MAX_PDF_BYTES, "PDF download")?;
-
-    if !has_pdf_magic(&bytes) {
-        return Err(
-            "downloaded content is not a PDF (missing %PDF magic bytes) -- \
-             this is usually an HTML interstitial, not the paper"
-                .to_string(),
-        );
-    }
-
+/// `timeout` is the caller's to set: `add --url` uses `DEFAULT_PDF_TIMEOUT`,
+/// while `fetch`'s candidate loop caps it at what's left of its own overall
+/// deadline, so one slow/blocked candidate out of several can't block for
+/// the full default on each.
+///
+/// Checks the `%PDF` magic bytes on just the first four bytes of the body,
+/// before reading the rest -- Unpaywall's `url_for_pdf` not infrequently
+/// lands on an HTML interstitial instead of the actual paper, and there's
+/// no reason to read a whole (possibly large) one just to throw it away.
+pub fn download_pdf(url: &str, timeout: Duration) -> Result<Vec<u8>, String> {
+    let (bytes, _final_url) =
+        fetch_guarded_with(url, timeout, MAX_PDF_BYTES, "PDF download", read_pdf_body)?;
     Ok(bytes)
 }
 
@@ -633,8 +655,8 @@ fn unescape_html(s: &str) -> String {
 // Shared by every small-document caller here (Crossref/Unpaywall/bioRxiv
 // JSON, and the PMC S3 listing, which is XML but tiny -- the JSON
 // timeout/size limits are still the right ones for it).
-fn get_text(url: &str, service: &str) -> Result<String, String> {
-    let (bytes, _final_url) = fetch_guarded(url, JSON_TIMEOUT, MAX_JSON_BYTES, service)?;
+fn get_text(url: &str, service: &str, timeout: Duration) -> Result<String, String> {
+    let (bytes, _final_url) = fetch_guarded(url, timeout, MAX_JSON_BYTES, service)?;
     String::from_utf8(bytes).map_err(|_| format!("{service} returned invalid UTF-8"))
 }
 
@@ -792,7 +814,7 @@ fn read_pdf_body(resp: Response<ureq::Body>, limit: u64, what: &str) -> Result<V
     let mut reader = resp.into_body().into_reader();
     let mut magic = [0u8; 4];
     match reader.read_exact(&mut magic) {
-        Ok(()) if &magic == b"%PDF" => {}
+        Ok(()) if has_pdf_magic(&magic) => {}
         // A body shorter than four bytes can't be a PDF either -- treated
         // the same as a mismatched one, not a distinct I/O error.
         Ok(()) => return Err(not_a_pdf()),
@@ -1179,6 +1201,16 @@ fn pmcid_from_pmh_id(pmh_id: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    // M5: `add --url` falling back to page metadata on a DataCite DOI (no
+    // Crossref record) hinges on matching this exact string -- any other
+    // Crossref error (network, rate limit, ...) must stay fatal.
+    #[test]
+    fn is_no_record_404_matches_only_the_no_record_message() {
+        assert!(is_no_record_404("Crossref has no record for this DOI (404)"));
+        assert!(!is_no_record_404("Crossref rate limit exceeded (429); try again later"));
+        assert!(!is_no_record_404("failed to reach Crossref: network error"));
+    }
+
     // Trimmed from the real, live response body for
     // GET https://api.crossref.org/works/10.1038/nature12373 (captured
     // 2026-08-22) -- fields not exercised by parse_crossref are dropped, but
@@ -1523,7 +1555,7 @@ mod tests {
             "javascript:alert(1)",
         ] {
             assert!(
-                download_pdf(bad).is_err(),
+                download_pdf(bad, Duration::from_secs(1)).is_err(),
                 "expected {bad:?} to be rejected"
             );
         }
@@ -1534,6 +1566,40 @@ mod tests {
         assert!(has_pdf_magic(b"%PDF-1.4\n..."));
         assert!(!has_pdf_magic(b"<html><body>not a pdf</body></html>"));
         assert!(!has_pdf_magic(b""));
+    }
+
+    fn body_response(data: &str) -> Response<ureq::Body> {
+        let body = ureq::Body::builder().data(data.as_bytes().to_vec());
+        ureq::http::Response::builder().status(200).body(body).unwrap()
+    }
+
+    // read_pdf_body's whole point: a non-PDF body is rejected off its first
+    // four bytes, without needing to read the rest -- no network here, so
+    // this only checks the classification, not that reading actually stops
+    // early (which `into_reader` doesn't expose a way to observe).
+    #[test]
+    fn read_pdf_body_rejects_a_non_pdf_body() {
+        let err = read_pdf_body(body_response("<html>not a pdf</html>"), 1000, "PDF download")
+            .unwrap_err();
+        assert!(err.contains("not a PDF"));
+    }
+
+    #[test]
+    fn read_pdf_body_rejects_a_body_shorter_than_the_magic_number() {
+        let err = read_pdf_body(body_response("%PD"), 1000, "PDF download").unwrap_err();
+        assert!(err.contains("not a PDF"));
+    }
+
+    #[test]
+    fn read_pdf_body_accepts_a_real_pdf_and_keeps_the_rest_of_the_bytes() {
+        let bytes = read_pdf_body(body_response("%PDF-1.4 rest of the file"), 1000, "x").unwrap();
+        assert_eq!(bytes, b"%PDF-1.4 rest of the file");
+    }
+
+    #[test]
+    fn read_pdf_body_enforces_the_byte_cap_after_the_magic_number() {
+        let err = read_pdf_body(body_response("%PDF0123456789"), 4, "x").unwrap_err();
+        assert!(err.contains("byte cap"));
     }
 
     #[test]
@@ -1890,10 +1956,12 @@ mod tests {
 
     #[test]
     fn pmc_pdf_url_rejects_a_malformed_pmcid() {
-        assert!(pmc_pdf_url("9131462").is_err());
-        assert!(pmc_pdf_url("PMC").is_err());
-        assert!(pmc_pdf_url("PMCabc").is_err());
-        assert!(pmc_pdf_url("PMC123abc").is_err());
+        // Rejected by validation before any network call, so the timeout
+        // value here is never actually used.
+        assert!(pmc_pdf_url("9131462", JSON_TIMEOUT).is_err());
+        assert!(pmc_pdf_url("PMC", JSON_TIMEOUT).is_err());
+        assert!(pmc_pdf_url("PMCabc", JSON_TIMEOUT).is_err());
+        assert!(pmc_pdf_url("PMC123abc", JSON_TIMEOUT).is_err());
     }
 
     #[test]

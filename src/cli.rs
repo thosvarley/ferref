@@ -359,6 +359,38 @@ pub fn parse_author(raw: &str) -> Result<Author, String> {
     Ok(Author::new(last.to_string(), first_name))
 }
 
+// A cite_key ends up verbatim inside BibTeX's `@type{key,` on export (and
+// inside file paths for attachments), so it can't be blank, contain
+// whitespace, or contain any character BibTeX itself treats as a delimiter
+// or that's unsafe in a path -- `weird key,x` round-trips out as
+// `@article{weird key,x,`, which no BibTeX parser (including our own
+// import) reads back. `derive_cite_key` already only ever produces ASCII
+// alphanumerics, so it always passes this.
+const CITE_KEY_FORBIDDEN: [char; 12] =
+    ['{', '}', '(', ')', ',', '"', '#', '%', '\'', '=', '\\', '/'];
+
+pub fn validate_cite_key(key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("cite_key cannot be empty".to_string());
+    }
+    if key.chars().any(char::is_whitespace) {
+        return Err(format!("cite_key {key:?} cannot contain whitespace"));
+    }
+    if let Some(c) = key.chars().find(|c| CITE_KEY_FORBIDDEN.contains(c)) {
+        return Err(format!("cite_key {key:?} cannot contain '{c}'"));
+    }
+    Ok(())
+}
+
+// A title is `NOT NULL` in the schema, but that alone still accepts "" or
+// all-whitespace -- reject those rather than writing an unreadable entry.
+pub fn validate_title(title: &str) -> Result<(), String> {
+    if title.trim().is_empty() {
+        return Err("title cannot be empty".to_string());
+    }
+    Ok(())
+}
+
 // Attachment paths are stored absolute: the DB outlives any particular working
 // directory, and a relative path silently stops resolving after one `cd`.
 //
@@ -440,5 +472,35 @@ mod tests {
                 "expected {raw:?} to be rejected"
             );
         }
+    }
+
+    // M3: a key that reaches export unbraced as `@article{weird key,x,`
+    // breaks every BibTeX parser, ferref's own import included.
+    #[test]
+    fn validate_cite_key_rejects_bad_keys() {
+        for raw in ["", "../../x", "weird key,x", "a{b", "a}b", "a(b", "a)b", "a\"b", "a#b", "a%b", "a'b", "a=b", "a\\b", "a/b"] {
+            assert!(
+                validate_cite_key(raw).is_err(),
+                "expected {raw:?} to be rejected"
+            );
+        }
+        assert!(validate_cite_key("smith2020").is_ok());
+        assert!(validate_cite_key("smith2020b").is_ok());
+    }
+
+    // derive_cite_key only ever emits lowercased ASCII alphanumerics (plus
+    // "entry" as a fallback base), so it must always pass validation.
+    #[test]
+    fn validate_cite_key_accepts_derived_shape() {
+        for key in ["smith2020", "entry", "vandenberg1999z"] {
+            assert!(validate_cite_key(key).is_ok());
+        }
+    }
+
+    #[test]
+    fn validate_title_rejects_blank() {
+        assert!(validate_title("").is_err());
+        assert!(validate_title("   ").is_err());
+        assert!(validate_title("A Real Title").is_ok());
     }
 }

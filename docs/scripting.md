@@ -105,24 +105,27 @@ instead, which is slower but still correct.
 
 `fetch --json` when a PDF was downloaded. ferref tries every copy Unpaywall
 lists plus PubMed Central's, so `source` can be `"Unpaywall"`, `"PMC"`,
-`"arXiv"`, `"bioRxiv"`, `"OSF"`, or `"preprints.org"`:
+`"arXiv"`, `"bioRxiv"`, `"OSF"`, or `"preprints.org"` -- or `null`, if the
+entry already had its PDF attached and nothing was downloaded at all:
 
 ```json
 { "cite_key": "harris2020", "doi": "10.1038/s41586-020-2649-2", "oa_found": true,
-  "source": "Unpaywall", "path": "/home/you/.ferref/pdfs/harris2020.pdf",
+  "source": "PMC", "path": "/home/you/.ferref/pdfs/harris2020.pdf",
   "already_present": false, "extracted": true, "chars": 41013 }
 ```
 
 …and when none was found. `is_oa` is Unpaywall's verdict. If Unpaywall (or
-any other source) couldn't be reached and nothing else turned up a PDF
-either, `fetch` exits 1 with an error instead of this shape -- a network
-problem doesn't get reported as "not open access". `attempted` lists every
-source tried, in order, with a reason for any that had a candidate but
-failed to download:
+any other source) couldn't be reached, or a candidate PDF existed but every
+download failed, `fetch` exits 1 with an error instead of this shape -- a
+network problem or a bot-blocked link doesn't get reported as "not open
+access". `attempted` lists only the sources actually consulted, in order --
+PMC with no PubMed Central id, or a pattern source (arXiv/OSF/preprints.org)
+whose DOI didn't match, is left out entirely, since it was never asked
+anything:
 
 ```json
 { "cite_key": "piwowar2018", "doi": "10.7717/peerj.4375", "oa_found": false,
-  "is_oa": true, "attempted": ["PMC", "Unpaywall", "arXiv", "bioRxiv", "OSF", "preprints.org"] }
+  "is_oa": true, "attempted": ["Unpaywall"] }
 ```
 
 `doctor --json`:

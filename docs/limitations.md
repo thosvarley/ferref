@@ -20,15 +20,21 @@
 
 **Fetching**
 
-- `add --doi` only works for DOIs that Crossref knows about. arXiv DOIs
-  (`10.48550/arXiv.*`) are not among them, so add arXiv papers with
-  `add --url https://arxiv.org/abs/...` instead.
+- `add --doi` only works for DOIs that Crossref knows about. DataCite DOIs
+  (arXiv's `10.48550/arXiv.*`, Zenodo, Figshare, ...) are not among them, so
+  add those with `add --url <landing page>` instead -- when the DOI comes
+  from the page itself rather than `--doi`, a Crossref 404 falls back to the
+  page's own meta tags automatically, with a note that Crossref had no
+  record.
 - `fetch` only downloads free, legal copies. It will not get around a paywall.
   It tries every copy Unpaywall lists plus PubMed Central's, moving on after a
   failed download, but some publisher sites answer scripts with a bot check
   (Cloudflare, Akamai, reCAPTCHA); `fetch` reports those clearly rather than
   trying to solve them -- download the PDF in a browser and attach it with
-  `ferref attach` instead.
+  `ferref attach` instead. The whole search is capped at 60 seconds, so a DOI
+  with many candidates (some journals list a dozen-plus) doesn't hang
+  indefinitely; whatever wasn't tried in time is reported as such rather than
+  silently skipped.
 
 **Text**
 
@@ -53,3 +59,8 @@
 
 - It doesn't notice changes made from another terminal until you press `r`.
 - Its export (`x`) writes plain BibTeX only.
+- Its author editor round-trips the whole author list through one
+  "Last, First; Last, First" text box, so an author whose name contains `;`,
+  or a single-name/organization author (e.g. "LIGO Scientific Collaboration")
+  whose name contains `,`, gets split at the wrong place. Not redesigned;
+  use `ferref edit --author` on the CLI, once per author, for those.
