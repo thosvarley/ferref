@@ -871,6 +871,44 @@ pub fn move_collection(conn: &Connection, path: &str, new_parent: Option<&str>) 
     Ok(())
 }
 
+// Renames a collection in place. Takes an id, not a path -- the TUI already
+// has it, and this is the id-based core create_collection_under mirrors on
+// the write side. Same rules as create_collection_under's sibling lookup:
+// the new name must pass validate_collection_name, and no *other* sibling
+// (same parent_id) may already use it case-insensitively -- but the
+// collection itself is exempt from that check, so `ml` -> `ML` is a
+// case-only rename rather than a clash with itself.
+pub fn rename_collection(conn: &Connection, id: i64, new_name: &str) -> Result<()> {
+    let name = validate_collection_name(new_name).map_err(rusqlite::Error::InvalidParameterName)?;
+
+    let parent_id: Option<i64> = conn.query_row(
+        "SELECT parent_id FROM collections WHERE id = ?1",
+        [id],
+        |row| row.get(0),
+    )?;
+
+    let sibling: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM collections WHERE lower(name) = lower(?1) AND parent_id IS ?2",
+            rusqlite::params![name, parent_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(sibling_id) = sibling
+        && sibling_id != id
+    {
+        return Err(rusqlite::Error::InvalidParameterName(format!(
+            "a sibling collection named {name:?} already exists"
+        )));
+    }
+
+    conn.execute(
+        "UPDATE collections SET name = ?1 WHERE id = ?2",
+        rusqlite::params![name, id],
+    )?;
+    Ok(())
+}
+
 // Ordered (depth, collection) pairs for rendering a tree. Terminates on a
 // cyclic parent_id graph rather than recursing forever: built iteratively
 // from the flat `all_collections` list with an explicit stack (DFS
@@ -958,14 +996,22 @@ fn subtree_ids(conn: &Connection, root: i64) -> Result<Vec<i64>> {
     Ok(ids)
 }
 
-// Deletes the subtree (ON DELETE CASCADE on parent_id takes it) and returns
-// how many collections went. Entries are never touched -- only
-// collection_entries membership rows, which cascade off collection_id.
-pub fn delete_collection(conn: &Connection, path: &str) -> Result<usize> {
-    let id = require_collection(conn, path)?;
+// Deletes the subtree rooted at `id` (ON DELETE CASCADE on parent_id takes
+// it) and returns how many collections went, `id` included. Entries are
+// never touched -- only collection_entries membership rows, which cascade
+// off collection_id. Takes an id rather than a path so the TUI, which
+// already has the id, doesn't need to rebuild a path just to resolve it
+// back to the same id.
+pub fn delete_collection_by_id(conn: &Connection, id: i64) -> Result<usize> {
     let count = subtree_ids(conn, id)?.len();
     conn.execute("DELETE FROM collections WHERE id = ?1", [id])?;
     Ok(count)
+}
+
+// Path-based wrapper around delete_collection_by_id, for the CLI.
+pub fn delete_collection(conn: &Connection, path: &str) -> Result<usize> {
+    let id = require_collection(conn, path)?;
+    delete_collection_by_id(conn, id)
 }
 
 // An all-None Filter matches everything, so `list` and `search` are the same
@@ -2919,5 +2965,56 @@ mod tests {
         assert!(require_collection(&conn, "Physics").is_ok());
         let err = require_collection(&conn, "Pyhsics"); // typo
         assert!(err.is_err(), "an unresolvable path must be an error, not None/empty");
+    }
+
+    // Phase 29: rename_collection mirrors create_collection_under's
+    // sibling-uniqueness rule, but must exempt the collection being renamed
+    // from its own clash check (a case-only rename is not a clash).
+    #[test]
+    fn rename_collection_validates_and_checks_sibling_clashes() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        let ml_id = create_collection(&conn, "ml").unwrap();
+        let stats_id = create_collection(&conn, "Statistics").unwrap();
+        let physics_id = create_collection(&conn, "Physics").unwrap();
+        // A same-named collection nested under a different parent.
+        let nested_ml = create_collection_under(&conn, Some(physics_id), "ml").unwrap();
+
+        // A normal rename.
+        rename_collection(&conn, ml_id, "Machine Learning").unwrap();
+        assert_eq!(
+            collection_by_path(&conn, "Machine Learning").unwrap(),
+            Some(ml_id)
+        );
+
+        // An empty name or a name containing '/' is rejected.
+        assert!(rename_collection(&conn, ml_id, "").is_err());
+        assert!(rename_collection(&conn, ml_id, "a/b").is_err());
+
+        // A sibling-name clash differing only in case is rejected.
+        assert!(rename_collection(&conn, ml_id, "statistics").is_err());
+        assert_eq!(
+            collection_by_path(&conn, "Machine Learning").unwrap(),
+            Some(ml_id),
+            "a rejected rename must leave the name unchanged"
+        );
+
+        // A case-only self-rename is allowed.
+        rename_collection(&conn, stats_id, "STATISTICS").unwrap();
+        assert_eq!(
+            collection_by_path(&conn, "STATISTICS").unwrap(),
+            Some(stats_id)
+        );
+
+        // The same name under a different parent is allowed: renaming the
+        // top-level "Machine Learning" back to "ml" doesn't clash with
+        // Physics/ml, a different parent.
+        rename_collection(&conn, ml_id, "ml").unwrap();
+        assert_eq!(collection_by_path(&conn, "ml").unwrap(), Some(ml_id));
+        assert_eq!(
+            collection_by_path(&conn, "Physics/ml").unwrap(),
+            Some(nested_ml)
+        );
     }
 }

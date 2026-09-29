@@ -331,6 +331,14 @@ pub enum CollectionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Rename a collection in place. <new-name> is one path segment, not a
+    /// path -- moving a collection stays `collection mv`'s job.
+    Rename {
+        path: String,
+        new_name: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 // "Last, First" -> Author. Splits on the first comma only (names can contain

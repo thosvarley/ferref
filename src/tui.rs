@@ -4,8 +4,8 @@
 // and copies an entry's link to the system clipboard. Mutating and
 // destructive actions live behind the ":" command palette and (for
 // delete/merge) a confirm prompt, so they're deliberate rather than a
-// stray keypress. Deleting or renaming a collection, and creating a new
-// entry, stay CLI-only.
+// stray keypress. Collections can also be renamed ("R") and deleted ("D"),
+// each behind its own confirm/input; creating a new entry stays CLI-only.
 //
 // Data is fetched only when state changes (on load, on a collection
 // selection change, on a sort/filter edit, or on manual reload) and cached
@@ -258,6 +258,13 @@ fn handle_normal_key(app: &mut App, conn: &Connection, code: KeyCode, modifiers:
         KeyCode::Char('n') if app.focus == Focus::Collections => {
             app.mode = Mode::Input(InputKind::NewCollection, String::new());
         }
+        // "R"/"D": rename/delete the highlighted collection. Capitals, and
+        // deliberately not "r"/"d" -- "r" is already reload, and a delete
+        // key shouldn't be one slip away from a common one. Both are
+        // no-ops on the "All Papers" row (see App::begin_rename_collection
+        // and App::begin_delete_collection).
+        KeyCode::Char('R') if app.focus == Focus::Collections => app.begin_rename_collection(),
+        KeyCode::Char('D') if app.focus == Focus::Collections => app.begin_delete_collection(),
         KeyCode::Char('c') if app.focus == Focus::Entries => app.open_picker(conn),
         KeyCode::Char('o') if matches!(app.focus, Focus::Entries | Focus::Details) => {
             app.open_selected(conn);
@@ -367,6 +374,13 @@ fn handle_input_key(
                     // Search: the filter was already applied live as it was typed.
                     app.mode = Mode::Normal;
                 }
+                InputKind::RenameCollection { id } => {
+                    let name = buffer.trim().to_string();
+                    if !name.is_empty() {
+                        app.rename_collection(conn, id, &name);
+                    }
+                    app.mode = Mode::Normal;
+                }
                 InputKind::Search { .. } => {
                     app.mode = Mode::Normal;
                 }
@@ -399,7 +413,10 @@ fn handle_input_key(
                     app.details_scroll = 0;
                     app.mode = Mode::Normal;
                 }
-                InputKind::NewCollection | InputKind::ExportPath { .. } | InputKind::Tag { .. } => {
+                InputKind::NewCollection
+                | InputKind::RenameCollection { .. }
+                | InputKind::ExportPath { .. }
+                | InputKind::Tag { .. } => {
                     app.mode = Mode::Normal;
                 }
                 // Esc on a field edit backs out to the field picker without
@@ -725,6 +742,20 @@ fn handle_confirm_key(app: &mut App, conn: &Connection, code: KeyCode, action: P
         return; // app.mode is already Normal
     }
 
+    // DeleteCollection is handled separately: it manages its own post-
+    // delete selection (parent, or the nearest remaining row -- see
+    // App::finish_delete_collection), unlike Delete/Merge below, which
+    // both always land back on the same selected collection via the
+    // generic app.reload(). Marks are cleared here too, same as the other
+    // two -- harmless, since marks hold entry ids and deleting a
+    // collection never deletes an entry, but there's no reason for this
+    // one action to behave differently from a cancelled confirm above.
+    if let PendingAction::DeleteCollection { id, parent_id } = action {
+        app.marked.clear();
+        app.finish_delete_collection(conn, id, parent_id);
+        return;
+    }
+
     let result = match action {
         PendingAction::Delete { entry_id } => app
             .entry_by_id(entry_id)
@@ -733,6 +764,7 @@ fn handle_confirm_key(app: &mut App, conn: &Connection, code: KeyCode, action: P
             .and_then(|cite_key| db::delete_entry(conn, &cite_key).map_err(|e| e.to_string())),
         PendingAction::Merge { keep_id, drop_id } => db::merge_entries(conn, keep_id, drop_id)
             .map_err(|e| crate::friendly(None, "merge entries", e)),
+        PendingAction::DeleteCollection { .. } => unreachable!("handled above"),
     };
     if let Err(e) = result {
         app.status = Some(e);
@@ -950,6 +982,10 @@ enum InputKind {
         previous: String,
     },
     NewCollection,
+    // "R": pre-filled with the collection's current name.
+    RenameCollection {
+        id: i64,
+    },
     // Edit's value box. `return_selected` is the field picker's row to
     // return to on Enter/Esc, so fixing several fields in one visit doesn't
     // reset the list to the top each time.
@@ -976,6 +1012,13 @@ enum InputKind {
 enum PendingAction {
     Delete { entry_id: i64 },
     Merge { keep_id: i64, drop_id: i64 },
+    // "D" in the Collections pane. `parent_id` is captured at confirm time
+    // (see App::begin_delete_collection), not re-derived afterward -- once
+    // the collection is deleted there's nothing left to ask its parent id.
+    DeleteCollection {
+        id: i64,
+        parent_id: Option<i64>,
+    },
 }
 
 // Field names Edit (":" -> "e") can change: Entry's own scalar columns plus
@@ -1335,6 +1378,127 @@ impl App {
             // human, and to_string() prefixes it with "Invalid parameter
             // name:" -- rusqlite's vocabulary leaking onto the footer.
             Err(e) => self.status = Some(crate::friendly(None, "create collection", e)),
+        }
+    }
+
+    // The highlighted row's parent, found by walking back to the nearest
+    // preceding row one depth shallower -- valid because the tree pane's
+    // rows are a pre-order walk (see load_tree/db::collection_tree), which
+    // always lists a parent immediately before its subtree. None both for
+    // a top-level collection (its "parent" row is the synthetic "All
+    // Papers" root, whose id is itself None -- matching a real top-level
+    // collection's parent_id, which is NULL in the DB) and for "All
+    // Papers" itself.
+    fn parent_row_id(&self, row_idx: usize) -> Option<i64> {
+        let depth = self.rows[row_idx].depth;
+        self.rows[..row_idx]
+            .iter()
+            .rev()
+            .find(|r| r.depth + 1 == depth)
+            .and_then(|r| r.id)
+    }
+
+    // How many rows below `row_idx` belong to its subtree: the contiguous
+    // run of following rows at strictly greater depth, same shape
+    // db::subtree_ids walks (over collection_tree's output rather than
+    // this pane's rows, but the same pre-order guarantee).
+    fn subcollection_count(&self, row_idx: usize) -> usize {
+        let depth = self.rows[row_idx].depth;
+        self.rows[row_idx + 1..]
+            .iter()
+            .take_while(|r| r.depth > depth)
+            .count()
+    }
+
+    // "R": opens the input line pre-filled with the collection's current
+    // name. A no-op on "All Papers" (id: None) -- that row isn't a real
+    // collection.
+    fn begin_rename_collection(&mut self) {
+        let row = &self.rows[self.selected_row];
+        let Some(id) = row.id else {
+            self.status = Some("'All Papers' isn't a collection -- nothing to rename".to_string());
+            return;
+        };
+        self.mode = Mode::Input(InputKind::RenameCollection { id }, row.name.clone());
+    }
+
+    // RenameCollection's Enter. Reuses `reload`, which re-selects by id
+    // (see its own comment) -- since `id` here is the same collection
+    // being renamed, the selection lands right back on it.
+    fn rename_collection(&mut self, conn: &Connection, id: i64, new_name: &str) {
+        match db::rename_collection(conn, id, new_name) {
+            Ok(()) => {
+                if let Err(e) = self.reload(conn) {
+                    self.status = Some(e);
+                }
+            }
+            Err(e) => self.status = Some(crate::friendly(None, "rename collection", e)),
+        }
+    }
+
+    // "D": confirms before deleting the highlighted collection and its
+    // subtree. Names the collection, says how many subcollections go with
+    // it, and says papers aren't touched -- delete_collection_by_id only
+    // ever removes collection_entries membership rows, never an entry
+    // itself. A no-op on "All Papers", same as begin_rename_collection.
+    fn begin_delete_collection(&mut self) {
+        let row_idx = self.selected_row;
+        let row = &self.rows[row_idx];
+        let Some(id) = row.id else {
+            self.status = Some("'All Papers' isn't a collection -- nothing to delete".to_string());
+            return;
+        };
+        let name = row.name.clone();
+        let subcollections = self.subcollection_count(row_idx);
+        let parent_id = self.parent_row_id(row_idx);
+        let message = if subcollections == 0 {
+            format!("Delete '{name}'? Papers stay in the library. y/n")
+        } else {
+            format!(
+                "Delete '{name}' and its {subcollections} subcollection(s)? Papers stay in the library. y/n"
+            )
+        };
+        self.mode = Mode::Confirm {
+            message,
+            action: PendingAction::DeleteCollection { id, parent_id },
+        };
+    }
+
+    // PendingAction::DeleteCollection, confirmed. Selection goes to the
+    // parent if there was one; a top-level collection has none
+    // (parent_id: None), so it falls to whatever slid into the deleted
+    // row's old index once the subtree is gone -- the "nearest remaining
+    // row" a plain list deletion produces. Reloads the tree via load_tree
+    // and the entries pane via load_entries, the same helpers `reload`
+    // itself calls, rather than hand-rolling either.
+    fn finish_delete_collection(&mut self, conn: &Connection, id: i64, parent_id: Option<i64>) {
+        if let Err(e) = db::delete_collection_by_id(conn, id) {
+            self.status = Some(crate::friendly(None, "delete collection", e));
+            return;
+        }
+
+        self.rows = match load_tree(conn) {
+            Ok(r) => r,
+            Err(e) => {
+                self.status = Some(e);
+                return;
+            }
+        };
+        self.selected_row = match parent_id {
+            Some(pid) => self.rows.iter().position(|r| r.id == Some(pid)).unwrap_or(0),
+            None => self.selected_row.min(self.rows.len() - 1),
+        };
+        self.ensure_selected_visible();
+
+        let collection_id = self.rows[self.selected_row].id;
+        match load_entries(conn, collection_id) {
+            Ok((entries, lengths)) => {
+                self.entries = entries;
+                self.attachment_lengths = lengths;
+                self.rebuild_view();
+                self.details_scroll = 0;
+            }
+            Err(e) => self.status = Some(e),
         }
     }
 
@@ -2631,6 +2795,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             Mode::Input(InputKind::NewCollection, buffer) => {
                 format!(" New collection: {buffer}")
             }
+            Mode::Input(InputKind::RenameCollection { .. }, buffer) => {
+                format!(" Rename collection: {buffer}")
+            }
             Mode::Input(InputKind::EditField { field, .. }, buffer) => {
                 format!(" {}: {buffer}", field.label())
             }
@@ -2770,6 +2937,8 @@ fn draw_help(frame: &mut Frame, frame_area: Rect) {
             "Collections",
             &[
                 ("n", "new (sub)collection"),
+                ("R", "rename this collection"),
+                ("D", "delete this collection and its subtree"),
                 ("x", "export this collection as BibTeX"),
             ],
         ),
@@ -3641,6 +3810,88 @@ mod tests {
             "the untagged entry should have dropped out of the active filter"
         );
         assert_eq!(app.details_scroll, 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // "R": renaming the selected collection must leave the selection on
+    // the same collection (by id), not wherever the newly-named row's
+    // sort position happens to land.
+    #[test]
+    fn rename_collection_keeps_the_selection_on_the_same_id() {
+        let dir = std::env::temp_dir().join("ferref-rename-collection-test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = db::init_db(&dir.join("ferref.db")).unwrap();
+
+        let id = db::create_collection(&conn, "ml").unwrap();
+        let mut app = App::load(&conn).unwrap();
+        app.selected_row = app.rows.iter().position(|r| r.id == Some(id)).unwrap();
+
+        app.rename_collection(&conn, id, "Machine Learning");
+
+        assert_eq!(app.status, None, "rename should succeed");
+        assert_eq!(app.rows[app.selected_row].id, Some(id));
+        assert_eq!(app.rows[app.selected_row].name, "Machine Learning");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // "D": deleting a selected subcollection must move the selection to
+    // its parent, not to "All Papers" or wherever it happened to land.
+    #[test]
+    fn delete_collection_selects_the_parent() {
+        let dir = std::env::temp_dir().join("ferref-delete-collection-test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = db::init_db(&dir.join("ferref.db")).unwrap();
+
+        let parent_id = db::create_collection(&conn, "Physics").unwrap();
+        let child_id = db::create_collection(&conn, "Physics/Entropy").unwrap();
+
+        let mut app = App::load(&conn).unwrap();
+        app.selected_row = app.rows.iter().position(|r| r.id == Some(child_id)).unwrap();
+
+        app.begin_delete_collection();
+        let (id, parent_id_captured) = match app.mode {
+            Mode::Confirm {
+                action: PendingAction::DeleteCollection { id, parent_id },
+                ..
+            } => (id, parent_id),
+            _ => panic!("expected a Confirm(DeleteCollection) mode"),
+        };
+        assert_eq!(id, child_id);
+        assert_eq!(parent_id_captured, Some(parent_id));
+
+        app.finish_delete_collection(&conn, id, parent_id_captured);
+        assert_eq!(app.status, None, "delete should succeed");
+        assert_eq!(app.rows[app.selected_row].id, Some(parent_id));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Neither key does anything on the synthetic "All Papers" row -- it
+    // isn't a real collection, so there's nothing to rename or delete.
+    #[test]
+    fn rename_and_delete_do_nothing_on_the_all_entries_row() {
+        let dir = std::env::temp_dir().join("ferref-collection-noop-test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = db::init_db(&dir.join("ferref.db")).unwrap();
+        db::create_collection(&conn, "Physics").unwrap();
+
+        let mut app = App::load(&conn).unwrap();
+        app.selected_row = 0;
+        assert_eq!(app.rows[0].id, None, "row 0 must be the 'All Papers' root");
+
+        app.begin_rename_collection();
+        assert!(matches!(app.mode, Mode::Normal), "R must not open an input on this row");
+        assert!(app.status.is_some(), "R must leave an explanatory status");
+
+        app.status = None;
+        app.begin_delete_collection();
+        assert!(matches!(app.mode, Mode::Normal), "D must not open a confirm on this row");
+        assert!(app.status.is_some(), "D must leave an explanatory status");
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -1738,11 +1738,56 @@ fn dispatch_collection(conn: &rusqlite::Connection, command: cli::CollectionComm
                     let out = serde_json::json!({ "path": path, "deleted": count });
                     emit_json(&out);
                 } else {
-                    emit(&format!("Deleted '{path}' and {count} collection(s)"));
+                    // count includes the collection itself, so the
+                    // subcollection count shown to the user is count - 1.
+                    let subcollections = count - 1;
+                    if subcollections == 0 {
+                        emit(&format!("Deleted '{path}'"));
+                    } else {
+                        emit(&format!(
+                            "Deleted '{path}' and its {subcollections} subcollection(s)"
+                        ));
+                    }
                 }
             }
             Err(e) => die(&friendly(None, "delete collection", e)),
         },
+
+        CollectionCommand::Rename {
+            path,
+            new_name,
+            json,
+        } => {
+            let id = match db::require_collection(conn, &path) {
+                Ok(id) => id,
+                Err(e) => die(&friendly(None, "rename collection", e)),
+            };
+            match db::rename_collection(conn, id, &new_name) {
+                Ok(()) => {
+                    // Rebuilt from the tree rather than string-substituted
+                    // into `path`, so it reflects the name rename_collection
+                    // actually stored (trimmed) rather than the raw arg.
+                    let tree = match db::collection_tree(conn) {
+                        Ok(t) => t,
+                        Err(e) => die(&format!("failed to rename collection: {e}")),
+                    };
+                    let paths = db::collection_tree_paths(&tree);
+                    let new_path = tree
+                        .iter()
+                        .zip(paths.iter())
+                        .find(|((_, c), _)| c.id == id)
+                        .map(|(_, p)| p.clone())
+                        .unwrap_or_else(|| new_name.clone());
+                    if json {
+                        let out = serde_json::json!({ "path": path, "new_path": new_path });
+                        emit_json(&out);
+                    } else {
+                        emit(&format!("Renamed '{path}' to '{new_path}'"));
+                    }
+                }
+                Err(e) => die(&friendly(None, "rename collection", e)),
+            }
+        }
     }
 }
 

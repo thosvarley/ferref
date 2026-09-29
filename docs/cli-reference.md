@@ -39,6 +39,7 @@ require `--json`.
 | `collection ls` | Show the collection tree, with paper counts |
 | `collection add <path> <key>` / `collection rm <path> <key>` | File or unfile a paper |
 | `collection mv <path> --parent <path>` | Move a collection under another. Use `--root` to move it to the top level |
+| `collection rename <path> <new-name>` | Rename a collection in place. `<new-name>` is one segment, not a path |
 | `collection delete <path>` | Delete a collection and its subcollections. The papers are not deleted |
 
 ## PDFs and text

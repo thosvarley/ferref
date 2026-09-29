@@ -111,8 +111,8 @@ shannon1948     1948   A Mathematical Theory of Communication             Shanno
 ```
 
 `collection mv` moves a collection (and everything under it) to a new parent.
-`collection delete` removes a collection and its subcollections, but never the
-papers in them.
+`collection rename` renames one in place. `collection delete` removes a
+collection and its subcollections, but never the papers in them.
 
 ## 4. Search
 

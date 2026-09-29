@@ -105,7 +105,11 @@ With the Collections pane focused:
 | Key | Action |
 | --- | --- |
 | `n` | Create a collection inside the highlighted one |
+| `R` | Rename the highlighted collection |
+| `D` | Delete the highlighted collection and its subcollections, after a y/n confirmation. Papers stay in the library |
 | `x` | Export every paper in the highlighted collection (and its subcollections) as BibTeX. The file is named after the collection |
+
+Neither `R` nor `D` does anything on "All Papers" -- it isn't a real collection.
 
 ## Good to know
 

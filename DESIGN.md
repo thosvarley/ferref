@@ -2519,6 +2519,58 @@ four more problems (marked *review* below). Those were fixed too.
 
 ---
 
+## Phase 29 — Rename and delete collections, in the CLI and the TUI
+
+*Status: done.* `db::rename_collection` takes an id (as specified) and shares
+`create_collection_under`'s case-insensitive sibling check, exempting the
+collection's own id so `ml` -> `ML` is allowed. `delete_collection` grew an
+id-based core, `delete_collection_by_id`, with the path-based CLI form now a
+thin wrapper over it. In the TUI, `R`/`D` are no-ops on "All Papers" (status
+message, not silence); `R` reuses `App::reload`'s existing by-id reselection
+so the rename lands back on the same collection with no new logic needed;
+`D`'s post-delete selection (parent, else nearest remaining row) is resolved
+from the tree pane's own rows rather than a new DB query, since the rows are
+already a pre-order walk with parent-before-child ordering.
+
+Collections can be created in both front ends. Before this phase, they could
+only be deleted from the CLI (`collection delete`), and renamed nowhere.
+Renaming meant deleting and refiling every paper by hand, which is friction in
+both front ends.
+
+**Database (`db.rs`).** A new `rename_collection(conn, id, new_name)`:
+- validates the name with `validate_collection_name`, as creation does;
+- refuses a name a sibling already uses, compared case-insensitively as
+  `create_collection_under` does;
+- allows a case-only rename of itself (`ml` → `ML`).
+
+It takes an id, not a path, because the TUI already has the id. Paths still
+resolve through `require_collection`. Deleting reuses `delete_collection`'s
+logic.
+
+**CLI.**
+- `ferref collection rename <path> <new-name> [--json]`. `<new-name>` is one
+  segment, not a path; moving stays `collection mv`'s job. JSON:
+  `{"path": <old>, "new_path": <new>}`.
+- `collection delete`'s message is reworded. It said "Deleted 'X' and N
+  collection(s)", where N includes X itself.
+
+**TUI, collections pane:**
+- `R` renames the highlighted collection. It opens the input line pre-filled
+  with the current name, and the selection stays on the renamed collection.
+- `D` deletes it, after a y/n confirmation. The prompt names the collection,
+  how many subcollections go with it, and that no papers are deleted.
+- Both keys are capitals. `r` is reload, and a delete key shouldn't be one
+  slip from a common key. Neither works on the "all entries" row.
+- After a delete, the selection moves to the parent, or to the nearest row if
+  there is none, and the entries pane reloads.
+- The help screen and docs/tui.md list both keys. docs/cli-reference.md lists
+  `rename`.
+
+**Not in scope:** moving collections in the TUI (`collection mv` covers it),
+and undoing a delete.
+
+---
+
 ## Roadmap (not yet scoped)
 
 Ideas worth doing sometime, deliberately not designed in detail yet — see
@@ -2551,7 +2603,7 @@ one yet.
 
 ## Order of work
 
-Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17 → 18 → 19 → 20 → 21 → 22 → 23 → 24 → 25 → 26 → 28. Phase 27 (browser extension) is deferred. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
+Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17 → 18 → 19 → 20 → 21 → 22 → 23 → 24 → 25 → 26 → 28 → 29. Phase 27 (browser extension) is deferred. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
 
 ---
 
@@ -2590,6 +2642,7 @@ Which phases get farmed out to a `coder` subagent, and which get an
 | 26 — `fetch`: all Unpaywall copies + PMC | **yes** | **yes** | Network, remote XML/JSON not under our control, and a real silent-failure trap: an S3 prefix without its trailing dot downloads a *different paper's* PDF that passes every check. Same shape as Phases 8 and 19. |
 | 27 — Firefox extension *(deferred)* | **yes** | **yes** | New trust boundary (page-controlled HTML and PDF bytes arriving on stdin), a byte-exact framing protocol where one stray stdout write breaks everything, and a refactor of `cmd_add` that must not change `add --url`. The extension half can only be verified in a real Firefox, so the user runs that check. |
 | 28 — Second audit (Opus): fixes | **yes** | **yes** | Fixes across every module, several at trust boundaries (terminal output, .bib parsing, network deadlines). The follow-up review caught a TUI state leak and an incomplete deadline, both in the first round of fixes. |
+| 29 — Rename/delete collections | **yes** | **yes** | One DB function, one CLI subcommand, and two TUI modes. The TUI half carries the same selection-after-change risk that Phases 25 and 28 were caught by. |
 
 The table is a default, not a rule. The reasoning behind it, which outlives the
 table if the phases change:
