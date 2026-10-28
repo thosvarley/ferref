@@ -19,7 +19,10 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use ratatui::Frame;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::crossterm::tty::IsTty;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -35,6 +38,143 @@ use crate::models::Entry;
 const MIN_WIDTH: u16 = 40;
 const MIN_HEIGHT: u16 = 10;
 
+// Each divider reuses the adjacent pane borders instead of consuming a column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Split {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaneWidths {
+    left: u16,
+    right: u16,
+}
+
+impl Default for PaneWidths {
+    fn default() -> Self {
+        Self {
+            left: 26,
+            right: 34,
+        }
+    }
+}
+
+struct PaneAreas {
+    tree: Rect,
+    table: Rect,
+    details: Rect,
+    footer: Rect,
+}
+
+impl PaneWidths {
+    fn areas(self, screen: Rect) -> PaneAreas {
+        let [main, footer] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(screen);
+        // Below the interactive minimum, still return valid rectangles.
+        let side_min = 10.min(main.width / 4);
+        let table_min = 20.min(main.width / 2);
+        let budget = main.width.saturating_sub(table_min);
+        let left = self.left.clamp(side_min, budget.saturating_sub(side_min));
+        let right = self.right.clamp(side_min, budget.saturating_sub(left));
+        let [tree, table, details] = Layout::horizontal([
+            Constraint::Length(left),
+            Constraint::Min(table_min),
+            Constraint::Length(right),
+        ])
+        .areas(main);
+        PaneAreas {
+            tree,
+            table,
+            details,
+            footer,
+        }
+    }
+
+    fn move_to(&mut self, screen: Rect, split: Split, x: u16) {
+        if screen.width < MIN_WIDTH || screen.height < MIN_HEIGHT {
+            return;
+        }
+        let areas = self.areas(screen);
+        match split {
+            Split::Left => {
+                let boundary = x.clamp(areas.tree.x + 10, areas.details.x - 20);
+                self.left = boundary - areas.tree.x;
+            }
+            Split::Right => {
+                let boundary = x.clamp(areas.table.x + 20, areas.details.right() - 10);
+                self.right = areas.details.right() - boundary;
+            }
+        }
+    }
+}
+
+fn handle_resize_key(app: &mut App, mut split: Split, code: KeyCode) {
+    match code {
+        KeyCode::Enter | KeyCode::Esc => return,
+        KeyCode::Tab | KeyCode::BackTab => {
+            split = match split {
+                Split::Left => Split::Right,
+                Split::Right => Split::Left,
+            };
+        }
+        KeyCode::Char('0') => app.panes = PaneWidths::default(),
+        KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l' | 'H' | 'L') => {
+            let delta = match code {
+                KeyCode::Left | KeyCode::Char('h') => -1,
+                KeyCode::Char('H') => -5,
+                KeyCode::Char('L') => 5,
+                _ => 1,
+            };
+            let areas = app.panes.areas(app.screen);
+            let x = match split {
+                Split::Left => areas.table.x,
+                Split::Right => areas.details.x,
+            };
+            app.panes
+                .move_to(app.screen, split, x.saturating_add_signed(delta));
+        }
+        _ => {}
+    }
+    app.mode = Mode::Resize(split);
+}
+
+fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    if !matches!(app.mode, Mode::Normal | Mode::Resize(_))
+        || app.screen.width < MIN_WIDTH
+        || app.screen.height < MIN_HEIGHT
+    {
+        app.drag = None;
+        return;
+    }
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.drag = None;
+            let areas = app.panes.areas(app.screen);
+            if mouse.row >= areas.table.y && mouse.row < areas.table.bottom() {
+                app.drag = [
+                    (Split::Left, areas.table.x),
+                    (Split::Right, areas.details.x),
+                ]
+                .into_iter()
+                .find(|(_, x)| mouse.column == *x || mouse.column == x.saturating_sub(1))
+                .map(|(split, x)| (split, x - mouse.column));
+                if let (Some((split, _)), Mode::Resize(_)) = (app.drag, &app.mode) {
+                    app.mode = Mode::Resize(split);
+                }
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some((split, offset)) = app.drag {
+                app.panes
+                    .move_to(app.screen, split, mouse.column.saturating_add(offset));
+            }
+        }
+        MouseEventKind::Up(_) => app.drag = None,
+        _ => {}
+    }
+}
+
 // ---------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------
@@ -47,9 +187,22 @@ pub fn run(conn: &Connection) -> Result<(), String> {
     let mut app = App::load(conn).map_err(|e| format!("failed to load library: {e}"))?;
 
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, &mut app, conn);
+    let result = (|| {
+        let _capture = MouseCaptureGuard;
+        ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture)
+            .map_err(|e| e.to_string())?;
+        event_loop(&mut terminal, &mut app, conn)
+    })();
     ratatui::restore();
     result
+}
+
+struct MouseCaptureGuard;
+
+impl Drop for MouseCaptureGuard {
+    fn drop(&mut self) {
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    }
 }
 
 fn event_loop(
@@ -59,7 +212,10 @@ fn event_loop(
 ) -> Result<(), String> {
     loop {
         terminal
-            .draw(|frame| draw(frame, app))
+            .draw(|frame| {
+                app.screen = frame.area();
+                draw(frame, app);
+            })
             .map_err(|e| e.to_string())?;
 
         match event::read().map_err(|e| e.to_string())? {
@@ -78,7 +234,8 @@ fn event_loop(
                 }
             }
             // Resize just needs a redraw, which happens at the top of the loop.
-            Event::Resize(_, _) => {}
+            Event::Resize(_, _) => app.drag = None,
+            Event::Mouse(mouse) => handle_mouse(app, mouse),
             _ => {}
         }
     }
@@ -87,10 +244,10 @@ fn event_loop(
 // Dispatches on mode FIRST, before any key is interpreted as a command --
 // the one rule that keeps a search query like "query" from also quitting at
 // 'q' or reloading at 'r' along the way.
-fn handle_key(
+fn handle_key<B: ratatui::backend::Backend>(
     app: &mut App,
     conn: &Connection,
-    terminal: &mut ratatui::DefaultTerminal,
+    terminal: &mut ratatui::Terminal<B>,
     code: KeyCode,
     modifiers: KeyModifiers,
 ) {
@@ -98,6 +255,7 @@ fn handle_key(
     // dismisses it also clears it, so it can't linger over unrelated
     // activity.
     app.status = None;
+    app.drag = None;
 
     // Every mode past Normal carries data a handler needs to own (a text
     // buffer, a picker's rows, ...), so it has to come out of `app.mode`
@@ -107,6 +265,7 @@ fn handle_key(
     // established which variant it is).
     match std::mem::replace(&mut app.mode, Mode::Normal) {
         Mode::Normal => handle_normal_key(app, conn, code, modifiers),
+        Mode::Resize(split) => handle_resize_key(app, split, code),
         Mode::Input(kind, buffer) => handle_input_key(app, conn, code, kind, buffer),
         Mode::Picker {
             rows,
@@ -150,6 +309,10 @@ fn handle_key(
 }
 
 fn handle_normal_key(app: &mut App, conn: &Connection, code: KeyCode, modifiers: KeyModifiers) {
+    if code == KeyCode::Char('w') && modifiers.contains(KeyModifiers::CONTROL) {
+        app.mode = Mode::Resize(Split::Left);
+        return;
+    }
     match code {
         KeyCode::Char('q') => app.should_quit = true,
         // Esc clears an active filter and any merge marks rather than
@@ -518,10 +681,10 @@ fn handle_picker_key(
 
 // The ":" palette: Edit / Fetch / Merge / Delete, scoped to whichever entry
 // was selected when it opened.
-fn handle_command_key(
+fn handle_command_key<B: ratatui::backend::Backend>(
     app: &mut App,
     conn: &Connection,
-    terminal: &mut ratatui::DefaultTerminal,
+    terminal: &mut ratatui::Terminal<B>,
     code: KeyCode,
     entry_id: i64,
 ) {
@@ -842,6 +1005,7 @@ impl SortKey {
 // also quit at 'q' or reload at 'r').
 enum Mode {
     Normal,
+    Resize(Split),
     Input(InputKind, String),
     Picker {
         // (depth, collection id, name), same shape draw_tree renders from.
@@ -1221,6 +1385,9 @@ struct App {
     // shown for exactly one keypress, then cleared by handle_key.
     status: Option<String>,
     should_quit: bool,
+    panes: PaneWidths,
+    screen: Rect,
+    drag: Option<(Split, u16)>,
 
     // "y"'s clipboard handle, created once and held for the app's whole
     // lifetime -- not per-copy. arboard's X11 backend serves the clipboard
@@ -1255,6 +1422,9 @@ impl App {
             mode: Mode::Normal,
             status: None,
             should_quit: false,
+            panes: PaneWidths::default(),
+            screen: Rect::default(),
+            drag: None,
             clipboard: arboard::Clipboard::new().ok(),
         };
         app.rebuild_view();
@@ -1811,10 +1981,10 @@ impl App {
     // blocking call, or the freeze reads as a hang rather than progress.
     // No --email equivalent in the TUI: falls back to FERREF_EMAIL / the
     // config file, same as the CLI does when --email is omitted.
-    fn fetch_selected(
+    fn fetch_selected<B: ratatui::backend::Backend>(
         &mut self,
         conn: &Connection,
-        terminal: &mut ratatui::DefaultTerminal,
+        terminal: &mut ratatui::Terminal<B>,
         entry_id: i64,
     ) {
         let Some(cite_key) = self.entry_by_id(entry_id).map(|e| e.cite_key.clone()) else {
@@ -2374,18 +2544,30 @@ fn draw(frame: &mut Frame, app: &App) {
         return;
     }
 
-    let [main, footer] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
-    let [tree, table, details] = Layout::horizontal([
-        Constraint::Length(26),
-        Constraint::Min(20),
-        Constraint::Length(34),
-    ])
-    .areas(main);
+    let PaneAreas {
+        tree,
+        table,
+        details,
+        footer,
+    } = app.panes.areas(area);
 
     draw_tree(frame, tree, app);
     draw_table(frame, table, app);
     draw_details(frame, details, app);
     draw_footer(frame, footer, app);
+    let active = app.drag.map(|(split, _)| split).or(match app.mode {
+        Mode::Resize(split) => Some(split),
+        _ => None,
+    });
+    if let Some(split) = active {
+        let x = match split {
+            Split::Left => table.x,
+            Split::Right => details.x,
+        };
+        for y in table.y..table.bottom() {
+            frame.buffer_mut()[(x, y)].set_style(FLOAT_ACCENT);
+        }
+    }
 
     match &app.mode {
         Mode::Picker {
@@ -2430,7 +2612,7 @@ fn draw(frame: &mut Frame, app: &App) {
             selected,
             ..
         } => draw_file_browser(frame, area, cwd, entries, *selected),
-        Mode::Normal | Mode::Input(..) => {}
+        Mode::Normal | Mode::Resize(_) | Mode::Input(..) => {}
     }
 }
 
@@ -2770,11 +2952,10 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &App) {
 // they're typing; then the active filter, so it doesn't silently vanish
 // from view; then the keymap.
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let text =
-        if let Some(status) = &app.status {
-            format!(" {status}")
-        } else {
-            match &app.mode {
+    let text = if let Some(status) = &app.status {
+        format!(" {status}")
+    } else {
+        match &app.mode {
             Mode::Input(InputKind::Search { .. }, buffer) => format!(" /{buffer}"),
             Mode::Input(InputKind::NewCollection, buffer) => {
                 format!(" New collection: {buffer}")
@@ -2786,7 +2967,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 format!(" {}: {buffer}", field.label())
             }
             Mode::Input(InputKind::ExportPath { ids }, buffer) => {
-                format!(" Export {} entr{} to: {buffer}", ids.len(), entries_plural(ids.len()))
+                format!(
+                    " Export {} entr{} to: {buffer}",
+                    ids.len(),
+                    entries_plural(ids.len())
+                )
             }
             Mode::Input(InputKind::Tag { ids, add }, buffer) => {
                 format!(
@@ -2813,6 +2998,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                     .to_string()
             }
             Mode::Confirm { message, .. } => format!(" {message}"),
+            Mode::Resize(_) => {
+                " Resize: Tab boundary · h/l ←/→ move · H/L 5 cols · 0 reset · Enter/Esc done"
+                    .to_string()
+            }
             Mode::Help => " Esc/q/any key: close".to_string(),
             Mode::FileBrowser { .. } => {
                 " jk move \u{b7} l/Enter open/attach \u{b7} h back \u{b7} Esc cancel".to_string()
@@ -2820,9 +3009,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             Mode::Normal if !app.filter.is_empty() => format!(" filter: {}", app.filter),
             // The full keymap lived here as one long line that grew with
             // every new feature; it's behind "?" now instead (draw_help).
-            Mode::Normal => " ?  help \u{b7} q quit".to_string(),
+            Mode::Normal => " ? help \u{b7} Ctrl-w resize \u{b7} q quit".to_string(),
         }
-        };
+    };
     let footer = Paragraph::new(text.clone());
     frame.render_widget(footer, area);
 
@@ -2905,6 +3094,8 @@ fn draw_help(frame: &mut Frame, frame_area: Rect) {
             "Navigate",
             &[
                 ("Tab / BackTab", "switch pane"),
+                ("Ctrl-w", "resize panes (Tab boundary, h/l move)"),
+                ("Mouse drag", "resize at pane borders"),
                 ("j/k, \u{2191}\u{2193}", "move"),
                 ("g / G", "top / bottom"),
                 ("Ctrl-d / Ctrl-u", "10 rows"),
@@ -3249,6 +3440,201 @@ mod tests {
         e
     }
 
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn pane_layout_stays_inside_terminal_and_preserves_requested_widths() {
+        let panes = PaneWidths {
+            left: 45,
+            right: 40,
+        };
+        for width in 0..160 {
+            let screen = Rect::new(3, 2, width, 20);
+            let areas = panes.areas(screen);
+            assert_eq!(
+                areas.tree.width + areas.table.width + areas.details.width,
+                width
+            );
+            assert_eq!(areas.details.right(), screen.right());
+            if width >= MIN_WIDTH {
+                assert!(areas.tree.width >= 10);
+                assert!(areas.table.width >= 20);
+                assert!(areas.details.width >= 10);
+            }
+        }
+        let restored = panes.areas(Rect::new(0, 0, 140, 20));
+        assert_eq!((restored.tree.width, restored.details.width), (45, 40));
+    }
+
+    #[test]
+    fn dividers_clamp_and_leave_the_opposite_pane_unchanged() {
+        let screen = Rect::new(3, 2, 120, 20);
+        for split in [Split::Left, Split::Right] {
+            for x in [0, u16::MAX] {
+                let mut panes = PaneWidths::default();
+                panes.move_to(screen, split, x);
+                let areas = panes.areas(screen);
+                assert!(
+                    areas.tree.width >= 10 && areas.table.width >= 20 && areas.details.width >= 10
+                );
+                match split {
+                    Split::Left => assert_eq!(areas.details.width, 34),
+                    Split::Right => assert_eq!(areas.tree.width, 26),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_requires_a_border_press_and_stops_on_release_or_popup() {
+        let mut app = mk_app(vec![]);
+        app.screen = Rect::new(0, 0, 120, 25);
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Drag(MouseButton::Left), 35, 5),
+        );
+        assert_eq!(app.panes.left, 26);
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), 26, 5),
+        );
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Drag(MouseButton::Left), 35, 5),
+        );
+        assert_eq!(app.panes.left, 35);
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Up(MouseButton::Left), 35, 5),
+        );
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Drag(MouseButton::Left), 40, 5),
+        );
+        assert_eq!(app.panes.left, 35);
+        app.mode = Mode::Help;
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), 35, 5),
+        );
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Drag(MouseButton::Left), 40, 5),
+        );
+        assert_eq!(app.panes.left, 35);
+        assert_eq!(app.drag, None);
+    }
+
+    #[test]
+    fn either_side_of_each_border_drags_without_a_jump_and_footer_is_not_a_handle() {
+        for (split, x) in [(Split::Left, 26), (Split::Right, 86)] {
+            for offset in [0, 1] {
+                let mut app = mk_app(vec![]);
+                app.screen = Rect::new(0, 0, 120, 25);
+                handle_mouse(
+                    &mut app,
+                    mouse(MouseEventKind::Down(MouseButton::Left), x - offset, 24),
+                );
+                assert_eq!(app.drag, None);
+                handle_mouse(
+                    &mut app,
+                    mouse(MouseEventKind::Down(MouseButton::Left), x - offset, 5),
+                );
+                handle_mouse(
+                    &mut app,
+                    mouse(MouseEventKind::Drag(MouseButton::Left), x - offset, 5),
+                );
+                assert_eq!(app.panes, PaneWidths::default());
+                handle_mouse(
+                    &mut app,
+                    mouse(MouseEventKind::Drag(MouseButton::Left), x - offset + 3, 5),
+                );
+                let areas = app.panes.areas(app.screen);
+                let boundary = match split {
+                    Split::Left => areas.table.x,
+                    Split::Right => areas.details.x,
+                };
+                assert_eq!(boundary, x + 3);
+            }
+        }
+    }
+
+    #[test]
+    fn resize_render_handles_small_and_compressed_terminals() {
+        let mut app = mk_app(vec![]);
+        app.mode = Mode::Resize(Split::Right);
+        for (width, height) in [(1, 1), (39, 9), (40, 10), (60, 15), (120, 25)] {
+            let backend = ratatui::backend::TestBackend::new(width, height);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+        }
+    }
+
+    #[test]
+    fn resize_keys_switch_move_reset_and_exit_without_quitting() {
+        let conn = Connection::open_in_memory().unwrap();
+        let backend = ratatui::backend::TestBackend::new(120, 25);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut app = mk_app(vec![]);
+        app.screen = Rect::new(0, 0, 120, 25);
+        for (code, modifiers) in [
+            (KeyCode::Char('w'), KeyModifiers::CONTROL),
+            (KeyCode::Char('L'), KeyModifiers::SHIFT),
+            (KeyCode::Tab, KeyModifiers::NONE),
+            (KeyCode::Left, KeyModifiers::NONE),
+        ] {
+            handle_key(&mut app, &conn, &mut terminal, code, modifiers);
+        }
+        assert_eq!(
+            app.panes,
+            PaneWidths {
+                left: 31,
+                right: 35
+            }
+        );
+        assert!(matches!(app.mode, Mode::Resize(Split::Right)));
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let areas = app.panes.areas(app.screen);
+        assert_eq!(
+            terminal.backend().buffer()[(areas.details.x, 2)].fg,
+            Color::Rgb(0x7f, 0xc8, 0xff)
+        );
+        handle_key(
+            &mut app,
+            &conn,
+            &mut terminal,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(!app.should_quit);
+        assert_eq!(app.panes.left, 31);
+        app.mode = Mode::Resize(Split::Left);
+        handle_key(
+            &mut app,
+            &conn,
+            &mut terminal,
+            KeyCode::Char('0'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.panes, PaneWidths::default());
+        handle_key(
+            &mut app,
+            &conn,
+            &mut terminal,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
     // Minimal App fixture: the synthetic "All Papers" root as the only tree
     // row, `entries` as given, `view` = every index in order (tests that
     // care about filtering override it after construction).
@@ -3276,6 +3662,9 @@ mod tests {
             mode: Mode::Normal,
             status: None,
             should_quit: false,
+            panes: PaneWidths::default(),
+            screen: Rect::default(),
+            drag: None,
             clipboard: None,
         }
     }
@@ -3394,6 +3783,9 @@ mod tests {
             mode: Mode::Normal,
             status: None,
             should_quit: false,
+            panes: PaneWidths::default(),
+            screen: Rect::default(),
+            drag: None,
             clipboard: None,
         };
         app.rebuild_view();

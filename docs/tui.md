@@ -30,6 +30,7 @@ Vim keys and arrow keys both work.
 | `g` / `G` | Jump to the top / bottom |
 | `Ctrl-d` / `Ctrl-u` | 10 rows down / up |
 | `h` / `l` | In Collections: fold / unfold. Elsewhere: move to the pane on the left / right |
+| `Ctrl-w` | Resize the panes (see below) |
 | `r` | Reload from the database |
 | `q` | Quit |
 | `Esc` | Clear the search and all marks. If there's nothing to clear, quit |
@@ -43,6 +44,25 @@ Vim keys and arrow keys both work.
 | `S` | Reverse the sort |
 
 Searching and sorting only rearrange what's on screen, so they're instant.
+
+## Resizing panes
+
+The three panes can be resized to give more room to the collection tree, entry
+list, or paper details. Press `Ctrl-w` to enter resize mode. The active divider
+is highlighted.
+
+| Key or action | Effect |
+| --- | --- |
+| `h` / `l` or `←` / `→` | Move the active divider one column |
+| `H` / `L` | Move it five columns |
+| `Tab` / `Shift-Tab` | Switch between the two dividers |
+| `0` | Restore the default pane widths |
+| `Enter` / `Esc` | Finish resizing |
+| Drag a pane border with the left mouse button | Resize that divider directly |
+
+The collection tree and details panes keep a minimum width of 10 columns, and
+the entry list keeps 20 columns when the terminal is wide enough. Pane widths
+only affect the current TUI session; reopening it restores the defaults.
 
 ## Working with papers
 
