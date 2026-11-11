@@ -20,6 +20,9 @@ use crate::models::{Author, Entry};
 
 const CROSSREF_BASE: &str = "https://api.crossref.org/works";
 const UNPAYWALL_BASE: &str = "https://api.unpaywall.org/v2";
+// The tail of the 404 message `fetch_guarded` produces for JSON services.
+const NO_RECORD_404: &str = "has no record for this DOI (404)";
+const OPENLIBRARY_BASE: &str = "https://openlibrary.org";
 
 // Plain and fixed for both APIs. Crossref doesn't need identifying info;
 // Unpaywall gets the contact email as a query parameter instead, per its
@@ -65,7 +68,7 @@ pub fn fetch_metadata(doi: &str) -> Result<Entry, String> {
 /// one `Result<_, String>` shape; kept as one function so the exact wording
 /// only has to be right in one place.
 pub fn is_no_record_404(err: &str) -> bool {
-    err == "Crossref has no record for this DOI (404)"
+    err == format!("Crossref {NO_RECORD_404}")
 }
 
 /// Looks up everything Unpaywall knows about `doi`: every PDF URL it lists
@@ -770,7 +773,7 @@ fn fetch_guarded_with(
             // download or a landing page 404s on its own URL, nothing to do
             // with a DOI, so that wording would be actively misleading.
             404 if suggests_manual_download(what) => return Err(format!("{what} not found (404)")),
-            404 => return Err(format!("{what} has no record for this DOI (404)")),
+            404 => return Err(format!("{what} {NO_RECORD_404}")),
             429 => return Err(format!("{what} rate limit exceeded (429); try again later")),
             // Cloudflare marks a challenge page it served instead of the
             // real response with this response header -- a plain "HTTP 403"
@@ -1116,11 +1119,259 @@ fn parse_crossref(json: &str) -> Result<Entry, String> {
     let mut entry = Entry::new(entry_type, String::new(), title);
     entry.doi = doi;
     entry.journal = journal;
+    // For articles Crossref's publisher is the corporate parent, which BibTeX
+    // ignores for @article; only books and chapters keep it.
+    if matches!(entry.entry_type.as_str(), "book" | "incollection") {
+        entry.publisher = message
+            .get("publisher")
+            .and_then(|p| p.as_str())
+            .map(str::to_string);
+    }
     entry.volume = volume;
     entry.pages = pages;
     entry.year = year;
     entry.abstract_text = abstract_text;
     for author in authors {
+        entry.add_author(author);
+    }
+    Ok(entry)
+}
+
+/// Normalises a user-typed ISBN-10 or ISBN-13 to a bare ISBN-13.
+pub fn normalize_isbn(input: &str) -> Result<String, String> {
+    let trimmed = input.trim();
+    // to_ascii_lowercase keeps byte offsets, so the prefix length indexes both.
+    let lower = trimmed.to_ascii_lowercase();
+    let rest = ["isbn-13", "isbn-10", "isbn"]
+        .iter()
+        .find(|p| lower.starts_with(*p))
+        .map_or(trimmed, |p| trimmed[p.len()..].trim_start());
+    let rest = rest.strip_prefix(':').unwrap_or(rest);
+    let chars: Vec<char> = rest
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect();
+
+    match chars.len() {
+        10 => {
+            let digits = chars[..9]
+                .iter()
+                .map(|c| c.to_digit(10))
+                .collect::<Option<Vec<u32>>>();
+            let check = match chars[9] {
+                'X' | 'x' => Some(10),
+                c => c.to_digit(10),
+            };
+            let (Some(mut all), Some(check)) = (digits, check) else {
+                return Err(format!(
+                    "'{input}' is not a valid ISBN-10 (expected 9 digits and a digit or X)"
+                ));
+            };
+            all.push(check);
+            let sum: u32 = all.iter().zip((1..=10).rev()).map(|(d, w)| d * w).sum();
+            if !sum.is_multiple_of(11) {
+                return Err(format!("'{input}' has a bad ISBN-10 check digit"));
+            }
+            let mut thirteen: Vec<u32> = vec![9, 7, 8];
+            thirteen.extend(&all[..9]);
+            thirteen.push(isbn13_check_digit(&thirteen));
+            Ok(thirteen.iter().map(|d| d.to_string()).collect())
+        }
+        13 => {
+            let Some(digits) = chars
+                .iter()
+                .map(|c| c.to_digit(10))
+                .collect::<Option<Vec<u32>>>()
+            else {
+                return Err(format!("'{input}' is not a valid ISBN-13 (digits only)"));
+            };
+            if digits[..3] != [9, 7, 8] && digits[..3] != [9, 7, 9] {
+                return Err(format!(
+                    "'{input}' is not an ISBN-13 (must start 978 or 979)"
+                ));
+            }
+            if isbn13_check_digit(&digits[..12]) != digits[12] {
+                return Err(format!("'{input}' has a bad ISBN-13 check digit"));
+            }
+            Ok(digits.iter().map(|d| d.to_string()).collect())
+        }
+        n => Err(format!(
+            "'{input}' is not an ISBN: expected 10 or 13 characters, got {n}"
+        )),
+    }
+}
+
+// EAN-13 check digit over the first twelve digits (weights 1, 3, 1, 3, ...).
+fn isbn13_check_digit(first12: &[u32]) -> u32 {
+    let sum: u32 = first12
+        .iter()
+        .zip([1, 3].iter().cycle())
+        .map(|(d, w)| d * w)
+        .sum();
+    (10 - sum % 10) % 10
+}
+
+/// "First Last" -> Author. Trailing suffixes (Jr, Sr, II, III, IV) are
+/// dropped first; a name that still has a comma is "Last, First" and goes to
+/// `parse_author`; otherwise the last token is the surname and a single token
+/// is all surname. Known limitation: "Ludwig van Beethoven" splits as first
+/// "Ludwig van", last "Beethoven".
+fn split_name(name: &str) -> Option<Author> {
+    let mut tokens: Vec<&str> = name.split_whitespace().collect();
+    while tokens.len() > 1
+        && let Some(last) = tokens.last()
+        && ["jr", "sr", "ii", "iii", "iv"]
+            .contains(&last.trim_end_matches('.').to_ascii_lowercase().as_str())
+    {
+        tokens.pop();
+    }
+    let joined = tokens.join(" ");
+    let joined = joined.trim_end_matches(',');
+    if joined.contains(',') {
+        return crate::cli::parse_author(joined).ok();
+    }
+    match joined.rsplit_once(' ') {
+        Some((first, last)) => Some(Author::new(last.to_string(), Some(first.to_string()))),
+        None => (!joined.is_empty()).then(|| Author::new(joined.to_string(), None)),
+    }
+}
+
+// `/authors/OL123A` or `/works/OL123W`: the only shapes ever interpolated
+// into a request path.
+fn is_ol_key(key: &str, prefix: &str, suffix: char) -> bool {
+    key.strip_prefix(prefix)
+        .and_then(|k| k.strip_suffix(suffix))
+        .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
+}
+
+// First four-digit run in free text like "Mar 15, 2011" that is a plausible year.
+fn year_from_publish_date(text: &str) -> Option<i32> {
+    text.split(|c: char| !c.is_ascii_digit())
+        .filter(|run| run.len() == 4)
+        .filter_map(|run| run.parse::<i32>().ok())
+        .find(|y| (1000..=9999).contains(y))
+}
+
+// Valid, de-duplicated author keys from an edition (`authors[].key`) or a
+// work (`authors[].author.key`) record; malformed keys are skipped.
+fn author_keys(v: &serde_json::Value) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for a in v
+        .get("authors")
+        .and_then(|a| a.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let key = a
+            .get("key")
+            .or_else(|| a.get("author").and_then(|x| x.get("key")))
+            .and_then(|k| k.as_str());
+        if let Some(key) = key
+            && is_ol_key(key, "/authors/OL", 'A')
+            && !keys.iter().any(|k| k == key)
+        {
+            keys.push(key.to_string());
+        }
+    }
+    keys
+}
+
+/// Parses an Open Library edition record into a book `Entry` (no authors
+/// yet), its valid author keys, and its valid work key.
+fn parse_openlibrary_edition(json: &str) -> Result<(Entry, Vec<String>, Option<String>), String> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("invalid Open Library JSON: {e}"))?;
+    let text = |field: &str| {
+        v.get(field)
+            .and_then(|t| t.as_str())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+    };
+    let base = text("title").ok_or_else(|| "Open Library record has no title".to_string())?;
+    let title = match text("subtitle") {
+        Some(sub) => format!("{base}: {sub}"),
+        None => base.to_string(),
+    };
+
+    let mut entry = Entry::new("book".to_string(), String::new(), title);
+    entry.year = text("publish_date").and_then(year_from_publish_date);
+    entry.publisher = v
+        .get("publishers")
+        .and_then(|p| p.as_array())
+        .and_then(|a| a.first())
+        .and_then(|p| p.as_str())
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
+
+    let work_key = v
+        .get("works")
+        .and_then(|w| w.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|w| w.get("key")?.as_str())
+        .find(|k| is_ol_key(k, "/works/OL", 'W'))
+        .map(str::to_string);
+    Ok((entry, author_keys(&v), work_key))
+}
+
+// GET on openlibrary.org; a 404 reports `not_found` instead of the generic
+// "no record for this DOI" text.
+fn ol_get(path: &str, not_found: &str) -> Result<String, String> {
+    get_text(
+        &format!("{OPENLIBRARY_BASE}{path}"),
+        "Open Library",
+        JSON_TIMEOUT,
+    )
+    .map_err(|e| {
+        if e.ends_with(NO_RECORD_404) {
+            not_found.to_string()
+        } else {
+            e
+        }
+    })
+}
+
+/// Looks up a book by ISBN-13 on Open Library: the edition, then (if the
+/// edition lists none) the work's authors, then each author's name.
+pub fn fetch_isbn_metadata(isbn13: &str) -> Result<Entry, String> {
+    let body = ol_get(
+        &format!("/isbn/{isbn13}.json"),
+        &format!("Open Library has no record for ISBN {isbn13}"),
+    )?;
+    let (mut entry, mut keys, work_key) = parse_openlibrary_edition(&body)?;
+
+    if keys.is_empty()
+        && let Some(work_key) = work_key
+    {
+        let work = ol_get(
+            &format!("{work_key}.json"),
+            &format!("Open Library has no work record for ISBN {isbn13}"),
+        )?;
+        let v: serde_json::Value =
+            serde_json::from_str(&work).map_err(|e| format!("invalid Open Library JSON: {e}"))?;
+        keys = author_keys(&v);
+    }
+
+    if keys.len() > 50 {
+        return Err(format!(
+            "Open Library lists {} authors for ISBN {isbn13}; more than ferref will \
+             fetch one at a time -- add it with --type/--key/--title instead",
+            keys.len()
+        ));
+    }
+    for key in &keys {
+        let body = ol_get(
+            &format!("{key}.json"),
+            &format!("Open Library has no record for author {key}"),
+        )?;
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| format!("invalid Open Library author JSON: {e}"))?;
+        let author = v
+            .get("name")
+            .and_then(|n| n.as_str())
+            .and_then(split_name)
+            .ok_or_else(|| format!("Open Library author {key} has no name"))?;
         entry.add_author(author);
     }
     Ok(entry)
@@ -2058,6 +2309,141 @@ mod tests {
             r#"{"collection":42}"#,
         ] {
             assert!(parse_biorxiv_details(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn normalize_isbn_cases() {
+        let cases: &[(&str, &str, Result<&str, &str>)] = &[
+            ("valid 13", "9780199603398", Ok("9780199603398")),
+            ("hyphenated 13", "978-0-19-960339-8", Ok("9780199603398")),
+            (
+                "ISBN: prefix",
+                "ISBN: 978-0-19-960339-8",
+                Ok("9780199603398"),
+            ),
+            (
+                "ISBN-13 prefix",
+                "isbn-13: 9780199603398",
+                Ok("9780199603398"),
+            ),
+            ("979 prefix", "9791032300961", Ok("9791032300961")),
+            ("10 -> 13", "0199603391", Ok("9780199603398")),
+            ("10 with X", "080442957X", Ok("9780804429573")),
+            ("bad 10 check", "0199603392", Err("check digit")),
+            ("bad 13 check", "9780199603399", Err("check digit")),
+            ("wrong length", "12345", Err("10 or 13")),
+            ("non-978/979 13", "9770199603390", Err("978 or 979")),
+        ];
+        for (label, input, expect) in cases {
+            let got = normalize_isbn(input);
+            match expect {
+                Ok(want) => assert_eq!(got.as_deref(), Ok(*want), "{label}"),
+                Err(frag) => {
+                    let e = got.expect_err(label);
+                    assert!(e.contains(frag), "{label}: {e}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_name_cases() {
+        let cases = [
+            ("James Oxley", "Oxley", Some("James")),
+            ("Jean-Pierre Serre", "Serre", Some("Jean-Pierre")),
+            ("Plato", "Plato", None),
+            ("Ludwig van Beethoven", "Beethoven", Some("Ludwig van")),
+            ("John Fox Jr.", "Fox", Some("John")),
+            ("Voddie T. Baucham, Jr.", "Baucham", Some("Voddie T.")),
+            ("Oxley, James G.", "Oxley", Some("James G.")),
+        ];
+        for (name, last, first) in cases {
+            let a = split_name(name).unwrap();
+            assert_eq!(a.last_name, last, "{name}: last");
+            assert_eq!(a.first_name.as_deref(), first, "{name}: first");
+        }
+    }
+
+    #[test]
+    fn parse_openlibrary_edition_cases() {
+        type ExpectedEdition = (
+            &'static str,
+            Option<i32>,
+            Option<&'static str>,
+            Vec<&'static str>,
+            Option<&'static str>,
+        );
+        // (label, json, expect: Ok((title, year, publisher, author keys, work key)))
+        let cases: Vec<(&str, &str, Option<ExpectedEdition>)> = vec![
+            (
+                "subtitle, March 2011, authors",
+                r#"{"title":"Matroid Theory","subtitle":"Second edition","publish_date":"March 2011",
+                    "publishers":["Oxford University Press"],
+                    "authors":[{"key":"/authors/OL5666395A"}],
+                    "works":[{"key":"/works/OL20438223W"}]}"#,
+                Some((
+                    "Matroid Theory: Second edition",
+                    Some(2011),
+                    Some("Oxford University Press"),
+                    vec!["/authors/OL5666395A"],
+                    Some("/works/OL20438223W"),
+                )),
+            ),
+            (
+                "no authors, work key returned",
+                r#"{"title":"Matroid Theory","publish_date":"2011",
+                    "works":[{"key":"/works/OL20438223W"}]}"#,
+                Some((
+                    "Matroid Theory",
+                    Some(2011),
+                    None,
+                    vec![],
+                    Some("/works/OL20438223W"),
+                )),
+            ),
+            (
+                "malformed author key skipped",
+                r#"{"title":"T","authors":[{"key":"/authors/../../x"},{"key":"/works/OL1W"},{"key":"/authors/OL7A"}]}"#,
+                Some(("T", None, None, vec!["/authors/OL7A"], None)),
+            ),
+            (
+                "work-shaped, duplicate, and padded values",
+                r#"{"title":"T","publish_date":"0123 2011","publishers":["  "],
+                    "authors":[{"author":{"key":"/authors/OL7A"}},{"key":"/authors/OL7A"}]}"#,
+                Some(("T", Some(2011), None, vec!["/authors/OL7A"], None)),
+            ),
+            ("no title", r#"{"publish_date":"2011"}"#, None),
+            ("empty title", r#"{"title":"  "}"#, None),
+        ];
+        for (label, json, expect) in cases {
+            let got = parse_openlibrary_edition(json);
+            let Some((title, year, publisher, keys, work)) = expect else {
+                assert!(got.is_err(), "{label}: should be an error");
+                continue;
+            };
+            let (entry, got_keys, got_work) = got.unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(entry.entry_type, "book", "{label}: type");
+            assert_eq!(entry.title, title, "{label}: title");
+            assert_eq!(entry.year, year, "{label}: year");
+            assert_eq!(entry.publisher.as_deref(), publisher, "{label}: publisher");
+            assert_eq!(got_keys, keys, "{label}: author keys");
+            assert_eq!(got_work.as_deref(), work, "{label}: work key");
+        }
+    }
+
+    #[test]
+    fn crossref_publisher_only_for_books_and_chapters() {
+        let cases = [
+            ("book", Some("OUP")),
+            ("book-chapter", Some("OUP")),
+            ("journal-article", None),
+        ];
+        for (kind, expect) in cases {
+            let json =
+                format!(r#"{{"message":{{"type":"{kind}","title":["T"],"publisher":"OUP"}}}}"#);
+            let entry = parse_crossref(&json).unwrap();
+            assert_eq!(entry.publisher.as_deref(), expect, "{kind}");
         }
     }
 }

@@ -210,6 +210,12 @@ fn from_biblatex(e: &BibEntry) -> Result<Entry, String> {
 
     entry.year = e.date().ok().and_then(date_to_year);
     entry.journal = e.journal().ok().map(|c| c.format_verbatim());
+    // publisher is a list type in biblatex (split on " and "); read the raw
+    // field instead so a name like "Smith and Sons" survives intact.
+    entry.publisher = e
+        .get("publisher")
+        .map(|c| c.format_verbatim().trim().to_string())
+        .filter(|p| !p.is_empty());
     // Read volume as the raw field text, not through volume()'s
     // PermissiveType<i64>: the crate's i64 parser also accepts Roman
     // numerals, so a volume of "II" comes back as 2. We store a String
@@ -325,6 +331,9 @@ fn to_biblatex(entry: &Entry) -> BibEntry {
     }
     if let Some(journal) = &entry.journal {
         e.set_journal(journal.to_chunks());
+    }
+    if let Some(publisher) = &entry.publisher {
+        e.set("publisher", publisher.to_chunks());
     }
     if let Some(volume) = &entry.volume {
         e.set_volume(parse_volume(volume));
@@ -450,6 +459,7 @@ mod tests {
         entry.add_author(Author::new("van der Berg".into(), Some("Jan".into())));
         entry.year = Some(2020);
         entry.journal = Some("Nature".into());
+        entry.publisher = Some("Smith and Sons".into());
         entry.volume = Some("12A".into());
         entry.pages = Some("123--145".into());
         entry.abstract_text = Some("An abstract about things.".into());
@@ -466,6 +476,7 @@ mod tests {
         assert_eq!(round_tripped.authors[0].first_name, Some("Jan".to_string()));
         assert_eq!(round_tripped.year, Some(2020));
         assert_eq!(round_tripped.journal.as_deref(), Some("Nature"));
+        assert_eq!(round_tripped.publisher.as_deref(), Some("Smith and Sons"));
         assert_eq!(round_tripped.volume.as_deref(), Some("12A"));
         assert_eq!(round_tripped.pages.as_deref(), Some("123--145"));
         assert_eq!(

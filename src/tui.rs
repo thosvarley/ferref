@@ -1013,6 +1013,7 @@ enum EditField {
     Title,
     Year,
     Journal,
+    Publisher,
     Volume,
     Pages,
     Doi,
@@ -1022,10 +1023,11 @@ enum EditField {
 }
 
 impl EditField {
-    const ALL: [EditField; 9] = [
+    const ALL: [EditField; 10] = [
         EditField::Title,
         EditField::Year,
         EditField::Journal,
+        EditField::Publisher,
         EditField::Volume,
         EditField::Pages,
         EditField::Doi,
@@ -1039,6 +1041,7 @@ impl EditField {
             EditField::Title => "title",
             EditField::Year => "year",
             EditField::Journal => "journal",
+            EditField::Publisher => "publisher",
             EditField::Volume => "volume",
             EditField::Pages => "pages",
             EditField::Doi => "doi",
@@ -1055,6 +1058,7 @@ impl EditField {
             EditField::Title => e.title.clone(),
             EditField::Year => e.year.map(|y| y.to_string()).unwrap_or_default(),
             EditField::Journal => e.journal.clone().unwrap_or_default(),
+            EditField::Publisher => e.publisher.clone().unwrap_or_default(),
             EditField::Volume => e.volume.clone().unwrap_or_default(),
             EditField::Pages => e.pages.clone().unwrap_or_default(),
             EditField::Doi => e.doi.clone().unwrap_or_default(),
@@ -1087,6 +1091,9 @@ impl EditField {
             }
             EditField::Journal => {
                 entry.journal = (!trimmed.is_empty()).then(|| trimmed.to_string())
+            }
+            EditField::Publisher => {
+                entry.publisher = (!trimmed.is_empty()).then(|| trimmed.to_string())
             }
             EditField::Volume => entry.volume = (!trimmed.is_empty()).then(|| trimmed.to_string()),
             EditField::Pages => entry.pages = (!trimmed.is_empty()).then(|| trimmed.to_string()),
@@ -2268,6 +2275,11 @@ fn matches_filter(entry: &Entry, needle_lowercase: &str) -> bool {
     {
         return true;
     }
+    if let Some(p) = &entry.publisher
+        && p.to_lowercase().contains(needle_lowercase)
+    {
+        return true;
+    }
     if let Some(y) = entry.year
         && y.to_string().contains(needle_lowercase)
     {
@@ -2679,6 +2691,9 @@ fn details_lines(e: &Entry, lengths: Option<&Vec<Option<i64>>>) -> Vec<Line<'sta
     }
 
     let mut fields = Vec::new();
+    if let Some(p) = &e.publisher {
+        fields.push(field_line("publisher", p.clone()));
+    }
     if let Some(v) = &e.volume {
         fields.push(field_line("volume", v.clone()));
     }

@@ -12,7 +12,7 @@ sqlite3 ~/.ferref/ferref.db "SELECT cite_key, title FROM entries WHERE year > 20
 
 | Table | Holds |
 | --- | --- |
-| `entries` | One row per paper: title, year, journal, DOI, abstract, and so on |
+| `entries` | One row per paper: title, year, journal, publisher, DOI, abstract, and so on |
 | `authors` | Each paper's authors, in order |
 | `tags`, `entry_tags` | Tag names, and which papers have which tags |
 | `collections` | The collection tree. Each row points to its parent |

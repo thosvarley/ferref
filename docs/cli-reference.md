@@ -9,13 +9,14 @@ interactive).
 | Command | What it does |
 | --- | --- |
 | `add --doi <doi>` | Add a paper, with metadata from Crossref |
+| `add --isbn <isbn>` | Add a book, with metadata from Open Library. Takes an ISBN-10 or ISBN-13, with or without hyphens or an `ISBN` prefix. No PDF is fetched, and the ISBN isn't stored |
 | `add --url <url>` | Add a paper from its web page, and download the PDF it links to. Use `--url` on its own for this |
-| `add --type <t> --key <k> --title <t>` | Add a paper by hand. Also takes `--author` (repeatable, `"Last, First"`), `--year`, `--journal`, `--volume`, `--pages`, `--doi`, `--url`, `--abstract` |
+| `add --type <t> --key <k> --title <t>` | Add a paper by hand. Also takes `--author` (repeatable, `"Last, First"`), `--year`, `--journal`, `--publisher`, `--volume`, `--pages`, `--doi`, `--url`, `--abstract` (`edit` takes `--publisher` too) |
 | `edit <key>` | Change fields. Only the flags you pass are changed. `--author` replaces the whole author list |
 | `rm <key>` | Delete a paper, with its tags, collection memberships, and attachment records |
 | `merge <keep> <drop>` | Move `drop`'s tags, collections, and PDFs to `keep`, then delete `drop` |
 
-With `--doi` or a lone `--url`, any other field you pass overrides the fetched
+With `--doi`, `--isbn`, or a lone `--url`, any other field you pass overrides the fetched
 value.
 
 `--doi` (on `add` and `edit`, and the TUI's DOI field) also accepts a URL

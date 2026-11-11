@@ -2577,6 +2577,186 @@ and undoing a delete.
 
 ---
 
+## Phase 30 — Books: `add --isbn` (Open Library) and a `publisher` field
+
+*Status: done.* Review (Sonnet) found no trust-boundary defects. It did
+find four silent or misleading results, all fixed:
+- An authorless book now adds with a stderr `Note:`. It is not an error,
+  because Open Library genuinely lacks authors for some editions.
+- Author keys are deduped. The silent cap of 20 became a hard error above
+  50.
+- `split_name` drops Jr/Sr/II–IV suffixes first, and hands "Last, First"
+  forms to `cli::parse_author`. Before this, "John Fox Jr." keyed as
+  `jr…`.
+- Every Open Library request goes through one `ol_get`. A 404 never says
+  "DOI", and the 404 text is a shared const (`NO_RECORD_404`) rather than a
+  hand-copied literal.
+
+Two departures from the spec below:
+- The BibTeX publisher uses the raw field, not the crate's list accessor.
+  The accessor splits on " and ", which breaks "Smith and Sons".
+- The DB-level `search` doesn't match publisher, consistent with how it
+  doesn't match journal.
+
+### Why
+
+ferref's only metadata source is Crossref, keyed by DOI, and most books
+have no DOI. Crossref has no record of `9780199603398` (Oxley, *Matroid
+Theory*, OUP 2011), for example. `add --url` doesn't help either. Publisher
+catalogue pages are product listings with no `citation_*` tags, and OUP's
+returns an empty 202 to anything that isn't a browser. The one identifier
+every book has is its ISBN, and library catalogues are what index ISBNs.
+
+Separately, `Entry` has nowhere to put a publisher. `@book` and
+`@incollection` need one in BibTeX, and a book entry without it is
+incomplete on export.
+
+### Source: Open Library, not Google Books
+
+Open Library is free and needs no key or account. It has a stable JSON
+interface:
+- `GET https://openlibrary.org/isbn/<isbn13>.json` returns the edition,
+  via a 302 to `/books/OL…M.json`. `fetch_guarded` already follows redirects
+  and revalidates each hop.
+- The edition record has `title`, an optional `subtitle`, `publish_date`
+  (free text: `"2011"`, `"March 2011"`, `"Mar 15, 2011"`), `publishers[]`,
+  `authors[].key` and `works[].key`.
+- Author names need one more request each:
+  `GET https://openlibrary.org/authors/OL…A.json` → `"name"`. Names come as
+  "First Last".
+- Many editions carry no `authors` and list them only on the work instead
+  (`GET https://openlibrary.org/works/OL…W.json` → `authors[].author.key`).
+
+Google Books' keyless API returned a 429 on the first request during
+scoping. A source that needs a key is a settings system, which `config.rs`
+deliberately is not.
+
+No new dependency: `ureq` + `serde_json` cover it. Every request goes
+through `get_text` / `fetch_guarded`, under the same SSRF, redirect and
+size-cap guards as Crossref.
+
+### What changes
+
+**ISBN handling (`doi.rs`, pure).** `normalize_isbn(input) -> Result<String, String>`:
+- strips spaces and hyphens, plus an optional leading case-insensitive
+  `ISBN`, `ISBN-10` or `ISBN-13` with an optional `:`;
+- accepts an ISBN-10 (9 digits + a digit or `X`, mod-11 check) and converts
+  it to ISBN-13 (`978` + the first 9 digits + a recomputed EAN check digit);
+- accepts an ISBN-13 that starts with `978`/`979` and passes the mod-10
+  1/3-weight check;
+- rejects anything else with a message naming what was wrong (length, check
+  digit, prefix).
+
+All lookups use the ISBN-13 form.
+
+**Fetch (`doi.rs`).** `fetch_isbn_metadata(isbn13) -> Result<Entry, String>`:
+1. Fetch the edition.
+   - A 404 means "Open Library has no record for ISBN X". Reuse
+     `is_no_record_404`'s matching if it fits, and don't duplicate it.
+2. Parse the edition with a pure `parse_openlibrary_edition(json) -> (Entry, Vec<author_key>, Option<work_key>)`,
+   or a small struct.
+   - `entry_type = "book"`.
+   - `title` is `title`, or `"title: subtitle"` when there's a subtitle.
+   - `year` is the first run of four digits in `publish_date` that falls in
+     1000..=9999.
+   - `publisher` is `publishers[0]`.
+   - A missing or empty `title` is an error.
+3. If the edition has no author keys and there is a work key, fetch the work
+   and take `authors[].author.key` from it. That is at most one extra
+   request.
+4. Fetch each author key and take its `name`. Only the first 20 keys are
+   fetched, to bound the number of requests.
+   - Turn the name into an `Author`: the last whitespace-separated token is
+     the last name and everything before it the first name. A single token is
+     all surname.
+   - A failed author request is fatal: a book with silently missing authors
+     is worse than an error.
+5. Keys are interpolated into URLs, so each must match `^/(authors|works)/OL\d+[AW]$`
+   (as appropriate) before use. Otherwise a hostile or garbled response
+   could steer the request path. Malformed keys are skipped.
+
+**CLI (`cli.rs`, `main.rs`).** `ferref add --isbn <ISBN>`:
+- `value_parser = parse_isbn`, a thin wrapper over `normalize_isbn`, like
+  `parse_doi`.
+- `conflicts_with = "doi"`.
+- `--type`/`--key`/`--title`'s `required_unless_present_any` becomes
+  `["doi", "url", "isbn"]`.
+- `scrape_url` additionally requires `isbn.is_none()`. With `--isbn`,
+  `--url` is just the entry's url field, as it is with `--doi`.
+
+`cmd_add`'s `--isbn` branch has the same shape as the `--doi` branch:
+fetch, `apply_manual_overrides`, `resolve_cite_key`. `--type`/`--title` are
+ignored, as in DOI mode, and `--key` overrides the derived key. No PDF
+step: Open Library has no PDFs, and `fetch` stays limited to open-access
+articles.
+
+ISBNs are not stored. There is no column for them in this phase. Re-adding
+the same book makes a second entry with a suffixed key (`oxley2011b`), the
+same as any non-DOI entry today.
+
+**`publisher` field, end to end:**
+- **`models.rs`:** `publisher: Option<String>` after `journal`, defaulting to
+  `None`. It reaches `--json` through `Serialize` for free.
+- **`db.rs`:**
+  - Add a `publisher TEXT` column to `SCHEMA_SQL`.
+  - In `create_schema`, add the column when it's missing, using the same
+    `pragma_table_info` check as `attachments.full_text`. Libraries created
+    before this phase need it.
+  - Update `insert_entry`, `update_entry` and the row mapping.
+  - The existing migration test builds a pre-phase `entries` table; extend
+    it to assert that `publisher` exists afterwards. Don't add a separate
+    test.
+- **`bibtex.rs`:** import and export `publisher`, in both BibTeX and
+  BibLaTeX modes; the field name is the same in both. Extend the existing
+  round-trip test.
+- **Crossref (`parse_crossref`):** store Crossref's `publisher` only when
+  the mapped type is `book` or `incollection`. For articles, Crossref's
+  publisher is the corporate parent ("Springer Science and Business Media
+  LLC"), which BibTeX ignores for `@article`. Storing it would add noise to
+  every existing article's `show` output.
+- **CLI:** `--publisher` on `add`, applied by `apply_manual_overrides` in
+  every mode and set directly in manual mode, and on `edit`. `show` prints
+  a `Publisher` line.
+- **TUI:**
+  - `EditField::Publisher`, placed after `Journal`.
+  - A DETAILS pane line.
+  - `matches_filter` matches on publisher, as it does on journal.
+- **Docs:** `docs/cli-reference.md` (`--isbn`, `--publisher`),
+  `docs/database.md` (the column), and the `add` section of
+  `docs/tutorial.md` if it lists the ways to add.
+
+### Tests (one per piece of non-trivial logic)
+
+- A table test for `normalize_isbn`:
+  - valid 13 (`9780199603398`), hyphenated 13, an `ISBN:` prefix, and a 979
+    prefix;
+  - a valid 10 → 13 conversion, and a 10 with an `X` check digit;
+  - a bad check digit (10 and 13), the wrong length, and a 13-digit number
+    with a non-978/979 prefix.
+- A table test for the name split: "James Oxley", "Jean-Pierre Serre",
+  "Plato", and "Ludwig van Beethoven" (last token only; that's the known
+  limitation).
+- `parse_openlibrary_edition` against fixtures. One has a subtitle,
+  `publish_date` "March 2011" and authors present. One has no authors, so
+  the work key is returned. One has a malformed author key, which is
+  skipped. One has no title, which is an error.
+- Crossref: `book` sets publisher; `journal-article` doesn't.
+- The migration and BibTeX tests are extended as above.
+
+No live-network test. Verify by hand against a scratch `FERREF_HOME`: the
+OUP book (`9780199603398`), its ISBN-10 (`0199603391`), an edition with no
+authors, and a nonexistent ISBN.
+
+### Not in scope
+
+- An `isbn` column, and dedup by ISBN.
+- Finding an ISBN inside a pasted `--url`.
+- An ISBN on `@incollection` entries.
+- Page counts.
+- Cover images.
+
+---
+
 ## Roadmap (not yet scoped)
 
 Ideas worth doing sometime, deliberately not designed in detail yet — see
@@ -2609,7 +2789,7 @@ one yet.
 
 ## Order of work
 
-Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17 → 18 → 19 → 20 → 21 → 22 → 23 → 24 → 25 → 26 → 28 → 29. Phase 27 (browser extension) is deferred. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
+Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17 → 18 → 19 → 20 → 21 → 22 → 23 → 24 → 25 → 26 → 28 → 29 → 30. Phase 27 (browser extension) is deferred. Phase 1 unblocks everything else — nothing downstream is useful until entries actually persist. Phases 7 and 8 (full text, DOI fetch) are pulled ahead of citation formatting because they're what actually serves the AI-native vision; APA/MLA formatting is cosmetic and can slip without cost.
 
 ---
 
@@ -2649,6 +2829,7 @@ Which phases get farmed out to a `coder` subagent, and which get an
 | 27 — Firefox extension *(deferred)* | **yes** | **yes** | New trust boundary (page-controlled HTML and PDF bytes arriving on stdin), a byte-exact framing protocol where one stray stdout write breaks everything, and a refactor of `cmd_add` that must not change `add --url`. The extension half can only be verified in a real Firefox, so the user runs that check. |
 | 28 — Second audit (Opus): fixes | **yes** | **yes** | Fixes across every module, several at trust boundaries (terminal output, .bib parsing, network deadlines). The follow-up review caught a TUI state leak and an incomplete deadline, both in the first round of fixes. |
 | 29 — Rename/delete collections | **yes** | **yes** | One DB function, one CLI subcommand, and two TUI modes. The TUI half carries the same selection-after-change risk that Phases 25 and 28 were caught by. |
+| 30 — `add --isbn` + `publisher` | **yes** | **yes** | A new external service returning JSON we don't control, with keys interpolated into request paths. Also a schema migration that has to land on existing libraries, threaded through every layer (DB, BibTeX, CLI, TUI). |
 
 The table is a default, not a rule. The reasoning behind it, which outlives the
 table if the phases change:

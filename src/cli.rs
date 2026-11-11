@@ -14,22 +14,23 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Add a new entry. Either give --type/--key/--title directly, give
-    /// --doi and let Crossref fill them in, or give --url alone and let the
+    /// --doi and let Crossref fill them in, give --isbn and let Open Library
+    /// fill them in (books), or give --url alone and let the
     /// page's own citation_* meta tags fill them in.
     Add {
-        /// Required unless --doi is given, or --url is given alone (with
+        /// Required unless --doi or --isbn is given, or --url is given alone (with
         /// none of --type/--key/--title) to fetch it from that page.
-        #[arg(long = "type", required_unless_present_any = ["doi", "url"])]
+        #[arg(long = "type", required_unless_present_any = ["doi", "url", "isbn"])]
         entry_type: Option<String>,
-        /// Required unless --doi is given, or --url is given alone (with
+        /// Required unless --doi or --isbn is given, or --url is given alone (with
         /// none of --type/--key/--title) to derive one (first author's last
         /// name + year, e.g. "kucsko2013"). An explicit --key always wins
         /// over a derived one.
-        #[arg(long = "key", required_unless_present_any = ["doi", "url"])]
+        #[arg(long = "key", required_unless_present_any = ["doi", "url", "isbn"])]
         cite_key: Option<String>,
-        /// Required unless --doi is given, or --url is given alone (with
+        /// Required unless --doi or --isbn is given, or --url is given alone (with
         /// none of --type/--key/--title) to fetch it from that page.
-        #[arg(long, required_unless_present_any = ["doi", "url"])]
+        #[arg(long, required_unless_present_any = ["doi", "url", "isbn"])]
         title: Option<String>,
         /// Repeatable, each as "Last, First"
         #[arg(long = "author")]
@@ -39,12 +40,18 @@ pub enum Command {
         #[arg(long)]
         journal: Option<String>,
         #[arg(long)]
+        publisher: Option<String>,
+        #[arg(long)]
         volume: Option<String>,
         #[arg(long)]
         pages: Option<String>,
         /// A bare DOI, or a doi.org/publisher URL containing one.
         #[arg(long, value_parser = parse_doi)]
         doi: Option<String>,
+        /// An ISBN-10 or ISBN-13 (hyphens and an "ISBN" prefix are fine).
+        /// Fetches the book's metadata from Open Library; no PDF is fetched.
+        #[arg(long, value_parser = parse_isbn, conflicts_with = "doi")]
+        isbn: Option<String>,
         /// The paper's URL. Given alone -- with none of --type/--key/--title
         /// -- this is instead treated as a landing page to fetch from: reads
         /// its citation_* meta tags, prefers Crossref when the page names a
@@ -96,6 +103,8 @@ pub enum Command {
         year: Option<i32>,
         #[arg(long)]
         journal: Option<String>,
+        #[arg(long)]
+        publisher: Option<String>,
         #[arg(long)]
         volume: Option<String>,
         #[arg(long)]
@@ -394,6 +403,10 @@ pub fn validate_cite_key(key: &str) -> Result<(), String> {
 
 fn parse_doi(s: &str) -> Result<String, String> {
     Ok(crate::doi::normalize_doi(s))
+}
+
+fn parse_isbn(s: &str) -> Result<String, String> {
+    crate::doi::normalize_isbn(s)
 }
 
 // A title is `NOT NULL` in the schema, but that alone still accepts "" or

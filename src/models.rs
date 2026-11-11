@@ -48,6 +48,7 @@ pub struct Entry {
 
     // Option<String> means "might be Some(string) or None"
     pub journal: Option<String>,
+    pub publisher: Option<String>,
     pub volume: Option<String>,
     pub pages: Option<String>,
     pub doi: Option<String>,
@@ -95,6 +96,7 @@ impl Entry {
             attachments: Vec::new(),
             year: None,
             journal: None,
+            publisher: None,
             volume: None,
             pages: None,
             doi: None,

@@ -39,9 +39,11 @@ fn main() {
             authors,
             year,
             journal,
+            publisher,
             volume,
             pages,
             doi,
+            isbn,
             url,
             abstract_text,
             json,
@@ -53,9 +55,11 @@ fn main() {
             authors,
             year,
             journal,
+            publisher,
             volume,
             pages,
             doi,
+            isbn,
             url,
             abstract_text,
             json,
@@ -96,6 +100,7 @@ fn main() {
             title,
             year,
             journal,
+            publisher,
             volume,
             pages,
             doi,
@@ -121,6 +126,7 @@ fn main() {
                 &mut entry,
                 year,
                 journal,
+                publisher,
                 volume,
                 pages,
                 abstract_text,
@@ -435,7 +441,7 @@ fn resolve_cite_key(
     }
 }
 
-// Applies the manual override flags (--journal/--volume/--pages/--abstract/
+// Applies the manual override flags (--journal/--publisher/--volume/--pages/--abstract/
 // --url/--author) on top of whatever --doi (Crossref) or a scraped landing
 // page already put on `entry`. An explicit flag always wins over a fetched
 // value -- the precedence --url established first; this extends the same
@@ -448,6 +454,7 @@ fn apply_manual_overrides(
     entry: &mut Entry,
     year: Option<i32>,
     journal: Option<String>,
+    publisher: Option<String>,
     volume: Option<String>,
     pages: Option<String>,
     abstract_text: Option<String>,
@@ -456,6 +463,7 @@ fn apply_manual_overrides(
 ) -> Result<(), String> {
     entry.year = year.or(entry.year);
     entry.journal = journal.or(entry.journal.take());
+    entry.publisher = publisher.or(entry.publisher.take());
     entry.volume = volume.or(entry.volume.take());
     entry.pages = pages.or(entry.pages.take());
     entry.abstract_text = abstract_text.or(entry.abstract_text.take());
@@ -503,16 +511,18 @@ fn cmd_add(
     authors: Vec<String>,
     year: Option<i32>,
     journal: Option<String>,
+    publisher: Option<String>,
     volume: Option<String>,
     pages: Option<String>,
     doi: Option<String>,
+    isbn: Option<String>,
     url: Option<String>,
     abstract_text: Option<String>,
     json: bool,
 ) {
     // --url given alone -- none of --type/--key/--title, which clap only
-    // allows when --doi or --url is present -- is the third way in,
-    // alongside --doi and the manual flags: it reads the page's citation_*
+    // allows when --doi, --isbn or --url is present -- is another way in,
+    // alongside --doi, --isbn and the manual flags: it reads the page's citation_*
     // meta tags, and if the page names a DOI it hands off to the Crossref
     // path below, since publisher pages abbreviate and Crossref is
     // authoritative. With any of --type/--key/--title also given, --url is
@@ -520,7 +530,11 @@ fn cmd_add(
     // alongside --journal/--volume/etc.) -- this is the fold of what used
     // to be a separate --from-url flag into --url, so the two nearly
     // identical flags don't have to be explained separately.
-    let scrape_url = doi.is_none() && entry_type.is_none() && cite_key.is_none() && title.is_none();
+    let scrape_url = doi.is_none()
+        && isbn.is_none()
+        && entry_type.is_none()
+        && cite_key.is_none()
+        && title.is_none();
 
     let mut pending_pdf: Option<String> = None;
     let mut doi = doi;
@@ -529,7 +543,7 @@ fn cmd_add(
     if scrape_url {
         // clap's required_unless_present_any guarantees --url is Some here:
         // it's the only thing that could have exempted --type/--key/--title
-        // from being required, since --doi is also None in this branch.
+        // from being required, since --doi and --isbn are also None here.
         let page_url = url.as_deref().expect("--url required by clap here");
         let found = match doi::fetch_page_metadata(page_url) {
             Ok(m) => m,
@@ -563,7 +577,39 @@ fn cmd_add(
     // as any other Crossref error here (network, rate limit, ...).
     let doi_from_page = scrape_url;
 
-    let mut entry = if let Some(doi_value) = doi {
+    let mut entry = if let Some(isbn13) = isbn {
+        // Open Library, keyed by the normalised ISBN-13. Same shape as the
+        // --doi branch below; no PDF step, since Open Library has none.
+        let mut entry = match doi::fetch_isbn_metadata(&isbn13) {
+            Ok(e) => e,
+            Err(e) => die(&format!(
+                "failed to fetch metadata for ISBN '{isbn13}': {e}"
+            )),
+        };
+        if let Err(e) = apply_manual_overrides(
+            &mut entry,
+            year,
+            journal,
+            publisher,
+            volume,
+            pages,
+            abstract_text,
+            url,
+            authors,
+        ) {
+            die(&e);
+        }
+        if entry.authors.is_empty() {
+            eprintln!(
+                "Note: {}",
+                sanitize_control_chars(&format!(
+                    "Open Library lists no authors for ISBN {isbn13}; add them with --author or edit"
+                ))
+            );
+        }
+        entry.cite_key = resolve_cite_key(conn, cite_key, &entry);
+        entry
+    } else if let Some(doi_value) = doi {
         let mut entry = match doi::fetch_metadata(&doi_value) {
             Ok(e) => e,
             Err(e) if doi_from_page && doi::is_no_record_404(&e) => {
@@ -586,6 +632,7 @@ fn cmd_add(
             &mut entry,
             year,
             journal,
+            publisher,
             volume,
             pages,
             abstract_text,
@@ -608,6 +655,7 @@ fn cmd_add(
             &mut entry,
             year,
             journal,
+            publisher,
             volume,
             pages,
             abstract_text,
@@ -619,7 +667,7 @@ fn cmd_add(
         entry.cite_key = resolve_cite_key(conn, cite_key, &entry);
         entry
     } else {
-        // Reached whenever --doi is absent and at least one of
+        // Reached whenever --doi and --isbn are absent and at least one of
         // --type/--key/--title was given (scrape mode requires *none* of
         // them) -- so, unlike the old --from-url split, clap alone can't
         // guarantee all three are present here (a partial --type without
@@ -628,8 +676,8 @@ fn cmd_add(
         let (entry_type, cite_key, title) = match (entry_type, cite_key, title) {
             (Some(t), Some(k), Some(ti)) => (t, k, ti),
             _ => die(
-                "--type, --key, and --title are all required unless --doi is \
-                 given, or --url is given alone (with none of --type/--key/\
+                "--type, --key, and --title are all required unless --doi or \
+                 --isbn is given, or --url is given alone (with none of --type/--key/\
                  --title) to fetch from a landing page",
             ),
         };
@@ -648,6 +696,7 @@ fn cmd_add(
         }
         entry.year = year;
         entry.journal = journal;
+        entry.publisher = publisher;
         entry.volume = volume;
         entry.pages = pages;
         entry.url = url;
@@ -2403,6 +2452,7 @@ fn format_entry(entry: &Entry) -> String {
     }
     for (label, value) in [
         ("Journal", &entry.journal),
+        ("Publisher", &entry.publisher),
         ("Volume", &entry.volume),
         ("Pages", &entry.pages),
         ("DOI", &entry.doi),
@@ -2651,6 +2701,7 @@ mod tests {
         struct Exp {
             year: Option<i32>,
             journal: Option<&'static str>,
+            publisher: Option<&'static str>,
             volume: Option<&'static str>,
             pages: Option<&'static str>,
             abstract_text: Option<&'static str>,
@@ -2660,6 +2711,7 @@ mod tests {
         let fetched = Exp {
             year: Some(2020),
             journal: Some("Fetched Journal"),
+            publisher: Some("Fetched Press"),
             volume: Some("1"),
             pages: Some("1-2"),
             abstract_text: Some("Fetched abstract"),
@@ -2669,7 +2721,7 @@ mod tests {
         let s = |v: &str| Some(v.to_string());
         let cases: Vec<(
             &str,
-            [Option<String>; 5],
+            [Option<String>; 6],
             Option<i32>,
             Vec<String>,
             Option<Exp>,
@@ -2682,6 +2734,7 @@ mod tests {
                 "explicit flags win",
                 [
                     s("MY JOURNAL"),
+                    s("MY PRESS"),
                     s("9"),
                     s("100-200"),
                     s("MY ABSTRACT"),
@@ -2692,6 +2745,7 @@ mod tests {
                 Some(Exp {
                     year: Some(1999),
                     journal: Some("MY JOURNAL"),
+                    publisher: Some("MY PRESS"),
                     volume: Some("9"),
                     pages: Some("100-200"),
                     abstract_text: Some("MY ABSTRACT"),
@@ -2704,7 +2758,7 @@ mod tests {
             // a no-op, not "wipe the authors Crossref found").
             (
                 "no-op when nothing overridden",
-                [None, None, None, None, None],
+                [None, None, None, None, None, None],
                 None,
                 vec![],
                 Some(fetched),
@@ -2713,14 +2767,21 @@ mod tests {
             // fully-manual path.
             (
                 "unparsable author",
-                [None, None, None, None, None],
+                [None, None, None, None, None, None],
                 None,
                 vec!["   ".to_string()],
                 None,
             ),
         ];
 
-        for (label, [journal, volume, pages, abstract_text, url], year, authors, expect) in cases {
+        for (
+            label,
+            [journal, publisher, volume, pages, abstract_text, url],
+            year,
+            authors,
+            expect,
+        ) in cases
+        {
             let mut entry = Entry::new(
                 "article".to_string(),
                 "smith2024".to_string(),
@@ -2728,6 +2789,7 @@ mod tests {
             );
             entry.year = Some(2020);
             entry.journal = s("Fetched Journal");
+            entry.publisher = s("Fetched Press");
             entry.volume = s("1");
             entry.pages = s("1-2");
             entry.abstract_text = s("Fetched abstract");
@@ -2741,6 +2803,7 @@ mod tests {
                 &mut entry,
                 year,
                 journal,
+                publisher,
                 volume,
                 pages,
                 abstract_text,
@@ -2754,6 +2817,11 @@ mod tests {
             result.unwrap_or_else(|e| panic!("{label}: {e}"));
             assert_eq!(entry.year, exp.year, "{label}: year");
             assert_eq!(entry.journal.as_deref(), exp.journal, "{label}: journal");
+            assert_eq!(
+                entry.publisher.as_deref(),
+                exp.publisher,
+                "{label}: publisher"
+            );
             assert_eq!(entry.volume.as_deref(), exp.volume, "{label}: volume");
             assert_eq!(entry.pages.as_deref(), exp.pages, "{label}: pages");
             assert_eq!(

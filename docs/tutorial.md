@@ -23,6 +23,14 @@ Information Theory and Statistical Mechanics [jaynes1957]
 Any other flag you pass (`--journal`, `--year`, `--abstract`, `--author`, and so
 on) overrides what Crossref returned. `--key` sets your own cite key.
 
+**By ISBN.** For a book, ferref looks the ISBN up on Open Library and fills in
+the title, authors, year, and publisher. Hyphens are fine, and an ISBN-10 works
+too. No PDF is downloaded.
+
+```sh
+ferref add --isbn 978-0-19-960339-8
+```
+
 **By hand.** Give a type, a cite key, and a title. Repeat `--author` once per
 author, written `"Last, First"`.
 

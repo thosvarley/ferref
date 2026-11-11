@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS entries (
     title TEXT NOT NULL,
     year INTEGER,
     journal TEXT,
+    publisher TEXT,
     volume TEXT,
     pages TEXT,
     doi TEXT,
@@ -131,6 +132,13 @@ fn create_schema(conn: &Connection) -> Result<()> {
         conn.execute("ALTER TABLE attachments ADD COLUMN full_text TEXT", [])?;
     }
 
+    let has_publisher = conn
+        .prepare("SELECT 1 FROM pragma_table_info('entries') WHERE name = 'publisher'")?
+        .exists([])?;
+    if !has_publisher {
+        conn.execute("ALTER TABLE entries ADD COLUMN publisher TEXT", [])?;
+    }
+
     if !fts_existed {
         // NOT a manual `INSERT ... SELECT ... WHERE full_text IS NOT NULL`.
         // The AFTER INSERT trigger indexes every row unconditionally, NULL
@@ -188,6 +196,7 @@ fn entry_from_row(row: &Row) -> Result<Entry> {
         attachments: Vec::new(),
         year: row.get("year")?,
         journal: row.get("journal")?,
+        publisher: row.get("publisher")?,
         volume: row.get("volume")?,
         pages: row.get("pages")?,
         doi: row.get("doi")?,
@@ -290,8 +299,8 @@ pub fn insert_entry(conn: &Connection, entry: &Entry) -> Result<i64> {
     tx.execute(
         r#"
         INSERT INTO entries
-            (entry_type, cite_key, title, year, journal, volume, pages, doi, url, abstract, date_added, date_modified)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            (entry_type, cite_key, title, year, journal, publisher, volume, pages, doi, url, abstract, date_added, date_modified)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
         "#,
         rusqlite::params![
             entry.entry_type,
@@ -299,6 +308,7 @@ pub fn insert_entry(conn: &Connection, entry: &Entry) -> Result<i64> {
             entry.title,
             entry.year,
             entry.journal,
+            entry.publisher,
             entry.volume,
             entry.pages,
             entry.doi,
@@ -1263,15 +1273,16 @@ pub fn update_entry(conn: &Connection, entry: &Entry) -> Result<()> {
     tx.execute(
         r#"
         UPDATE entries SET
-            entry_type = ?1, title = ?2, year = ?3, journal = ?4, volume = ?5,
-            pages = ?6, doi = ?7, url = ?8, abstract = ?9, date_modified = ?10
-        WHERE id = ?11
+            entry_type = ?1, title = ?2, year = ?3, journal = ?4, publisher = ?5,
+            volume = ?6, pages = ?7, doi = ?8, url = ?9, abstract = ?10, date_modified = ?11
+        WHERE id = ?12
         "#,
         rusqlite::params![
             entry.entry_type,
             entry.title,
             entry.year,
             entry.journal,
+            entry.publisher,
             entry.volume,
             entry.pages,
             entry.doi,
@@ -2537,6 +2548,13 @@ mod tests {
 
         // This is the actual migration path a real upgrade goes through.
         create_schema(&conn).unwrap();
+
+        let has_publisher = conn
+            .prepare("SELECT 1 FROM pragma_table_info('entries') WHERE name = 'publisher'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(has_publisher, "publisher column added by migration");
 
         // "ferref extract" on the never-extracted attachment.
         let never_extracted_id: i64 = conn

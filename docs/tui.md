@@ -38,7 +38,7 @@ Vim keys and arrow keys both work.
 
 | Key | Action |
 | --- | --- |
-| `/` | Search. The list filters as you type, matching titles, authors, journal, year, cite key, and tags. `Enter` keeps the filter; `Esc` cancels |
+| `/` | Search. The list filters as you type, matching titles, authors, journal, publisher, year, cite key, and tags. `Enter` keeps the filter; `Esc` cancels |
 | `s` | Change the sort column: title, author, year, journal |
 | `S` | Reverse the sort |
 
